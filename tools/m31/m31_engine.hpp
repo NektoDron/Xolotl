@@ -50,6 +50,10 @@ public:
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
     int64_t position() const;
+    // requested is already capped by the caller's remaining prompt. With
+    // M31_PREFILL_ADAPTIVE=1, choose a conservative CUDA scratch-safe chunk.
+    // Returns0 with error on invalid state/insufficient budget; forward never changes n.
+    int prefill_chunk(int requested, std::string & error) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

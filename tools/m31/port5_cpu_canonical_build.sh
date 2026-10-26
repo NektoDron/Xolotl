@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=/mnt/ai/Xolotl-m31
+exec >>/mnt/ai/logs/m31-port/port5-cpu-canonical-build-v1.log 2>&1
+exec 9>/mnt/ai/logs/m31-port/.build.lock
+flock -s -w 86400 9
+export CUDA_VISIBLE_DEVICES= OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1
+cmake -S "$ROOT/tools/m31/port5_cpu_build" -B "$ROOT/build-port5-cpu" -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=/usr/bin/g++-14
+cmake --build "$ROOT/build-port5-cpu" -j24
+"$ROOT/build-port5-cpu/port5_cpu_affinity_check"
+"$ROOT/build-port5-cpu/port5_cpu_probe" /mnt/ai/models/MiniMax-M3.1-Flash-GGUF/UD-IQ3_S/MiniMax-M3.1-Flash-UD-IQ3_S-00001-of-00005.gguf 16 0
+cmake --build "$ROOT/build-m31-cpu" --target m31_generate m31_serve -j24
+python3 "$ROOT/tools/m31/tests/test_math.py" --engine "$ROOT/build-m31-cpu/m31_generate" --inspect "$ROOT/build-m31-cpu/m31_inspect"

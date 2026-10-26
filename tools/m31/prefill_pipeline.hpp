@@ -3,7 +3,11 @@
 #pragma once
 #include "ggml-backend.h"
 #include <algorithm>
+#include <array>
+#include <functional>
+#include <utility>
 #include <cstdint>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <initializer_list>
@@ -17,19 +21,34 @@ namespace strata::m31 {
 class PrefillUploads {
 public:
     struct Part { size_t offset; const void * data; size_t bytes; };
+    struct CopySpan { void * destination; const void * source; size_t bytes; };
+    // An optional owner-supplied synchronous copier may distribute disjoint spans
+    // over a bounded persistent CPU pool. It MUST join all writes before return;
+    // the uploader submits DMA immediately afterward. The owner outlives the ring.
+    using Copier = std::function<void(const CopySpan *, size_t)>;
+    // Only [offset, offset+extent) is written. bytes original weight bytes
+    // are followed by zero padding through extent (the backend alloc size).
+    // Gaps between spans and trailing slot alignment are deliberately untouched.
+    struct Span { size_t offset; const void * data; size_t bytes; size_t extent; };
     struct Stats {
         uint64_t batches = 0, uploads = 0, packed_bytes = 0, upload_bytes = 0;
         uint64_t staging_reuses = 0;
         size_t staging_bytes = 0, depth = 0;
         bool pinned = false, asynchronous = false;
+        // Host wall times only; DMA execution is asynchronous. Collected only
+        // when M31_GPU_EXPERT_PROFILE=1; never interpreted as device timings.
+        double pack_seconds = 0, staging_wait_seconds = 0, submit_seconds = 0;
     };
     // slot_bytes includes quant and alignment padding; each upload zeros all
     // padding before copying Parts. No host/device allocation occurs in enqueue.
     PrefillUploads(ggml_backend_t compute, size_t slot_bytes, size_t depth = 2,
-                   bool allow_async = true, size_t staging_limit = 256 * 1024 * 1024)
-        : compute_(compute), bytes_(slot_bytes) {
+                   bool allow_async = true, size_t staging_limit = 256 * 1024 * 1024,
+                   Copier copier = {})
+        : compute_(compute), bytes_(slot_bytes), copier_(std::move(copier)) {
         require(compute && slot_bytes && depth && depth <= 16 &&
                 slot_bytes <= staging_limit / depth, "invalid bounded staging budget");
+        const char * profile = std::getenv("M31_GPU_EXPERT_PROFILE");
+        profile_ = profile && std::strcmp(profile, "1") == 0;
         stat_.depth = depth;
         stat_.staging_bytes = slot_bytes * depth;
         stages_.resize(depth);
@@ -99,17 +118,28 @@ public:
         }
         auto & stage = stages_[cursor_];
         if (stage.busy) {
+            const auto wait_start = timestamp();
             // CPU packing must not race a DMA still reading this pinned buffer.
             ggml_backend_event_synchronize(stage.event);
             ++stat_.staging_reuses;
+            account(stat_.staging_wait_seconds, wait_start);
         }
         auto * data = stage.buffer ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(stage.buffer))
                                   : stage.fallback.data();
+        const auto pack_start = timestamp();
         std::memset(data, 0, bytes_);
-        for (const auto & part : parts) if (part.bytes) {
+        if (copier_) {
+            require(parts.size() <= 16, "parallel copier accepts at most16 parts");
+            std::array<CopySpan,16> copies;
+            size_t count=0;
+            for (const auto & part:parts) if (part.bytes)
+                copies[count++]={data+part.offset,part.data,part.bytes};
+            copier_(copies.data(),count); // synchronous CPU barrier before DMA
+        } else for (const auto & part : parts) if (part.bytes)
             std::memcpy(data + part.offset, part.data, part.bytes);
-            stat_.packed_bytes += part.bytes;
-        }
+        for (const auto & part:parts) stat_.packed_bytes += part.bytes;
+        account(stat_.pack_seconds, pack_start);
+        const auto submit_start = timestamp();
         if (stat_.asynchronous) {
             ggml_backend_tensor_set_async(transfer_, destination, data, 0, bytes_);
             ggml_backend_event_record(stage.event, transfer_);
@@ -117,20 +147,113 @@ public:
         } else {
             ggml_backend_tensor_set(destination, data, 0, bytes_);
         }
+        account(stat_.submit_seconds, submit_start);
         ++stat_.uploads;
         stat_.upload_bytes += bytes_;
         cursor_ = (cursor_ + 1) % stages_.size();
     }
 
-    // Orders future compute after all uploads without a host synchronization.
-    // It does not overlap this batch's compute with this batch's uploads: the
-    // caller must supply disjoint batches/slots to implement that scheduling.
-    void finish() {
-        require(active_, "finish outside a batch");
+    // Compact role upload. Each role retains its backend-readable quant padding,
+    // while fixed-slot alignment gaps never cross PCIe. Callers must describe ALL
+    // bytes the consumer can read: extent must be the backend allocation size,
+    // not merely the raw tensor size. Old bytes outside these extents are not
+    // meaningful weights and must never be consumed. Source lifetime, events and
+    // destination overwrite protection are identical to enqueue().
+    void enqueue_spans(ggml_tensor * destination, std::initializer_list<Span> spans) {
+        require(active_, "enqueue_spans outside a batch");
+        require(destination && ggml_is_contiguous(destination) && ggml_nbytes(destination) == bytes_,
+                "destination must be one contiguous complete slot");
+        size_t packed = 0;
+        for (auto a = spans.begin(); a != spans.end(); ++a) {
+            require(a->offset <= bytes_ && a->extent <= bytes_ - a->offset &&
+                    a->bytes <= a->extent && (a->data || !a->bytes), "invalid upload span");
+            require(a->extent <= bytes_ - packed, "compact spans exceed staging budget");
+            packed += a->extent;
+            for (auto b = spans.begin(); b != a; ++b)
+                require(!a->extent || !b->extent || a->offset >= b->offset + b->extent ||
+                        b->offset >= a->offset + a->extent, "overlapping upload spans");
+        }
+        auto & stage = stages_[cursor_];
+        if (stage.busy) {
+            const auto wait_start = timestamp();
+            ggml_backend_event_synchronize(stage.event);
+            ++stat_.staging_reuses;
+            account(stat_.staging_wait_seconds, wait_start);
+        }
+        auto * data = stage.buffer ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(stage.buffer))
+                                  : stage.fallback.data();
+        size_t offset = 0;
+        if (copier_) {
+            require(spans.size() <= 16, "parallel copier accepts at most16 spans");
+            const auto pack_start=timestamp();
+            std::array<CopySpan,16> copies;
+            size_t count=0;
+            for (const auto & span:spans) {
+                if (span.bytes) copies[count++]={data+offset,span.data,span.bytes};
+                if (span.extent>span.bytes)
+                    std::memset(data+offset+span.bytes,0,span.extent-span.bytes);
+                offset+=span.extent;
+            }
+            copier_(copies.data(),count); // all role/chunk writes join before any DMA
+            account(stat_.pack_seconds,pack_start);
+            offset=0;
+        }
+        for (const auto & span : spans) {
+            if (!span.extent) continue;
+            if (!copier_) {
+                const auto pack_start = timestamp();
+                if (span.bytes) std::memcpy(data + offset, span.data, span.bytes);
+                if (span.extent > span.bytes)
+                    std::memset(data + offset + span.bytes, 0, span.extent - span.bytes);
+                account(stat_.pack_seconds, pack_start);
+            }
+            const auto submit_start = timestamp();
+            if (stat_.asynchronous)
+                ggml_backend_tensor_set_async(transfer_, destination, data + offset, span.offset, span.extent);
+            else
+                ggml_backend_tensor_set(destination, data + offset, span.offset, span.extent);
+            account(stat_.submit_seconds, submit_start);
+            offset += span.extent;
+            stat_.packed_bytes += span.bytes;
+        }
+        // One event covers every role DMA from this stage. A later ring reuse
+        // may overwrite any of its compact spans only after this event completes.
+        if (stat_.asynchronous && packed) {
+            const auto submit_start = timestamp();
+            ggml_backend_event_record(stage.event, transfer_);
+            stage.busy = true;
+            account(stat_.submit_seconds, submit_start);
+        }
+        ++stat_.uploads;
+        stat_.upload_bytes += packed;
+        cursor_ = (cursor_ + 1) % stages_.size();
+    }
+
+    // Publish all uploads queued so far while keeping this batch open. Consumers
+    // may immediately run on compute while later enqueue calls upload DISJOINT
+    // destination slots. The returned event is borrowed until uploader destruction;
+    // an external CUDA-stream bridge must enqueue its wait before the next
+    // checkpoint/finish, because the same event object is recorded again.
+    // CPU/synchronous fallback returns nullptr: its writes have already completed.
+    // This does not protect a same-batch slot from overwrite; the caller must not
+    // reuse any published slot until that consumer has completed. begin_batch only
+    // protects readers submitted on compute before begin_batch was called.
+    ggml_backend_event_t checkpoint() {
+        require(active_, "checkpoint outside a batch");
         if (stat_.asynchronous) {
             ggml_backend_event_record(ready_, transfer_);
             ggml_backend_event_wait(compute_, ready_);
+            return ready_;
         }
+        return nullptr;
+    }
+
+    // Orders future compute after all uploads without a host synchronization.
+    // Checkpoints permit upload/compute overlap only when the caller supplies
+    // disjoint slots and a compute API that does not synchronize each subset.
+    void finish() {
+        require(active_, "finish outside a batch");
+        checkpoint();
         active_ = false;
         ++stat_.batches;
     }
@@ -142,6 +265,11 @@ public:
     const Stats & stats() const { return stat_; }
 
 private:
+    using Clock = std::chrono::steady_clock;
+    Clock::time_point timestamp() const { return profile_ ? Clock::now() : Clock::time_point{}; }
+    void account(double & total, Clock::time_point begin) const {
+        if (profile_) total += std::chrono::duration<double>(Clock::now() - begin).count();
+    }
     struct Stage {
         ggml_backend_buffer_t buffer = nullptr;
         ggml_backend_event_t event = nullptr;
@@ -169,8 +297,9 @@ private:
     ggml_backend_t compute_ = nullptr, transfer_ = nullptr;
     ggml_backend_event_t ready_ = nullptr, readers_ = nullptr;
     size_t bytes_ = 0, cursor_ = 0;
+    Copier copier_;
     std::vector<Stage> stages_;
     Stats stat_;
-    bool active_ = false;
+    bool active_ = false, profile_ = false;
 };
 } // namespace strata::m31

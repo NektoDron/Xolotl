@@ -27,8 +27,49 @@ def load_case(path: Path):
         raise ValueError(f"{path}: token count mismatch")
     if (path / "logits.f32").stat().st_size != len(positions) * vocab * 4:
         raise ValueError(f"{path}: truncated/extra logits")
+    chunks = manifest.get('actual_chunks', [])
+    if chunks:
+        next_position = 0
+        for chunk in chunks:
+            if (not isinstance(chunk, dict) or type(chunk.get('position')) is not int
+                    or type(chunk.get('tokens')) is not int or chunk['position'] != next_position
+                    or chunk['tokens'] <= 0):
+                raise ValueError(f"{path}: invalid actual chunk sequence")
+            next_position += chunk['tokens']
+        if next_position != n:
+            raise ValueError(f"{path}: actual chunks do not cover input")
     values = np.memmap(path / "logits.f32", dtype="<f4", mode="r", shape=(len(positions), vocab))
     return manifest, values
+
+
+def execution_chunks(manifest):
+    if manifest.get('actual_chunks'):
+        return [(chunk['position'], chunk['tokens']) for chunk in manifest['actual_chunks']]
+    # Legacy frozen references predate actual_chunks; recover their fixed policy.
+    if type(manifest.get('chunk')) is not int or manifest['chunk'] <= 0:
+        return None
+    total, limit, tail = manifest['tokens'], manifest['chunk'], manifest.get('decode_tail', 0)
+    prefix = max(0, total - tail)
+    chunks, position = [], 0
+    while position < total:
+        count = 1 if tail and position >= prefix else min(limit, (prefix if tail else total) - position)
+        chunks.append((position, count))
+        position += count
+    return chunks
+
+
+def full_last_layer_before_crop(manifest):
+    value = manifest.get('full_last_layer_before_crop')
+    if value is not None and type(value) is not bool:
+        raise ValueError('invalid last-layer crop policy flag')
+    bounded_oracle = manifest.get('engine') == 'llama.cpp-PR31192' and manifest.get('head_tail', 0) > 0
+    if bounded_oracle:
+        # Old bounded references selected rows before FFN59. Missing metadata
+        # must retain that historical meaning rather than silently mean "full".
+        return False if value is None else value
+    if value is False:
+        raise ValueError('last-layer crop policy contradicts native/default-all execution')
+    return True
 
 
 def compare_case(reference: Path, candidate: Path, batch_rows=8):
@@ -37,6 +78,12 @@ def compare_case(reference: Path, candidate: Path, batch_rows=8):
     for key in ("model", "tokens", "vocab", "positions", "kv"):
         if a[key] != b[key]:
             raise ValueError(f"{candidate.name}: {key} differs from reference")
+    if a.get('head_tail', 0) != b.get('head_tail', 0):
+        raise ValueError(f"{candidate.name}: head_tail differs from reference")
+    if a.get('head_tail', 0) and execution_chunks(a) != execution_chunks(b):
+        raise ValueError(f"{candidate.name}: bounded head actual chunk geometry differs from reference")
+    if full_last_layer_before_crop(a) != full_last_layer_before_crop(b):
+        raise ValueError(f"{candidate.name}: full last-layer crop policy differs from reference")
     if (reference / "tokens.i32").read_bytes() != (candidate / "tokens.i32").read_bytes():
         raise ValueError(f"{candidate.name}: token IDs differ")
     total_kl = total_sq = max_kl = max_abs = 0.0
@@ -68,7 +115,9 @@ def compare_case(reference: Path, candidate: Path, batch_rows=8):
                 top1=same / count, mean_kl=total_kl / count, max_kl=max_kl,
                 worst_position=worst_position, max_abs=max_abs,
                 logits_rms=(total_sq / (count * a["vocab"])) ** .5,
-                full_rows=a["positions"] == list(range(a["tokens"])))
+                full_rows=a["positions"] == list(range(a["tokens"])), head_tail=a.get('head_tail', 0),
+                full_last_layer_before_crop={'reference': full_last_layer_before_crop(a),
+                                             'candidate': full_last_layer_before_crop(b)})
 
 
 def compare_suite(reference: Path, candidate: Path, top1=.99, mean_kl=1e-5,
@@ -82,19 +131,24 @@ def compare_suite(reference: Path, candidate: Path, top1=.99, mean_kl=1e-5,
                 raise ValueError(f"incomplete case: {p}")
     if not ref or ref.keys() != cand.keys():
         raise ValueError("case sets differ or are empty")
-    cases = [compare_case(ref[name], cand[name]) for name in sorted(ref)]
     if require_suite:
         for name in ref:
             rm, _ = load_case(ref[name])
             cm, _ = load_case(cand[name])
             if rm["engine"] != "llama.cpp-PR31192" or cm["engine"] != "xolotl-m31-correctness":
                 raise ValueError("M1 requires the PR oracle and the independent Xolotl engine")
+            if rm.get('oracle_op_offload', False):
+                raise ValueError('M1 requires the strict CPU expert oracle; GPU op-offload is a separate placement contract')
+            if execution_chunks(rm) != execution_chunks(cm):
+                raise ValueError('M1 requires matching actual chunk geometry')
+    cases = [compare_case(ref[name], cand[name]) for name in sorted(ref)]
+    if require_suite:
         groups = {name.split("_", 1)[0] for name in ref}
         if len(cases) != 20 or not {"ru", "en", "code", "math"} <= groups:
             raise ValueError("M1 requires exactly 20 RU/EN/code/math cases")
         if min(c["tokens"] for c in cases) != 64 or max(c["tokens"] for c in cases) != 3000:
             raise ValueError("M1 requires the 64..3000-token range")
-        if not all(64 <= c["tokens"] <= 3000 and c["full_rows"] for c in cases):
+        if not all(64 <= c["tokens"] <= 3000 and c["full_rows"] and c['head_tail'] == 0 for c in cases):
             raise ValueError("M1 acceptance requires every row of every prompt")
         if sum(c["tokens"] > 2048 for c in cases) < 4:
             raise ValueError("not enough sparse-selection cases")

@@ -52,12 +52,19 @@ class RPC:
 
     def close(self):
         if self.process.poll() is None:
-            self.process.terminate()
+            # An idle helper exits normally on EOF, releasing Engine and flushing
+            # its GPU/cache counters. SIGTERM bypasses those destructors.
+            with contextlib.suppress(BrokenPipeError, OSError, ValueError):
+                self.process.stdin.close()
             try:
                 self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait()
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
 
 
 def validate_messages(messages):

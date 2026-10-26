@@ -1,5 +1,6 @@
 #include "m31_run.hpp"
 #include "llama.h"
+#include "llama-ext.h"
 #include "ggml-cpu.h"
 
 #include <climits>
@@ -149,6 +150,12 @@ int main(int argc, char ** argv) {
         if (args.taps != "none") { cp.cb_eval = callback; cp.cb_eval_user_data = &capture; }
         Context ctx(llama_init_from_model(model.get(), cp));
         if (!ctx) throw std::runtime_error("cannot initialize PR context");
+        if (args.head_tail) {
+            // Selecting logits normally crops before the final FFN. Preserve
+            // native's full-token last-layer routing/histogram and crop only
+            // before the bounded head, using the PR's supported layer-tap API.
+            llama_set_embeddings_layer_inp(ctx.get(), uint32_t(llama_model_n_layer(model.get())), true);
+        }
         const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         Batch batch(args.chunk);
         for (const auto & path : cases) {
@@ -159,14 +166,17 @@ int main(int argc, char ** argv) {
             capture.dump = &dump;
             for (int pos = 0; pos < int(ids.size()); ) {
                 const int n = run::chunk_size(args, int(ids.size()), pos);
+                dump.record_chunk(pos, n);
                 batch.b.n_tokens = n;
                 for (int r = 0; r < n; ++r) {
                     batch.b.token[r] = ids[size_t(pos + r)];
                     batch.b.pos[r] = pos + r;
                     batch.b.n_seq_id[r] = 1;
                     batch.b.seq_id[r][0] = 0;
-                    // All outputs keep the last-layer taps aligned with every input row.
-                    batch.b.logits[r] = true;
+                    // Default all outputs preserve the existing M1 contract.
+                    // The explicit bounded mode matches native's contiguous head
+                    // width without allocating vocab*8192 output/scratch.
+                    batch.b.logits[r] = !args.head_tail || r >= n - std::min(n, args.head_tail);
                 }
                 capture.pos0 = pos;
                 if (llama_decode(ctx.get(), batch.b) != 0) throw std::runtime_error("PR llama_decode failed");

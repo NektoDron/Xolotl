@@ -16,6 +16,12 @@ def main():
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,180}", args.unit):
         parser.error("invalid systemd unit name")
     job = args.job.resolve(strict=True)
+    invalidated = job.parent / 'INVALIDATED.json'
+    if invalidated.exists():
+        parser.error(f'каталог помечен {invalidated}; этот кандидат отклонён, подготовьте новый job')
+    backup = Path('/etc/aictl') / ('config.json.bak-m31-port-' + job.stem)
+    if backup.exists() or backup.is_symlink():
+        parser.error(f'бэкап {backup} уже существует: нужен уникальный basename job JSON, одного нового имени unit недостаточно')
     spec = json.loads(job.read_text())
     if not isinstance(spec.get("measurement", True), bool):
         parser.error("measurement must be boolean")

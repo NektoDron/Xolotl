@@ -3,6 +3,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <vector>
 
 namespace strata::m31 {
 class GpuHostExecutor {
@@ -11,6 +12,9 @@ public:
         unsigned threads = 32;          // includes the submitting thread; 1..64
         size_t parallel_threshold = 32; // smaller calls never wake workers
         size_t minimum_rows_per_worker = 4;
+        // Optional exact worker placement; affinity[0] is the caller during jobs.
+        // Empty preserves the affinity inherited when the executor was created.
+        std::vector<unsigned> affinity;
     };
     struct Stats {
         size_t serial_jobs = 0, parallel_jobs = 0, worker_ranges = 0;

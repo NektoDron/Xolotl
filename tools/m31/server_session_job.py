@@ -39,9 +39,13 @@ def main():
     def telemetry():
         with Path(str(prefix) + ".telemetry.jsonl").open("x") as f:
             while not stop.is_set():
-                gpu = subprocess.run(["nvidia-smi", "-i", "0", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+                fields = ('memory.used', 'clocks.sm', 'clocks.mem', 'temperature.gpu', 'power.draw',
+                          'pcie.link.gen.gpucurrent', 'pcie.link.width.current')
+                gpu = subprocess.run(["nvidia-smi", "-i", "0", "--query-gpu=" + ','.join(fields), "--format=csv,noheader,nounits"],
                                      capture_output=True, text=True, timeout=10, check=False)
-                record = {"monotonic": time.monotonic(), "gpu0_used_mib": gpu.stdout.strip()}
+                values = [value.strip() for value in gpu.stdout.strip().split(',')]
+                record = {"monotonic": time.monotonic(), "gpu0_used_mib": values[0] if gpu.returncode == 0 else '',
+                          'gpu0': dict(zip(fields, values)), 'gpu_query_returncode': gpu.returncode}
                 # Include native engine descendants, not only the Python HTTP process.
                 processes = [server.pid]
                 rss = {}
@@ -94,12 +98,23 @@ def main():
         result.update(returncode=1, error=str(error) or type(error).__name__)
     finally:
         if server is not None and server.poll() is None:
-            os.killpg(server.pid, signal.SIGTERM)
+            # Signal only the adapter first. It closes helper stdin and waits for
+            # normal Engine destruction, so final profiling counters reach stderr.
+            server.terminate()
+            result['server_shutdown'] = 'adapter-sigterm/helper-eof'
             try:
-                server.wait(timeout=30)
+                server.wait(timeout=45)
             except subprocess.TimeoutExpired:
-                os.killpg(server.pid, signal.SIGKILL)
-                server.wait()
+                result['server_shutdown'] = 'group-sigterm-fallback'
+                os.killpg(server.pid, signal.SIGTERM)
+                try:
+                    server.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    result['server_shutdown'] = 'group-sigkill-fallback'
+                    os.killpg(server.pid, signal.SIGKILL)
+                    server.wait()
+        if server is not None:
+            result['server_returncode'] = server.poll()
         stop.set()
         if monitor is not None:
             monitor.join(timeout=12)

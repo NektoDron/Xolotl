@@ -33,12 +33,12 @@ if [ "$M31_MODE" = cuda ]; then
     if [ -f "$M31_VENDOR/ggml/CMakeLists.txt" ]; then
         M31_FLAGS+=("-DFETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP=$M31_VENDOR")
     fi
-    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
+    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_M31_CPU_QUANTS_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
                 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCUDAToolkit_ROOT=/usr/local/cuda
                 -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14
                 '-DCMAKE_CUDA_FLAGS=-U_GNU_SOURCE -D_DEFAULT_SOURCE -include /home/nekto/.local/include/cuda13_glibc_compat.h')
 else
-    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=OFF -DSTRATA_GGML_CUDA=OFF)
+    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=OFF -DSTRATA_GGML_CUDA=OFF -DSTRATA_M31_CPU_QUANTS_CUDA=OFF)
 fi
 # Root CMake fetches its own pinned ggml and applies its patch in OUR build tree.
 # Never point its write-capable FetchContent path at up5 or the reference agent's worktree.
@@ -48,7 +48,7 @@ if ! grep -q '^STRATA_M31:BOOL=ON$' "$M31_BUILD/CMakeCache.txt"; then
     cmake -S "$M31_ROOT" -B "$M31_BUILD" "${M31_FLAGS[@]}"
 fi
 check_ref
-cmake --build "$M31_BUILD" --target m31_inspect m31_generate m31_serve m31_expert_check -j "${M31_JOBS:-16}"
+cmake --build "$M31_BUILD" --target m31_inspect m31_generate m31_serve m31_expert_check -j "${M31_JOBS:-24}"
 check_ref
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 CUDA_VISIBLE_DEVICES=
 python3 "$M31_ROOT/tools/m31/tests/test_compare.py"

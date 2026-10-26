@@ -41,6 +41,77 @@ class CompareTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "token IDs differ"):
             compare_suite(self.ref, self.cand)
 
+    def test_bounded_head_contract_mismatch_refused(self):
+        candidate = self.cand / 'tiny/manifest.json'
+        manifest = json.loads(candidate.read_text())
+        manifest['head_tail'] = 64
+        candidate.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'head_tail differs'):
+            compare_suite(self.ref, self.cand)
+        reference = self.ref / 'tiny/manifest.json'
+        manifest = json.loads(reference.read_text())
+        manifest['head_tail'] = 64
+        manifest['full_last_layer_before_crop'] = True
+        reference.write_text(json.dumps(manifest))
+        result = compare_suite(self.ref, self.cand)
+        self.assertTrue(result['pass'])
+        self.assertEqual(result['scope'], 'diagnostic')
+        self.assertEqual(result['cases'][0]['head_tail'], 64)
+
+    def test_bounded_head_chunk_geometry_refused(self):
+        for root, chunks in ((self.ref, [{'position': 0, 'tokens': 3}]),
+                             (self.cand, [{'position': 0, 'tokens': 2}, {'position': 2, 'tokens': 1}])):
+            path = root / 'tiny/manifest.json'
+            manifest = json.loads(path.read_text())
+            manifest.update(head_tail=64, actual_chunks=chunks, full_last_layer_before_crop=True)
+            path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'actual chunk geometry differs'):
+            compare_suite(self.ref, self.cand)
+
+    def test_partial_actual_chunk_coverage_refused(self):
+        path = self.cand / 'tiny/manifest.json'
+        manifest = json.loads(path.read_text())
+        manifest['actual_chunks'] = [{'position': 0, 'tokens': 2}]
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'actual chunks do not cover'):
+            compare_suite(self.ref, self.cand)
+
+    def test_explicit_last_layer_crop_policy_refused(self):
+        for root, full in ((self.ref, True), (self.cand, False)):
+            path = root / 'tiny/manifest.json'
+            manifest = json.loads(path.read_text())
+            manifest['full_last_layer_before_crop'] = full
+            path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'last-layer crop policy'):
+            compare_suite(self.ref, self.cand)
+
+    def test_legacy_bounded_oracle_crop_is_not_native_full_layer(self):
+        for root in (self.ref, self.cand):
+            path = root / 'tiny/manifest.json'
+            manifest = json.loads(path.read_text())
+            manifest['head_tail'] = 64
+            path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'last-layer crop policy differs'):
+            compare_suite(self.ref, self.cand)
+
+    def test_gpu_offload_oracle_is_not_strict_m1(self):
+        path = self.ref / 'tiny/manifest.json'
+        manifest = json.loads(path.read_text())
+        manifest['oracle_op_offload'] = True
+        path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'strict CPU expert oracle'):
+            compare_suite(self.ref, self.cand, require_suite=True)
+
+    def test_full_gate_requires_same_actual_chunks(self):
+        for root, chunks in ((self.ref, [{'position': 0, 'tokens': 3}]),
+                             (self.cand, [{'position': 0, 'tokens': 2}, {'position': 2, 'tokens': 1}])):
+            path = root / 'tiny/manifest.json'
+            manifest = json.loads(path.read_text())
+            manifest['actual_chunks'] = chunks
+            path.write_text(json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, 'matching actual chunk geometry'):
+            compare_suite(self.ref, self.cand, require_suite=True)
+
     def test_corruption_and_nonfinite(self):
         path = self.cand / "tiny/logits.f32"
         values = np.fromfile(path, dtype="<f4")

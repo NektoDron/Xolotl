@@ -13,6 +13,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace strata::m31::run {
@@ -20,7 +21,7 @@ namespace fs = std::filesystem;
 
 struct Args {
     std::string model, ids, cases, out, backend = "cpu", rows = "all", taps = "none";
-    int chunk = 128, context = 4096, threads = 32, decode_tail = 0;
+    int chunk = 128, context = 4096, threads = 32, decode_tail = 0, head_tail = 0;
     double arena_gib = 0;
     double gpu_experts_gib = 0;
     int gpu_experts_min_tokens = 32;
@@ -52,6 +53,7 @@ inline Args parse(int argc, char ** argv) {
         else if (k == "--ctx") a.context = integer();
         else if (k == "--threads") a.threads = integer();
         else if (k == "--decode-tail") a.decode_tail = integer();
+        else if (k == "--head-tail") a.head_tail = integer();
         else if (k == "--gpu-experts-min-tokens") a.gpu_experts_min_tokens = integer();
         else if (k == "--oracle-op-offload") {
             if (v != "0" && v != "1") throw std::runtime_error("expected 0|1 for " + k);
@@ -83,10 +85,12 @@ inline Args parse(int argc, char ** argv) {
     if (a.model.empty() || a.out.empty() || (a.ids.empty() == a.cases.empty()))
         throw std::runtime_error("usage: -m model.gguf (--ids-file x.i32 | --cases DIR) --out NEW-DIR "
                                  "[--backend cpu|cuda --chunk 128 --ctx 4096 --threads 32 "
-                                 "--rows all|last|stride:N --taps none|layers|all]");
+                                 "--rows all|last|last:N|stride:N --head-tail N --taps none|layers|all]");
     if (a.backend != "cpu" && a.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
     if (a.taps != "none" && a.taps != "layers" && a.taps != "all") throw std::runtime_error("invalid taps mode");
-    if (a.chunk > 2048 || a.context > 1048576) throw std::runtime_error("chunk/context above correctness-tool cap");
+    if (a.chunk > 8192 || a.context > 1048576) throw std::runtime_error("chunk/context above correctness-tool cap");
+    if (a.head_tail && (a.taps != "none" || (a.rows != "last" && a.rows.rfind("last:", 0) != 0)))
+        throw std::runtime_error("bounded head requires --rows last|last:N and --taps none");
     if (a.backend == "cuda") {
         const char * session = std::getenv("M31_CARD_SESSION");
         if (!session || std::string(session) != "1")
@@ -137,6 +141,15 @@ inline std::vector<int32_t> read_ids(const fs::path & path) {
 }
 inline std::vector<int> selected_rows(const std::string & spec, int n) {
     if (spec == "last") return {n - 1};
+    if (spec.rfind("last:", 0) == 0) {
+        size_t end = 0;
+        const auto value = spec.substr(5);
+        const int count = std::stoi(value, &end);
+        if (end != value.size() || count <= 0) throw std::runtime_error("invalid last row count");
+        std::vector<int> result;
+        for (int p = std::max(0, n - count); p < n; ++p) result.push_back(p);
+        return result;
+    }
     int stride = 1;
     if (spec != "all") {
         if (spec.rfind("stride:", 0) != 0) throw std::runtime_error("invalid rows spec");
@@ -160,10 +173,21 @@ struct Dump {
     int vocab;
     std::vector<int> positions;
     std::vector<int> written;
+    std::vector<std::pair<int, int>> chunks;
     std::ofstream logits;
     std::ofstream taps;
     Dump(const fs::path & directory, const Args & a, const std::vector<int32_t> & ids, int n_vocab)
         : dir(directory), args(a), vocab(n_vocab), positions(selected_rows(a.rows, int(ids.size()))) {
+        if (a.head_tail) {
+            for (int pos = 0; pos < int(ids.size());) {
+                const int count = chunk_size(a, int(ids.size()), pos);
+                const int head_first = pos + count - std::min(count, a.head_tail);
+                for (int row : positions)
+                    if (row >= pos && row < head_first)
+                        throw std::runtime_error("requested row is outside bounded head tail; increase --head-tail");
+                pos += count;
+            }
+        }
         if (!fs::create_directory(dir)) throw std::runtime_error("case directory already exists: " + dir.string());
         std::ofstream f(dir / "tokens.i32", std::ios::binary);
         f.write(reinterpret_cast<const char *>(ids.data()), std::streamsize(ids.size() * sizeof(int32_t)));
@@ -177,6 +201,17 @@ struct Dump {
         }
     }
     bool wants(int pos) const { return std::binary_search(positions.begin(), positions.end(), pos); }
+    void record_chunk(int pos, int n) {
+        const int expected = chunks.empty() ? 0 : chunks.back().first + chunks.back().second;
+        if (n <= 0 || n > args.chunk || pos != expected)
+            throw std::runtime_error("invalid actual chunk sequence");
+        if (args.head_tail) {
+            const int first = pos + n - std::min(n, args.head_tail);
+            for (int row : positions) if (row >= pos && row < first)
+                throw std::runtime_error("requested row is outside actual bounded head tail");
+        }
+        chunks.emplace_back(pos, n);
+    }
     void row(int pos, const float * values) {
         if (!wants(pos)) return;
         logits.write(reinterpret_cast<const char *>(values), std::streamsize(vocab * sizeof(float)));
@@ -216,6 +251,8 @@ struct Dump {
     }
     void finish(const std::string & engine, int token_count) {
         if (written != positions) throw std::runtime_error("missing/reordered logits rows");
+        if (!chunks.empty() && chunks.back().first + chunks.back().second != token_count)
+            throw std::runtime_error("actual chunks do not cover all input tokens");
         logits.flush();
         if (!logits) throw std::runtime_error("cannot flush logits");
         std::ofstream f(dir / "manifest.json");
@@ -224,6 +261,8 @@ struct Dump {
           << ",\"tokens\":" << token_count << ",\"vocab\":" << vocab
           << ",\"chunk\":" << args.chunk << ",\"context\":" << args.context
           << ",\"decode_tail\":" << args.decode_tail << ",\"threads\":" << args.threads
+          << ",\"head_tail\":" << args.head_tail << ",\"row_selection\":" << quote(args.rows)
+          << ",\"full_last_layer_before_crop\":true"
           << ",\"arena_gib\":" << args.arena_gib
           << ",\"gpu_experts_gib\":" << args.gpu_experts_gib
           << ",\"gpu_experts_min_tokens\":" << args.gpu_experts_min_tokens
@@ -240,7 +279,10 @@ struct Dump {
           << ",\"oracle_op_offload\":" << (args.oracle_op_offload ? "true" : "false")
           << ",\"cuda_fusion_disabled\":" <<
              ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")
-          << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"positions\":[";
+          << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"actual_chunks\":[";
+        for (size_t i = 0; i < chunks.size(); ++i)
+            f << (i ? "," : "") << "{\"position\":" << chunks[i].first << ",\"tokens\":" << chunks[i].second << "}";
+        f << "],\"positions\":[";
         for (size_t i = 0; i < positions.size(); ++i) f << (i ? "," : "") << positions[i];
         f << "]}\n";
         if (!f) throw std::runtime_error("cannot write manifest");

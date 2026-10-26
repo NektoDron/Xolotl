@@ -29,7 +29,7 @@ def main():
     a = p.parse_args()
     if a.port == 8179:
         p.error('8179 is owned by card_worker health; use a separate HTTP port')
-    if a.ctx < (40000 if a.mode == 'full' else 8192) or not 1 <= a.chunk <= 2048 or a.threads < 1:
+    if a.ctx < (40000 if a.mode == 'full' else 8192) or not 1 <= a.chunk <= 8192 or a.threads < 1:
         p.error('insufficient context or invalid chunk/threads; full suite needs >=40000 context')
     a.directory = a.directory.resolve()
     # Existing benchmark scripts append or overwrite their files. Require a new directory.

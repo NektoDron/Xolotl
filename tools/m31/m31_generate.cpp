@@ -51,14 +51,19 @@ int main(int argc, char ** argv) {
                 active_dump = &dump;
                 const auto t0 = std::chrono::steady_clock::now();
                 for (int pos = 0; pos < int(ids.size()); ) {
-                    const int n = run::chunk_size(args, int(ids.size()), pos);
+                    const int requested = run::chunk_size(args, int(ids.size()), pos);
+                    const int n = engine.prefill_chunk(requested, error);
+                    if (n <= 0) throw std::runtime_error(error);
+                    dump.record_chunk(pos, n);
                     if (!engine.forward(ids.data() + pos, n, error)) throw std::runtime_error(error);
                     // Match the oracle's batched head (MMQ vs single-row MMV has
                     // different activation rounding). Chunk bounds vocab scratch.
+                    const int head_count = args.head_tail ? std::min(n, args.head_tail) : n;
+                    const int head_first = n - head_count;
                     std::vector<float> logits;
-                    if (!engine.logits(0, n, logits, error)) throw std::runtime_error(error);
-                    for (int r = 0; r < n; ++r) if (dump.wants(pos + r))
-                        dump.row(pos + r, logits.data() + size_t(r) * engine.geometry().vocab);
+                    if (!engine.logits(head_first, head_count, logits, error)) throw std::runtime_error(error);
+                    for (int r = head_first; r < n; ++r) if (dump.wants(pos + r))
+                        dump.row(pos + r, logits.data() + size_t(r - head_first) * engine.geometry().vocab);
                     pos += n;
                 }
                 dump.finish("xolotl-m31-correctness", int(ids.size()));

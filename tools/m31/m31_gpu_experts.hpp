@@ -18,12 +18,22 @@ public:
     struct Stats {
         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
         uint64_t graph_batches = 0, forwards = 0;
+        uint64_t cached_forwards = 0;
+        // Wall time on the calling thread. Async upload_submit can overlap prior
+        // DMA; execute includes device completion and must not be called pure kernel time.
+        double prepare_seconds = 0, pack_seconds = 0, upload_submit_seconds = 0;
+        double upload_wait_seconds = 0, execute_seconds = 0;
+        double gate_seconds = 0, up_seconds = 0, oai_seconds = 0;
+        double down_seconds = 0, reduce_seconds = 0;
         size_t seeded_slots = 0;
         size_t resident_bytes = 0, peak_resident_bytes = 0, budget_bytes = 0;
         size_t scratch_bytes = 0, minimum_budget_bytes = 0;
         size_t slot_stride = 0, slot_count = 0, pool_bytes = 0, occupied_slots = 0;
         bool pinned_staging = false;
         bool q8_activations = false;
+        uint64_t prefetch_batches = 0, prefetched_experts = 0, prefetch_bytes = 0;
+        double prefetch_wait_seconds = 0;
+        double prefetch_pack_seconds = 0, prefetch_staging_wait_seconds = 0, prefetch_submit_seconds = 0;
     };
     GpuExperts();
     ~GpuExperts();
@@ -42,6 +52,20 @@ public:
     std::vector<float> forward(int layer, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids,
                                const std::vector<float> & weights);
+    // Reuse caller-owned host capacity across layers/chunks. Output must not be
+    // the same vector object as x or weights; on failure the caller must discard it.
+    void forward_into(int layer, int n, const std::vector<float> & x,
+                      const std::vector<int32_t> & ids, const std::vector<float> & weights,
+                      std::vector<float> & output);
+    // A cache miss returns false without uploading, evicting, touching LRU or output.
+    // A hit executes the complete original [used,n] graph, preserving accumulation.
+    // Synchronizes the borrowed backend before exact-dot raw-stream execution.
+    bool forward_cached(int layer, int n, const std::vector<float> & x,
+                        const std::vector<int32_t> & ids, const std::vector<float> & weights,
+                        std::vector<float> & output);
+    // Readable during a live HTTP worker; no destructor or signal shutdown needed.
+    void print_profile(const char * label = "live") const;
+    bool exact_cpu_math() const;
     // Caller first runs cache_seed_preflight.py against current GGUF headers/stats.
     // Expected identity/content hashes come from its trusted receipt, not the rank itself.
     // Cold-cache initialization only; seed DMA is complete before returning.

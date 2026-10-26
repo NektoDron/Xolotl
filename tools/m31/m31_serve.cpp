@@ -50,7 +50,7 @@ int main(int argc, char ** argv) {
             else if (key == "--profile") cfg.profile = std::stoi(value) != 0;
             else throw std::runtime_error("unknown option " + key);
         }
-        if (model.empty() || cfg.context < 1 || cfg.context > 1048576 || cfg.max_chunk < 1 || cfg.max_chunk > 2048 || cfg.threads < 1)
+        if (model.empty() || cfg.context < 1 || cfg.context > 1048576 || cfg.max_chunk < 1 || cfg.max_chunk > 8192 || cfg.threads < 1)
             throw std::runtime_error("invalid model/context/chunk/threads");
         if (backend == "cuda") {
             const char * session = std::getenv("M31_CARD_SESSION");
@@ -124,7 +124,9 @@ int main(int argc, char ** argv) {
                     const auto start = Clock::now();
                     int last_n = 0;
                     for (size_t p = 0; p < ids.size();) {
-                        last_n = int(std::min(size_t(cfg.max_chunk), ids.size() - p));
+                        const int requested = int(std::min(size_t(cfg.max_chunk), ids.size() - p));
+                        last_n = engine.prefill_chunk(requested, error);
+                        if (last_n <= 0) throw std::runtime_error(error);
                         if (!engine.forward(ids.data() + p, last_n, error)) throw std::runtime_error(error);
                         p += size_t(last_n);
                     }

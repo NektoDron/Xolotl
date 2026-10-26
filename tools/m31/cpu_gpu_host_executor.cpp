@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstdlib>
 #include <cstring>
+#include <cstdio>
 #include <condition_variable>
 #include <cstdint>
 #include <exception>
@@ -13,6 +14,10 @@
 #include <thread>
 #include <utility>
 #include <vector>
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 #if defined(__SSE__)
 #include <xmmintrin.h>
 #endif
@@ -70,10 +75,31 @@ struct GpuHostExecutor::Impl {
     explicit Impl(Options options) : cfg(options) {
         if (cfg.threads < 1 || cfg.threads > 64 || !cfg.parallel_threshold || !cfg.minimum_rows_per_worker)
             throw std::invalid_argument("GPU host executor: invalid threads/threshold/grain");
+        if (!cfg.affinity.empty()) {
+            if (cfg.affinity.size() != cfg.threads)
+                throw std::invalid_argument("GPU host executor: affinity must match thread count");
+#if defined(__linux__)
+            for (size_t i = 0; i < cfg.affinity.size(); ++i) {
+                if (cfg.affinity[i] >= CPU_SETSIZE ||
+                    std::find(cfg.affinity.begin(), cfg.affinity.begin() + i, cfg.affinity[i]) != cfg.affinity.begin() + i)
+                    throw std::invalid_argument("GPU host executor: invalid/duplicate CPU affinity");
+            }
+#else
+            throw std::invalid_argument("GPU host executor: explicit affinity requires Linux");
+#endif
+        }
         workers.reserve(cfg.threads - 1);
         try {
-            for (unsigned index = 1; index < cfg.threads; ++index)
+            for (unsigned index = 1; index < cfg.threads; ++index) {
                 workers.emplace_back([this, index] { worker(index); });
+#if defined(__linux__)
+                if (!cfg.affinity.empty()) {
+                    cpu_set_t mask; CPU_ZERO(&mask); CPU_SET(cfg.affinity[index], &mask);
+                    if (pthread_setaffinity_np(workers.back().native_handle(), sizeof(mask), &mask))
+                        throw std::runtime_error("GPU host executor: cannot set worker CPU affinity");
+                }
+#endif
+            }
         } catch (...) {
             { std::lock_guard lock(state); stopping = true; }
             work.notify_all();
@@ -135,6 +161,22 @@ struct GpuHostExecutor::Impl {
         if (closed) throw std::logic_error("GPU host executor: already closed");
         if (!job) throw std::invalid_argument("GPU host executor: empty callback");
         if (!total) return false;
+#if defined(__linux__)
+        struct CallerAffinity {
+            cpu_set_t prior{};
+            bool changed = false;
+            explicit CallerAffinity(const std::vector<unsigned> & cpus) {
+                if (cpus.empty()) return;
+                if (pthread_getaffinity_np(pthread_self(), sizeof(prior), &prior))
+                    throw std::runtime_error("GPU host executor: cannot read caller CPU affinity");
+                cpu_set_t next; CPU_ZERO(&next); CPU_SET(cpus[0], &next);
+                if (pthread_setaffinity_np(pthread_self(), sizeof(next), &next))
+                    throw std::runtime_error("GPU host executor: cannot set caller CPU affinity");
+                changed = true;
+            }
+            ~CallerAffinity() { if (changed) pthread_setaffinity_np(pthread_self(), sizeof(prior), &prior); }
+        } caller_affinity(cfg.affinity);
+#endif
         const unsigned ranges = unsigned(std::min<size_t>(cfg.threads, total / cfg.minimum_rows_per_worker));
         if (total < cfg.parallel_threshold || ranges < 2) {
             serial_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -185,7 +227,16 @@ struct GpuHostExecutor::Impl {
         closed = true;
     }
 };
-GpuHostExecutor::GpuHostExecutor(Options options) : p_(std::make_unique<Impl>(options)) {}
+GpuHostExecutor::GpuHostExecutor(Options options) : p_(std::make_unique<Impl>(options)) {
+    int inherited_cpus = -1;
+#if defined(__linux__)
+    cpu_set_t allowed;
+    if (!pthread_getaffinity_np(pthread_self(), sizeof(allowed), &allowed)) inherited_cpus = CPU_COUNT(&allowed);
+#endif
+    std::fprintf(stderr, "M31 persistent host executor: threads=%u workers=%u min_rows=%zu grain=%zu explicit_cpus=%zu inherited_cpus=%d\n",
+        options.threads, options.threads - 1, options.parallel_threshold, options.minimum_rows_per_worker,
+        options.affinity.size(), inherited_cpus);
+}
 GpuHostExecutor::~GpuHostExecutor() = default;
 bool GpuHostExecutor::parallel_rows(size_t count, const Rows & callback) { return p_->submit(count, callback); }
 void GpuHostExecutor::close() { p_->shutdown(); }
@@ -195,6 +246,10 @@ GpuHostExecutor::Stats GpuHostExecutor::stats() const {
 GpuHostExecutor::Options GpuHostExecutor::options() const { return p_->cfg; }
 GpuHostExecutor::Options gpu_host_options_from_environment() {
     GpuHostExecutor::Options options;
+    for (const auto & names : {std::pair{"M31_GPU_CPU_QUANTS_HOST_THREADS", "M31_GPU_HOST_THREADS"},
+                               std::pair{"M31_GPU_SORT_ROUTES", "M31_GPU_EXPERT_SORT_ROUTES"}}) {
+        if (std::getenv(names.first)) throw std::invalid_argument(std::string("M31 runtime: unknown environment ") + names.first + "; use " + names.second);
+    }
     auto number = [](const char * name, size_t fallback, size_t maximum) {
         const char * value = std::getenv(name);
         if (!value) return fallback;
