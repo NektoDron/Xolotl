@@ -37,8 +37,14 @@ Sampling supports greedy `temperature:0`, temperature/top-k/top-p/min-p,
 The default chain is top-k40, top-p.95, min-p.05, then temperature1.0. The C++ RNG is
 not bit-identical to llama.cpp. Nonzero repeat/frequency/presence penalties,
 logit bias, response schemas, grammar constraints and forced tool choice are
-rejected. Automatic tools use the reference prompt/parser but **do not apply its
-lazy sampling grammar**; do not treat this as grammar-equivalent tools quality.
+rejected. Automatic tools use the reference prompt/parser and its real lazy
+GBNF sampler in the isolated vocab helper. The worker proposes a sampled token;
+the helper checks it and accepts it only after validation. If rejected, the helper
+filters the whole vocabulary and returns allowed IDs; the worker resamples the
+original logits with the same sampling chain on that support. It does not use a
+greedy fallback. Plain responses under auto remain permitted. The PR reasoning
+budget sampler suppresses grammar within thinking blocks and replays the end
+sequence when thinking finishes. Each chat request rebuilds the grammar state.
 `tool_choice:auto|none` is supported. Images/video are explicitly rejected.
 
 Responses include `usage` and llama-compatible `timings` with prompt/prediction
@@ -91,3 +97,14 @@ Validation on aiserver, 2026-10-26:
   retained; v2 passes after rebuild.
 - These checks do not establish real HTTP generation quality or server speed.
   The coordinator performs GPU correctness and performance gates separately.
+
+
+Port4 CPU checks: private `build-server-eval/m31_tokenizer` builds against audited
+PR libraries; C++ server syntax checks pass. `server-grammar-tests.log` records
+**15/15** protocol and real vocab-only tests in 0.603s: lazy triggering, text-only
+auto replies, trigger inside reasoning, Unicode nested object/array arguments,
+two calls, rejection of an unknown function name with allowed token IDs, reset,
+and cancellation during a proposal. A real inference request using this new
+handshake still needs an HTTP gate; tools23/GSM8K100 are not yet measured.
+`--cpu-decode-cache` is forwarded to the opt-in engine flag; its correctness and
+speed are checked separately by the CPU agent.

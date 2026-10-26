@@ -23,12 +23,12 @@ using namespace strata::m31;
 static double ms(Clock::time_point start) { return std::chrono::duration<double, std::milli>(Clock::now() - start).count(); }
 static void send(const json & value) { std::cout << value.dump() << '\n' << std::flush; }
 static int sample(const std::vector<float> & logits, double temperature, double top_p, int top_k, double min_p,
-                  const std::set<int> & excluded, std::mt19937_64 & rng) {
+                  const std::set<int> & excluded, std::mt19937_64 & rng, const std::set<int> * allowed = nullptr) {
     std::vector<std::pair<float, int>> values;
     values.reserve(logits.size());
     for (size_t i = 0; i < logits.size(); ++i) {
         if (!std::isfinite(logits[i])) throw std::runtime_error("nonfinite logits");
-        if (!excluded.count(int(i))) values.emplace_back(logits[i], int(i));
+        if (!excluded.count(int(i)) && (!allowed || allowed->count(int(i)))) values.emplace_back(logits[i], int(i));
     }
     if (values.empty()) throw std::runtime_error("empty sampling support");
     if (temperature <= 0) return std::max_element(values.begin(), values.end(), [](auto a, auto b) { return a.first < b.first; })->second;
@@ -69,6 +69,7 @@ int main(int argc, char ** argv) {
             else if (key == "--gpu-experts-min-tokens") cfg.gpu_experts_min_tokens = std::stoi(value);
             else if (key == "--reuse-allocations") cfg.reuse_allocations = std::stoi(value) != 0;
             else if (key == "--persistent-cpu-pool") cfg.persistent_cpu_pool = std::stoi(value) != 0;
+            else if (key == "--cpu-decode-cache") cfg.cpu_decode_cache = std::stoi(value) != 0;
             else if (key == "--cpu-residual") cfg.cpu_residual = std::stoi(value) != 0;
             else if (key == "--profile") cfg.profile = std::stoi(value) != 0;
             else throw std::runtime_error("unknown option " + key);
@@ -113,6 +114,23 @@ int main(int argc, char ** argv) {
                     if (ignore_eos) excluded.insert(stop_ids.begin(), stop_ids.end());
                     const uint64_t seed = req.value("seed", uint64_t(std::random_device{}()));
                     std::mt19937_64 rng(seed);
+                    std::vector<float> logits_for_sampling;
+                    auto choose = [&]() {
+                        int token = sample(logits_for_sampling, temperature, top_p, top_k, min_p, excluded, rng);
+                        if (!req.value("grammar_check", false)) return token;
+                        for (int attempt = 0; attempt < 2; ++attempt) {
+                            send({{"event", "sample"}, {"token", token}});
+                            std::string response;
+                            if (!std::getline(std::cin, response)) throw std::runtime_error("grammar controller disconnected");
+                            const auto control = json::parse(response);
+                            if (control.value("accepted", false)) return token;
+                            const auto ids = control.at("allowed").get<std::vector<int>>();
+                            const std::set<int> allowed(ids.begin(), ids.end());
+                            if (allowed.empty()) throw std::runtime_error("empty grammar sampling support");
+                            token = sample(logits_for_sampling, temperature, top_p, top_k, min_p, excluded, rng, &allowed);
+                        }
+                        throw std::runtime_error("grammar rejected filtered sample");
+                    };
                     engine.reset();
                     const auto start = Clock::now();
                     int last_n = 0;
@@ -121,11 +139,10 @@ int main(int argc, char ** argv) {
                         if (!engine.forward(ids.data() + p, last_n, error)) throw std::runtime_error(error);
                         p += size_t(last_n);
                     }
-                    std::vector<float> logits;
-                    if (maximum && !engine.logits(last_n - 1, 1, logits, error)) throw std::runtime_error(error);
+                    if (maximum && !engine.logits(last_n - 1, 1, logits_for_sampling, error)) throw std::runtime_error(error);
                     // The reference counts the first sample in prefill and measures n_gen-1
                     // generation steps, ending at the final sample rather than token transport.
-                    int sampled = maximum ? sample(logits, temperature, top_p, top_k, min_p, excluded, rng) : -1;
+                    int sampled = maximum ? choose() : -1;
                     const auto decode_start = Clock::now();
                     auto decode_end = decode_start;
                     const double prompt_ms = std::chrono::duration<double, std::milli>(decode_start - start).count();
@@ -133,7 +150,7 @@ int main(int argc, char ** argv) {
                     int predicted = 0;
                     std::string finish = "length";
                     for (int i = 0; i < maximum; ++i) {
-                        if (i > 0) sampled = sample(logits, temperature, top_p, top_k, min_p, excluded, rng);
+                        if (i > 0) sampled = choose();
                         const int token = sampled;
                         decode_end = i > 0 ? Clock::now() : decode_start;
                         ++predicted;
@@ -146,7 +163,7 @@ int main(int argc, char ** argv) {
                         }
                         if (i + 1 < maximum) {
                             const int32_t next = token;
-                            if (!engine.forward(&next, 1, error) || !engine.logits(0, 1, logits, error)) throw std::runtime_error(error);
+                            if (!engine.forward(&next, 1, error) || !engine.logits(0, 1, logits_for_sampling, error)) throw std::runtime_error(error);
                         }
                     }
                     const double predicted_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();

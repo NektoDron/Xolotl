@@ -27,6 +27,7 @@ static std::vector<llama_token> tokenize(const llama_vocab * vocab, const std::s
 static void check_ids(const llama_vocab * vocab, const std::vector<llama_token> & ids) {
     for (auto token : ids) if (token < 0 || token >= llama_vocab_n_tokens(vocab)) throw std::runtime_error("token out of vocabulary");
 }
+#include "server_grammar.hpp"
 int main(int argc, char ** argv) {
     if (argc != 2) { std::fprintf(stderr, "usage: m31_tokenizer MODEL.gguf\n"); return 2; }
     setenv("CUDA_VISIBLE_DEVICES", "", 1);
@@ -41,6 +42,7 @@ int main(int argc, char ** argv) {
         const auto * vocab = llama_model_get_vocab(model.get());
         auto templates = common_chat_templates_init(model.get(), "");
         common_chat_params chat_params;
+        ServerGrammar grammar;
         common_chat_msg previous_message;
         bool have_chat = false;
         std::vector<int> eog;
@@ -96,13 +98,24 @@ int main(int argc, char ** argv) {
                     if (req.contains("chat_template_kwargs")) for (auto it = req["chat_template_kwargs"].begin(); it != req["chat_template_kwargs"].end(); ++it)
                         inputs.chat_template_kwargs[it.key()] = it.value().dump();
                     chat_params = common_chat_templates_apply(templates.get(), inputs);
+                    grammar.init(vocab, chat_params);
                     have_chat = true;
                     previous_message = {};
                     previous_message.role = "assistant";
                     const std::string prompt = chat_params.prompt.str();
                     auto ids = tokenize(vocab, prompt, false, true);
                     send({{"tokens", ids}, {"prompt", prompt}, {"generation_prompt", chat_params.generation_prompt},
-                          {"additional_stops", chat_params.additional_stops}, {"format", common_chat_format_name(chat_params.format)}});
+                          {"additional_stops", chat_params.additional_stops}, {"format", common_chat_format_name(chat_params.format)},
+                          {"grammar_active", grammar.active()}, {"grammar_lazy", chat_params.grammar_lazy}});
+                } else if (op == "grammar_check") {
+                    if (!have_chat || !grammar.active()) throw std::runtime_error("chat tool grammar is not active");
+                    const auto token = req.at("token").get<int>();
+                    check_ids(vocab, {token});
+                    const bool accepted = grammar.allowed(token);
+                    if (accepted) {
+                        if (req.value("accept", true)) grammar.accept(token);
+                        send({{"accepted", true}});
+                    } else send({{"accepted", false}, {"allowed", grammar.allowed_ids()}});
                 } else if (op == "parse") {
                     if (!have_chat) throw std::runtime_error("chat must precede parse");
                     common_chat_parser_params pp(chat_params);

@@ -79,6 +79,32 @@ class ProtocolTests(unittest.TestCase):
             list(app.events({"tokens": [-1]}, []))
         self.assertEqual(len(engine.writes), 1)
 
+    def test_grammar_proposal_and_resample_handshake(self):
+        engine = FakeEngine([{"event": "sample", "token": 99}, {"event": "sample", "token": 10},
+                             {"event": "token", "token": 10}, done()])
+        class GrammarTokenizer(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "grammar_check":
+                    return {"accepted": True} if req["token"] == 10 else {"accepted": False, "allowed": [10]}
+                return super().call(req)
+        app = server.Application(engine, GrammarTokenizer({10: b"ok"}))
+        events = list(app.events({"tokens": [1], "grammar_check": True}, []))
+        self.assertEqual(engine.writes[1:3], [{"accepted": False, "allowed": [10]}, {"accepted": True}])
+        self.assertEqual(events[-1]["message"]["content"], "ok")
+
+    def test_cancellation_drains_pending_grammar_proposal(self):
+        engine = FakeEngine([{"event": "prefill"}, {"event": "sample", "token": 10},
+                             {"event": "token", "token": 10}, done()])
+        class GrammarTokenizer(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "grammar_check": return {"accepted": True}
+                return super().call(req)
+        app = server.Application(engine, GrammarTokenizer({10: b"ok"}))
+        events = app.events({"tokens": [1], "grammar_check": True}, [])
+        self.assertEqual(next(events)["event"], "prefill")
+        events.close()
+        self.assertEqual(engine.writes[-2:], [{"accepted": True}, {"continue": False}])
+
     def test_sampling_rejects_invalid_numbers_and_context_overflow(self):
         for body in ({"top_p": float("nan")}, {"temperature": -1}, {"min_p": 1.1}, {"top_k": True}, {"max_tokens": 129}):
             with self.assertRaises(ValueError):
@@ -144,6 +170,49 @@ class RealTokenizerTests(unittest.TestCase):
                 self.assertTrue((message.get(key) or "").startswith(previous.get(key) or ""), (index, previous, message))
             previous = message
         self.assertEqual(previous["content"], "Ответ")
+
+    def grammar_tokens(self, text, accept=True):
+        ids = self.helper.call({"op": "tokenize", "content": text, "parse_special": True})["tokens"]
+        for token in ids:
+            result = self.helper.call({"op": "grammar_check", "token": token, "accept": accept})
+            self.assertTrue(result["accepted"], (text, token, result))
+        return ids
+
+    def test_lazy_grammar_allows_text_reasoning_and_resets(self):
+        tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {}}}}]
+        rendered = self.chat(tools)
+        self.assertTrue(rendered["grammar_active"])
+        self.assertTrue(rendered["grammar_lazy"])
+        ns = "]<]minimax[>["
+        # A tool trigger within reasoning must not activate tool grammar.
+        self.grammar_tokens('<mm:think>' + ns + '<tool_call>' + ns + '<invoke name="missing">рассуждение</mm:think>Ответ без вызова')
+        self.chat(tools)
+        self.grammar_tokens("Простой ответ 🐈 без инструментов")
+        self.assertFalse(self.chat()["grammar_active"])
+
+    def test_lazy_grammar_nested_unicode_and_multiple_calls(self):
+        tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {
+            "obj": {"type": "object", "properties": {"value": {"type": "integer"}}, "required": ["value"]},
+            "items": {"type": "array", "items": {"type": "string"}}}, "required": ["obj", "items"]}}}]
+        ns = "]<]minimax[>["
+        invocation = (ns + '<invoke name="probe">' + ns + '<obj>' + ns + '<value>7' + ns + '</value>' + ns + '</obj>' +
+                      ns + '<items>' + ns + '<item>один 🐈' + ns + '</item>' + ns + '</items>' + ns + '</invoke>')
+        text = ns + '<tool_call>' + invocation + invocation + ns + '</tool_call>'
+        self.chat(tools, thinking=False)
+        self.grammar_tokens(text)
+        message = self.parse(text)
+        self.assertEqual(len(message["tool_calls"]), 2)
+        self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"obj": {"value": 7}, "items": ["один 🐈"]})
+        # A new request resets the finished grammar. Reject an unknown function name
+        # and return real PR-filtered candidates for resampling.
+        self.chat(tools, thinking=False)
+        self.grammar_tokens(ns + '<tool_call>' + ns + '<invoke name="')
+        bad = self.helper.call({"op": "tokenize", "content": "DefinitelyMissingTool", "parse_special": True})["tokens"][0]
+        result = self.helper.call({"op": "grammar_check", "token": bad})
+        self.assertFalse(result["accepted"])
+        self.assertTrue(result["allowed"])
+        self.assertNotIn(bad, result["allowed"])
+        self.grammar_tokens('probe">')
 
     def test_nested_xml_tool_and_continuation_template(self):
         tools = [{"type": "function", "function": {"name": "probe", "description": "test",

@@ -6,7 +6,7 @@
 
 ```bash
 python3 tools/m31/bench_m31.py --out /mnt/ai/logs/m31-port/bench-plan-v1.json \
-  plan --arm m31-xolotl-v1 --port 8179 \
+  plan --arm m31-xolotl-v1 --port 8180 \
   --directory /mnt/ai/logs/m31-port/bench-v1
 ```
 
@@ -49,3 +49,26 @@ backend flags (включая nofusion), arena/cache budget, KV/context/chunk/th
 server log и peak VRAM/RSS. Если реализация использует F16 KV, а референс q8_0,
 это прямо отметить: F16 увеличивает память и уменьшает экспертный кеш.
 M1 nofusion/op_offload=false oracle — эталон logits, не speed baseline.
+
+## Подготовленный временный пресет
+
+`server_make_session.py` создаёт новый каталог с reviewable session/job/manifest,
+ничего не запускает и не меняет `/etc/aictl/config.json`:
+
+```bash
+python3 tools/m31/server_make_session.py \
+  --directory /mnt/ai/logs/m31-port/my-new-server-run --arm my-new-server-run \
+  --ctx 8192 --mode speed4k --cpu-decode-cache
+```
+
+`manifest.json` содержит точный argv для systemd-run + card_session и команду
+точечного отката. Card session временно устанавливает `m31-xolotl`, сохраняет
+бэкап, берёт card lock и эксклюзивный `.build.lock`, ждёт возврата up, затем
+снимает модель и собственный ключ пресета. До запуска координатор объявляет
+окно замера. Порт8180 — HTTP; 8179 занят health самого worker.
+
+`--mode full --ctx 65536` подготавливает обе серии 4K/16K/32K и GSM8K100/tools23.
+До такого запуска требуется отдельная проверка памяти на указанном контексте:
+нынешний KV F16 отличается от Q8_0 референса. `--mode smoke` не запускает скорость.
+`--engine` и `--tokenizer` позволяют выбрать проверенную отдельную сборку.
+Полный quality gate пока не выполнен; CPU vocab-тесты grammar не заменяют tools23.

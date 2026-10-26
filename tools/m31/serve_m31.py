@@ -157,6 +157,7 @@ class Application:
                                            "enable_thinking": kwargs.get("enable_thinking", True), "chat_template_kwargs": kwargs})
             ids = rendered["tokens"]
             extra_stops = rendered.get("additional_stops", [])
+            grammar_active = rendered.get("grammar_active", False)
         else:
             prompt = body.get("prompt", "")
             if isinstance(prompt, str):
@@ -166,10 +167,11 @@ class Application:
             else:
                 raise ValueError("prompt must be a string or token ID array")
             extra_stops = []
+            grammar_active = False
         if not ids:
             raise ValueError("empty prompt")
         params, stops = request_parameters(body, self.context, len(ids))
-        params.update(tokens=ids, stop_ids=self.tokenizer.ready["eog"], suppress_ids=self.tokenizer.ready.get("suppress", []))
+        params.update(grammar_check=grammar_active, tokens=ids, stop_ids=self.tokenizer.ready["eog"], suppress_ids=self.tokenizer.ready.get("suppress", []))
         return params, stops + extra_stops
 
     def piece(self, token):
@@ -192,7 +194,9 @@ class Application:
                 if event.get("event") == "error":
                     completed = True
                     raise RuntimeError(event["error"])
-                if event["event"] == "prefill":
+                if event["event"] == "sample":
+                    self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
+                elif event["event"] == "prefill":
                     yield event
                 elif event["event"] == "token":
                     waiting_ack = True
@@ -250,7 +254,9 @@ class Application:
                 if not waiting_ack:
                     while True:
                         event = self.engine.read()
-                        if event["event"] == "token":
+                        if event["event"] == "sample":
+                            self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
+                        elif event["event"] == "token":
                             waiting_ack = True
                             break
                         if event["event"] in ("done", "error"):
@@ -396,7 +402,7 @@ def main():
     parser.add_argument("--arena-gib", type=float, default=0)
     parser.add_argument("--gpu-experts-gib", type=float, default=0)
     parser.add_argument("--gpu-experts-min-tokens", type=int, default=32)
-    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "profile"):
+    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "profile"):
         parser.add_argument("--" + flag, action="store_true")
     args = parser.parse_args()
     if args.backend == "cuda" and os.environ.get("M31_CARD_SESSION") != "1":
@@ -404,7 +410,7 @@ def main():
     argv = [args.engine, "--model", args.model, "--backend", args.backend, "--ctx", str(args.ctx),
             "--chunk", str(args.chunk), "--threads", str(args.threads), "--arena-gib", str(args.arena_gib),
             "--gpu-experts-gib", str(args.gpu_experts_gib), "--gpu-experts-min-tokens", str(args.gpu_experts_min_tokens)]
-    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "profile"):
+    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
     tokenizer = RPC([args.tokenizer, args.model])
     engine = None

@@ -147,7 +147,7 @@ def main():
     modes = parser.add_subparsers(dest="mode", required=True)
     prep = modes.add_parser("plan", help="print exact existing benchmark commands; do not execute")
     prep.add_argument("--arm", required=True)
-    prep.add_argument("--port", type=int, default=8179)
+    prep.add_argument("--port", type=int, default=8180)
     prep.add_argument("--directory", required=True)
     prep.add_argument("--home", default="/home/nekto")
     summary = modes.add_parser("summarize", help="read saved om_bench TSV and eval JSONL")
