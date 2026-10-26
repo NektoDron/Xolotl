@@ -1,0 +1,89 @@
+# GPU correctness, port4
+
+2026-10-26. Fixed VRAM slots + layer `mul_mat_id` проверены на code128.
+
+- `gpu-slot-code128-compare-v2.json`: против GPU-offload oracle **128/128 top1, KL0, maxabs0, побитно**.
+- `gpu-slot-vs-cpu-code128-v2.json`: против исходного M1 CPU oracle top1=.78125, meanKL=.7785709318, maxKL8.68356237. Это в точности oracle GPU-vs-CPU, т.е. дополнительная ошибка grouped/MMVQ устранена.
+- Штатные IQ3/IQ4 CUDA операции квантуют активации Q8_1 (32 элемента), CPU Q8_K (256); NVFP4 CPU Q8_0. `--gpu-q8-activations` не заменяет Q8_1 на Q8_K. Принятый M1 CPU oracle не меняем.
+- Полная synthetic tiny CUDA модель не поддержана: head geometry fixture вызывает abort в CUDA FA (`fattn.cu:761`) до MoE. CPU tiny ранее проходит. Для маленькой CUDA проверки нужен изолированный expert probe.
+- Real code128: arena pack72.975с; forward11.137с (диагностика, не speed benchmark); slots248×25909632B, pool6425588736B, uploads133020050688B, misses5134, scratch22025216B. Cache6GiB, chunk128, threads64, nofusion.
+
+Следующий шаг: opt-in CUDA dot с CPU Q8_K/Q8_0 activation quantization и совместимым AVX2 FMA порядком накопления. Сначала single expert, затем full code128 против неизменённого CPU oracle. M2 GPU acceptance ещё нет.
+
+## CPU-quant compatible CUDA proof
+
+`gpu-cpu-quants-probe-v1/report.json`: original expert0 слоёв3/10/52, n7,
+все gate/up/down и full OAI FFN промежуточные стадии **побитно равны CPU**.
+Проверены IQ3_XXS/IQ4_XS/NVFP4 и external NVFP4 scale.
+`gpu_cpu_quants.cu` использует штатный CPU activation quantizer Q8_K/Q8_0 и
+CUDA integer dots с тем же AVX2 8-lane/FMA/reduction порядком. OAI пока CPU.
+Новый CMake option `STRATA_M31_CPU_QUANTS_CUDA` OFF default; исполнение отдельно
+включается `M31_GPU_CPU_QUANTS=1`. Это прототип корректности, ещё не скорость.
+Сборка link-only `build-gpu-correctness`, vendor archives не менялись.
+
+## Осторожно: n7 не покрывает CPU tiled dispatch
+
+Первый full-model CPU-compatible prototype gate128 **не прошёл**:
+top1=.7578125, meanKL=.76127884. Он ещё не пригоден для M1/M2.
+`gpu-cpu-quants-code128-compare-v1.json`.
+
+Найдено ещё одно CPU отличие: IQ3/IQ4 CPU `MUL_MAT_ID` при >=8 назначениях одному
+эксперту включает `ggml-cpu/tiled/tiled.cpp`. Там целочисленная сумма по256
+элементам преобразуется в F32, затем `sum*weight_d` умножается на activation_d
+с FMA в накопитель (подтверждено linked object disassembly); для IQ3 weight_d уже включает0.25. При<8 используется
+AVX2 vec_dot с8 FMA накопителями. Выбор делается per-expert, не по общему n.
+
+`gpu-cpu-quants-probe-n128-v1/report.json`: при n128 отличие CUDA AVX2-compatible
+от CPU tiled составляет relL2≈1.1–1.4e-7 для matmul,1.69e-7 full FFN.
+Это доказывает различие накопления, но пока не доказывает, что оно объясняет
+всю full-model ошибку. Source исправления dispatch по histogram IDs написан,
+сборка/повтор отложены на окно CPU speed координатора.
+
+Tiled source учитывает отдельный weight mul + FMA с activation_d.
+Хотя исходник VNNI содержит отдельные mul+add intrinsics, GCC14 -O3 сворачивает
+их в vfmadd213ps; проверен objdump linked tiled-kernel.cpp.o.
+На aiserver подтверждены AVX512VNNI/VL/DQ (gcc14 -march=native predefines).
+Опциональный `M31_GPU_CPU_QUANTS_PROFILE=1` печатает только диагностическое
+время host quantization и общего H2D/kernel/D2H; это не speed benchmark.
+`M31_GPU_QUANTS_DEBUG_DIR` сохраняет реальные input/IDs/gate/up/down/result
+MoE3 для per-role диагностики. CPU OAI и staging roundtrips ещё присутствуют.
+
+Ограничение прототипа: точная FP-совместимость проверяется с данным
+`ggml-cpu` aiserver (gcc14 -O3 -march=native, EPYC9654, AVX2+FMA,
+AVX512VNNI). Kernel требует AVX2+FMA CPU build. Переносимость на иные
+компиляторы/`-ffp-contract` не заявляется; общий штатный ggml CUDA default
+не меняется. CPU OAI — диагностический компромисс; perf acceptance отдельно.
+
+## v2: vecdot/tiled arithmetic проверена
+
+`gpu-cpu-quants-probe-v2/report.json`: **36 cases**, слои3/10/52,
+n1/7/128, отдельные gate/up/down и full FFN. Все промежуточные
+`cuda_cpu_quants` результаты **побитно CPU** (bad0), включая tiled n128
+и NVFP4 down scale. Доказывает совместимость как vecdot, так и tiled.
+Полный code128v2 с реальными MoE3 dumps запущен отдельно; результата пока нет.
+
+## Code128v2 принят против неизменённого M1 CPU oracle
+
+`gpu-cpu-quants-code128-compare-v2.json`: **top1=1, meanKL=maxKL=maxabs=0,
+все128 позиций/25,608,192 logits побитно**. Юнит
+`codex-m31-port4-gpu-cpu-quants-code128-v2` rc0, down+rollback выполнены.
+M1 oracle и исходные веса не менялись, GPU0 через aictl/card lock.
+
+`gpu-quants-l3-compare-v2.json`: реальные MoE3 input, исходные512 expert IDs,
+gate/up и сумма routed output побитны CPU oracle. В слое3 одновременно
+29 tiled экспертов (>=8 назначений) и60 vecdot экспертов.
+
+Диагностический один forward128:13.719с (не M2 benchmark).
+171 matrix calls: host activation quantization228.957мс;
+H2D+kernel+D2H1001.056мс; scratch14381056B. Cache248 slots /6425588736B,
+misses5142, uploads133227327744B. CPU OAI, pageable small activation packing,
+синхронные roundtrips ещё присутствуют. Массовая загрузка экспертных весов
+остаётся главным видимым расходом этого конкретного пути; полное профилирование
+и speed window ещё нужны перед количественными выводами.
+
+Бинарник `build-gpu-correctness/m31_generate`, source snapshot в
+`build-gpu-correctness/source` (до добавления dense_decode_cache), совместно
+собраны engine/header/CLI и GPU modules. `gpu-build-engine-quants-v2.log`.
+Build option STRATA_M31_CPU_QUANTS_CUDA=ON и env M31_GPU_CPU_QUANTS=1 обязательны;
+default остаётся штатный ggml CUDA, который побитен GPU-offload oracle, но
+не соответствует исходному CPU oracle. Полный gate20 пока не запускался.

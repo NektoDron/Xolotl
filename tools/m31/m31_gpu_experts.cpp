@@ -1,6 +1,9 @@
 #include "m31_gpu_experts.hpp"
 
 #include "ggml-alloc.h"
+#ifdef M31_CPU_QUANTS_CUDA
+#include "gpu_cpu_quants.hpp"
+#endif
 #ifdef M31_ENGINE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -12,6 +15,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <filesystem>
+#include <fstream>
 #include <map>
 #include <numeric>
 #include <set>
@@ -82,6 +87,9 @@ struct GpuExperts::Impl {
     uint64_t clock = 0;
     int max_chunk = 0;
     bool ready = false;
+#ifdef M31_CPU_QUANTS_CUDA
+    std::unique_ptr<GpuCpuQuants> cpu_quants;
+#endif
 
     ~Impl() {
         if (backend) {
@@ -161,6 +169,70 @@ struct GpuExperts::Impl {
                                const std::vector<int32_t> & mapped_ids,
                                const std::vector<float> & route_weights,
                                const std::array<std::vector<float>, 3> & scales) {
+#ifdef M31_CPU_QUANTS_CUDA
+        if (cpu_quants) {
+            const char * debug_dir = std::getenv("M31_GPU_QUANTS_DEBUG_DIR");
+            auto dump = [&](const std::string & name, const auto & values) {
+                if (!debug_dir || layer != 3) return;
+                std::filesystem::create_directories(debug_dir);
+                const auto path = std::filesystem::path(debug_dir) / ("l3_"+name+".bin");
+                std::ofstream file(path, std::ios::binary);
+                file.write(reinterpret_cast<const char *>(values.data()), std::streamsize(values.size()*sizeof(values[0])));
+                check(bool(file), "cannot write requested GPU quant debug dump");
+            };
+            dump("input", x);
+            dump("mapped_ids", mapped_ids);
+            dump("route_weights", route_weights);
+            if (debug_dir && layer == 3) {
+                std::vector<int32_t> original_ids(mapped_ids.size(), -1);
+                for (const auto & entry : entries) if (int(entry.first/uint64_t(g.experts)) == layer)
+                    for (size_t route = 0; route < mapped_ids.size(); ++route)
+                        if (mapped_ids[route] == int32_t(entry.second.slot)) original_ids[route] = int32_t(entry.first%uint64_t(g.experts));
+                dump("original_ids", original_ids);
+            }
+            const auto & info = layers[size_t(layer)];
+            const auto * pool_base = static_cast<const uint8_t *>(ggml_backend_buffer_get_base(pool));
+            auto mm = [&](int role, const std::vector<float> & activation) {
+                const int columns = role == 2 ? int(g.expert_ff) : int(g.embd);
+                const int rows = role == 2 ? int(g.embd) : int(g.expert_ff);
+                auto out = cpu_quants->multiply(info.types[size_t(role)], pool_base + info.offsets[size_t(role)],
+                                                stat.slot_stride, columns, rows, int(g.used), n, activation, mapped_ids);
+                if (info.has_scale[size_t(role)]) {
+                    for (size_t route = 0; route < mapped_ids.size(); ++route)
+                        for (int row = 0; row < rows; ++row)
+                            out[route*size_t(rows)+size_t(row)] *= scales[size_t(role)][size_t(mapped_ids[route])];
+                }
+                return out;
+            };
+            const auto gate = mm(0, x);
+            const auto up = mm(1, x);
+            dump("gate", gate);
+            dump("up", up);
+            std::vector<float> activation(gate.size());
+            for (size_t i = 0; i < gate.size(); ++i) {
+                const float a = std::min(gate[i], 7.f), b = std::clamp(up[i], -7.f, 7.f);
+                const float glu = a / (1.f + expf(1.702f*(-a)));
+                activation[i] = glu*(b+1.f);
+            }
+            dump("activation", activation);
+            const auto down = mm(2, activation);
+            dump("down", down);
+            std::vector<float> result(size_t(g.embd)*n);
+            for (int token = 0; token < n; ++token) for (int row = 0; row < g.embd; ++row) {
+                float sum = 0;
+                for (int rank = 0; rank < g.used; ++rank) {
+                    const size_t route = size_t(token)*size_t(g.used)+size_t(rank);
+                    const float term = down[route*size_t(g.embd)+size_t(row)]*route_weights[route];
+                    sum = rank == 0 ? term : sum+term;
+                }
+                result[size_t(token)*size_t(g.embd)+size_t(row)] = sum;
+            }
+            dump("result", result);
+            stat.scratch_bytes = std::max(stat.scratch_bytes, cpu_quants->scratch_bytes());
+            ++stat.graph_batches;
+            return result;
+        }
+#endif
         Context context(8 * 1024 * 1024);
         auto c = context.value;
         auto graph = ggml_new_graph_custom(c, 8192, false);
@@ -330,6 +402,17 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
     std::fprintf(stderr, "M31 GPU experts: fixed_slots=%zu slot_stride=%zu pool_bytes=%zu budget=%zu pinned=%d source_q8=%d (layer mul_mat_id; graph scratch separate)\n",
                  p_->stat.slot_count, p_->stat.slot_stride, p_->stat.pool_bytes, p_->stat.budget_bytes,
                  int(p_->stat.pinned_staging), int(p_->stat.q8_activations));
+#ifdef M31_CPU_QUANTS_CUDA
+    const char * cpu_quants = std::getenv("M31_GPU_CPU_QUANTS");
+    if (cpu_quants && std::string(cpu_quants) == "1") {
+        for (int l = int(g.dense_lead); l < g.layers; ++l)
+            for (auto type : p_->layers[size_t(l)].types)
+                check(type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_NVFP4,
+                      "CPU-compatible CUDA dot does not support this weight type");
+        p_->cpu_quants = std::make_unique<GpuCpuQuants>();
+        std::fprintf(stderr, "M31 GPU experts: experimental CPU Q8_K/Q8_0 activation quants, CPU OAI, CUDA AVX2-compatible dot\n");
+    }
+#endif
     p_->ready = true;
 }
 

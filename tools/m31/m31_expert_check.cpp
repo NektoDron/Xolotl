@@ -5,6 +5,9 @@
 #include "m31_run.hpp"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
+#ifdef M31_CPU_QUANTS_CUDA
+#include "gpu_cpu_quants.hpp"
+#endif
 #ifdef M31_HAVE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -169,9 +172,39 @@ struct Mode {
     std::string name;
     ggml_backend_t backend;
     const WeightSet * weights;
-    bool indirect = false, q8 = false;
+    bool indirect = false, q8 = false, cpu_quants = false;
 };
 Outputs evaluate(const Mode & mode, int role, int n, const std::vector<float> & input, bool acc_f32) {
+#ifdef M31_CPU_QUANTS_CUDA
+    if (mode.cpu_quants) {
+        GpuCpuQuants gpu;
+        Outputs output;
+        const auto & w = *mode.weights;
+        std::vector<int32_t> ids(size_t(n), 0);
+        auto mm = [&](int r, const std::vector<float> & activation, const std::string & name) {
+            const auto * weight = w.tensors[size_t(r)];
+            auto raw = gpu.multiply(weight->type, weight->data, weight->nb[2], int(weight->ne[0]), int(weight->ne[1]), 1, n, activation, ids);
+            output[name + "_raw"] = raw;
+            for (auto & value : raw) value *= w.scales[size_t(r)];
+            output[name + "_scaled"] = raw;
+            return raw;
+        };
+        if (role >= 0) mm(role, input, "mm");
+        else {
+            const auto gate = mm(0, input, "gate");
+            const auto up = mm(1, input, "up");
+            std::vector<float> activation(gate.size());
+            for (size_t i = 0; i < gate.size(); ++i) {
+                const float x = std::min(gate[i], 7.f), y = std::clamp(up[i], -7.f, 7.f);
+                const float glu = x / (1.f + expf(1.702f * (-x)));
+                activation[i] = glu * (y + 1.f);
+            }
+            output["oai"] = activation;
+            mm(2, activation, "down");
+        }
+        return output;
+    }
+#endif
     Context context(8 * 1024 * 1024);
     auto c = context.value;
     auto graph = ggml_new_graph_custom(c, 2048, false);
@@ -332,6 +365,9 @@ int main(int argc, char ** argv) {
                     modes.push_back({"cuda_id_q8", gpu.value, gpu_weights.get(), true, true});
                 }
             }
+#ifdef M31_CPU_QUANTS_CUDA
+            if (gpu.value) modes.push_back({"cuda_cpu_quants", gpu.value, gpu_weights.get(), true, false, true});
+#endif
             for (int n : args.tokens) for (int role : {0, 1, 2, -1}) {
                 const std::string role_name = role < 0 ? "full" : role == 0 ? "gate" : role == 1 ? "up" : "down";
                 const std::string stem = "l" + std::to_string(layer) + "_n" + std::to_string(n) + "_" + role_name;
