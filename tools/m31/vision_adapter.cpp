@@ -6,6 +6,7 @@
 #include "chat.h"
 #include "json.hpp"
 #include <cmath>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -98,8 +99,11 @@ int main(int argc, char ** argv) {
         const int embd = std::stoi(embd_meta);
         if (embd != 6144) throw std::runtime_error("unexpected MiniMax embedding dimension");
         const bool encode = spec.value("encode", false);
+        const std::string encoder_mode = spec.value("encoder_mode", std::string("batch"));
+        if (encoder_mode != "batch" && encoder_mode != "single") throw std::runtime_error("encoder_mode must be batch|single");
         json manifest = {{"format", "m31-vision-ipc-v1"}, {"source_pr", "6b95a9908d2c7b242817a447708aec38e937e2c0"},
             {"backend", "cpu"}, {"llm_inference", false}, {"encoded", encode}, {"n_embd", embd},
+            {"encoder_mode", encoder_mode}, {"encoder_threads", params.n_threads},
             {"media", media_meta}, {"video_fps", opt.video_params.fps_target}, {"timestamp_interval_ms", opt.video_params.timestamp_interval_ms},
             {"chunks", json::array()}, {"encoder_batches", json::array()}};
         size_t row = 0, visual_row = 0;
@@ -141,7 +145,21 @@ int main(int argc, char ** argv) {
             manifest["chunks"].push_back(part);
             row += n;
         }
-        if (encode) {
+        const auto encode_start = std::chrono::steady_clock::now();
+        auto save_embedding = [&](size_t j, const float * values) {
+            const auto count = mtmd_input_chunk_get_n_tokens(images[j]) * size_t(embd);
+            if (!values) throw std::runtime_error("missing encoder output");
+            for (size_t k=0; k<count; ++k) if (!std::isfinite(values[k])) throw std::runtime_error("nonfinite embedding");
+            const auto name = manifest["chunks"][image_indices[j]]["embeddings"].get<std::string>();
+            save(out/name, values, count);
+        };
+        if (encode && encoder_mode == "single") {
+            for (size_t j=0; j<images.size(); ++j) {
+                if (mtmd_encode_chunk(ctx.get(), images[j])) throw std::runtime_error("single-chunk encoder computation failed");
+                save_embedding(j, mtmd_get_output_embd(ctx.get()));
+                manifest["encoder_batches"].push_back(json::array({image_indices[j]}));
+            }
+        } else if (encode) {
             for (size_t first=0; first<images.size();) {
                 std::unique_ptr<mtmd_batch, decltype(&mtmd_batch_free)> batch(mtmd_batch_init(ctx.get()), mtmd_batch_free);
                 size_t end = first;
@@ -154,16 +172,13 @@ int main(int argc, char ** argv) {
                 if (mtmd_batch_encode(batch.get())) throw std::runtime_error("encoder computation failed");
                 json group = json::array();
                 for (size_t j=first; j<end; ++j) {
-                    auto * values = mtmd_batch_get_output_embd(batch.get(), images[j]);
-                    const auto count = mtmd_input_chunk_get_n_tokens(images[j]) * size_t(embd);
-                    if (!values) throw std::runtime_error("missing encoder output");
-                    for (size_t k=0; k<count; ++k) if (!std::isfinite(values[k])) throw std::runtime_error("nonfinite embedding");
-                    const auto name = manifest["chunks"][image_indices[j]]["embeddings"].get<std::string>();
-                    save(out/name, values, count); group.push_back(image_indices[j]);
+                    save_embedding(j, mtmd_batch_get_output_embd(batch.get(), images[j]));
+                    group.push_back(image_indices[j]);
                 }
                 manifest["encoder_batches"].push_back(group); first=end;
             }
         }
+        manifest["encode_seconds"] = encode ? std::chrono::duration<double>(std::chrono::steady_clock::now()-encode_start).count() : 0;
         manifest["rows"] = row; manifest["visual_rows"] = visual_row;
         std::ofstream result(out/"manifest.json"); result << manifest.dump(2) << '\n';
         if (!result) throw std::runtime_error("cannot save manifest");

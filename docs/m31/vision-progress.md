@@ -57,12 +57,53 @@ python3 tools/m31/vision_verify_reference.py /mnt/ai/logs/m31-port/vision-next
 `vision_prepare_jobs.py --encode` включает настоящий CPU encoder через
 `mtmd_batch_add_chunk/mtmd_batch_encode`; единый пакет кадров собирается после
 кодирования независимо от поддержанного mtmd encoder batch size. Не запускать
-encode в окно скорости. В этой контрольной точке encode не запускался,
-raw F32 embeddings и их parity ещё не измерены; сравнение pixel values тоже
-не заявляется: проверены resize geometry/token spans.
+encode в окно скорости. На первом этапе encode не запускался; его последующая
+проверка описана ниже. Сравнение pixel values не заявляется: публичный API
+позволяет выгрузить preprocessing geometry, но не сами normalized pixel buffers.
 
-Следующее: CPU encode PNG (и повтор с другим encoder batching для проверки
-детерминизма), затем12 кадров. После этого отдельно реализовать native
+После сверки CPU encoder отдельно реализовать native
 `Engine.forward_embeddings`/mixed rows, проверить main logits против mtmd,
 и только затем подключать HTTP vision и измерять TTFT. Текущие server/engine
 файлы не менялись, GPU/пресеты/aictl не затрагивались.
+
+## Второй этап: настоящие F32 encoder rows
+
+Добавлен `encoder_mode="single"`: прямой `mtmd_encode_chunk()` +
+`mtmd_get_output_embd()`. Исходный `encoder_mode="batch"` использует
+`mtmd_batch_add_chunk()` + `mtmd_batch_encode()` + per-chunk output pointer.
+Оба пути используют один audited PR backend; это проверка adapter/IPC,
+а не независимая проверка native encoder Xolotl.
+
+Первый PNG CPU16: encoder1.301с, полный процесс2.60с, maxRSS1.92GiB.
+Получены1837056 конечных F32 values, shape `[299,6144]`; диапазон
+[-35.26296,793.1085]. Повтор через single API: encoder1.299с.
+Это диагностическое время encoder, не M2 speedbenchmark и не полный TTFT.
+
+Видео через batch API: encoder14.646с,12×299=3588 visual rows.
+Готов единый mixed-row пакет3863 позиций с F32 `[3588,6144]`
+(`video-batch-batch/visual.f32`,88178688байт). Настоящий mtmd encoder PR
+**не поддерживает multi-image batching MiniMax**: даже с budget4096
+`mtmd_batch_add_chunk()` разбил12 кадров на12 encoder calls. Общий LLM
+пакет всех кадров при этом собран один раз. Не выдавать это за ускорение
+или единый encoder forward всех12 изображений.
+
+Рабочие артефакты `/mnt/ai/logs/m31-port/vision-encode-v1/`.
+Каждый encode выполнен отдельным CPU процессом под shared `.build.lock`
+через `systemd-run User=nekto`, GPU скрыта, use_gpu=false,16 потоков.
+`vision_validate_encode.sh` последовательно выполняет independent API paths
+и пишет image/video compare reports со строгими atol0/rtol0.
+
+Проверка завершена: unit `codex-m31-port4-vision-encode-compare-v1` rc0.
+PNG single/batch и все12 видео-кадров single/batch **побитно совпали**:
+maxabs0, relativeL2=0 по каждому кадру. Видео single encode14.679с,
+maxRSS обоих видеопутей≈1.95GiB. Все F32 arrays имеют ожидаемый размер и
+конечные значения; assembled visual files тоже побитно совпали.
+`image-compare.json`, `video-compare.json`, `summary.json` сохраняют точные
+времена, размеры, SHA256 файлов и пределы проверки. Прежние text token IDs,
+frame IDs, geometry и абсолютные позиции также совпали с preprocessing-v3.
+
+Для продолжения native mixed-input path готов пакет
+`vision-encode-v1/video-batch-batch/manifest.json`:3863 последовательные
+позиции,3588 visual rows,275 текстовых token IDs. Actual encoder parity
+проверена между двумя PR API путями; собственного native encoder ещё нет,
+native main logits и HTTP vision не проверялись. GPU не занималась.
