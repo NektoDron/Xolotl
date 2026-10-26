@@ -1,9 +1,12 @@
 #include "m31_gpu_experts.hpp"
+#include "cache_seed_rank.hpp"
+#include "cache_seed_receipt.hpp"
 #include "prefill_pipeline.hpp"
 
 #include "ggml-alloc.h"
 #ifdef M31_CPU_QUANTS_CUDA
 #include "gpu_cpu_quants.hpp"
+#include "cpu_gpu_host_ops.hpp"
 #endif
 #ifdef M31_ENGINE_CUDA
 #include "ggml-cuda.h"
@@ -85,6 +88,7 @@ struct GpuExperts::Impl {
     ggml_gallocr_t allocator = nullptr;
     std::vector<Layer> layers;
     std::map<uint64_t, Entry> entries;
+    std::set<uint64_t> seeded_keys;
     Stats stat;
     uint64_t clock = 0;
     int max_chunk = 0;
@@ -131,7 +135,7 @@ struct GpuExperts::Impl {
         } else {
             auto victim = entries.end();
             for (auto it = entries.begin(); it != entries.end(); ++it)
-                if (!protected_keys.count(it->first) &&
+                if (!protected_keys.count(it->first) && !seeded_keys.count(it->first) &&
                     (victim == entries.end() || it->second.last_used < victim->second.last_used)) victim = it;
             check(victim != entries.end(), "all cache slots are protected; increase expert cache budget");
             slot = victim->second.slot;
@@ -238,11 +242,7 @@ struct GpuExperts::Impl {
             dump("gate", gate);
             dump("up", up);
             std::vector<float> activation(gate.size());
-            for (size_t i = 0; i < gate.size(); ++i) {
-                const float a = std::min(gate[i], 7.f), b = std::clamp(up[i], -7.f, 7.f);
-                const float glu = a / (1.f + expf(1.702f*(-a)));
-                activation[i] = glu*(b+1.f);
-            }
+            gpu_host_oai_rows(cpu_quants->host_executor(), size_t(g.expert_ff), gate, up, activation);
             dump("activation", activation);
             const auto down = mm(2, activation);
             dump("down", down);
@@ -451,6 +451,37 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
     }
 #endif
     p_->ready = true;
+    const char * hot_text = std::getenv("M31_GPU_SEED_HOT");
+    if (hot_text && *hot_text) {
+        try {
+            const std::string count_text(hot_text);
+            check(count_text.find_first_not_of("0123456789") == std::string::npos, "seed hot count must be an unsigned integer");
+            const uint64_t hot = std::stoull(count_text);
+            if (hot) {
+                auto env = [](const char * name) {
+                    const char * value = std::getenv(name);
+                    check(value && *value, std::string("missing required seed environment: ")+name);
+                    return std::string(value);
+                };
+                const auto rank_path = env("M31_GPU_SEED_PATH");
+                const auto identity = cache_seed::hex_digest(env("M31_GPU_SEED_IDENTITY"));
+                const auto rank_sha = cache_seed::hex_digest(env("M31_GPU_SEED_SHA256"));
+                const auto receipt = cache_seed::read_receipt(env("M31_GPU_SEED_RECEIPT"),
+                    cache_seed::hex_digest(env("M31_GPU_SEED_RECEIPT_SHA256")));
+                check(receipt.expected.identity == identity && receipt.expected.file_sha256 == rank_sha,
+                      "seed environment hashes differ from trusted preflight receipt");
+                check(std::filesystem::canonical(rank_path).string() == receipt.rank_path,
+                      "seed environment rank path differs from trusted preflight receipt");
+                check(receipt.hot == hot && receipt.slots == p_->stat.slot_count,
+                      "seed hot count/cache slots differ from trusted preflight receipt");
+                cache_seed::verify_current_model(receipt, model);
+                seed_hot(rank_path, receipt.expected, size_t(hot));
+            }
+        } catch (...) {
+            p_->ready = false; // A failed env initialization must never expose a usable partial cache.
+            throw;
+        }
+    }
 }
 
 std::vector<float> GpuExperts::forward(int layer, int n, const std::vector<float> & x,
@@ -508,6 +539,8 @@ std::vector<float> GpuExperts::forward(int layer, int n, const std::vector<float
             p_->cpu_quants.reset(); // cudaFree also drains its independent raw stream.
 #endif
             p_->entries.clear();
+            p_->seeded_keys.clear();
+            p_->stat.seeded_slots = 0;
             p_->free_slots.clear();
             for (size_t slot = 0; slot < p_->stat.slot_count; ++slot)
                 p_->free_slots.push_back(p_->stat.slot_count-slot-1);
@@ -521,6 +554,45 @@ std::vector<float> GpuExperts::forward(int layer, int n, const std::vector<float
                 p_->ready = false; // Failed recovery is terminal; forward refuses reuse.
             }
         }
+        throw;
+    }
+}
+
+void GpuExperts::seed_hot(const std::string & rank_path, const cache_seed::ExpectedRank & expected,
+                           size_t hot_count) {
+    check(p_->ready, "seed initialization requires a ready cache");
+    check(p_->entries.empty() && p_->stat.forwards == 0 && p_->seeded_keys.empty(),
+          "seed initialization is allowed only before the first forward on a cold cache");
+    check(expected.layers == uint32_t(p_->g.layers) && expected.experts == uint32_t(p_->g.experts) &&
+          expected.dense_lead == uint32_t(p_->g.dense_lead), "seed geometry differs from loaded model");
+    const auto ranking = cache_seed::read(rank_path, expected);
+    const auto plan = cache_seed::budget(p_->stat.slot_count, uint32_t(p_->g.experts),
+        uint32_t(p_->g.layers), uint32_t(p_->g.dense_lead), uint32_t(p_->g.used), hot_count);
+    std::set<uint64_t> pins;
+    for (size_t i = 0; i < plan.hot; ++i) pins.insert(ranking.ids[i]);
+    try {
+        if (p_->uploads) p_->uploads->begin_batch();
+        for (size_t i = 0; i < plan.hot; ++i) {
+            const uint32_t id = ranking.ids[i];
+            p_->load(int(id / p_->g.experts), int(id % p_->g.experts), pins);
+        }
+        if (p_->uploads) {
+            p_->uploads->finish();
+            p_->uploads->synchronize(); // Cover ggml and exact-dot CUDA streams before publishing pins.
+        }
+        ggml_backend_synchronize(p_->backend);
+        p_->seeded_keys = std::move(pins);
+        p_->stat.seeded_slots = plan.hot;
+        std::fprintf(stderr, "M31 seed cache: hot=%zu stream=%zu maximum_hot=%zu recommendation=%zu\n",
+                     plan.hot, plan.stream, plan.maximum_hot, plan.recommended_hot);
+    } catch (...) {
+        // A partial seed is never exposed as a usable cache. A fresh Engine is required.
+        p_->ready = false;
+        p_->uploads.reset(); // Drain any queued DMA before discarding metadata.
+        p_->entries.clear();
+        p_->seeded_keys.clear();
+        p_->stat.seeded_slots = 0;
+        p_->stat.occupied_slots = 0;
         throw;
     }
 }
@@ -540,5 +612,6 @@ void GpuExperts::reset_stats() {
     p_->stat.slot_count = old.slot_count;
     p_->stat.pool_bytes = old.pool_bytes;
     p_->stat.occupied_slots = old.occupied_slots;
+    p_->stat.seeded_slots = old.seeded_slots;
 }
 } // namespace strata::m31

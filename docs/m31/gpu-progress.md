@@ -143,3 +143,72 @@ Probe обходит attention, поэтому ограничение tiny CUDA 
 создающий read-only runner snapshot и SHA manifest. Recovery был запущен до
 появления launcher через собственный immutable snapshot, результаты не затронуты.
 GPU source freeze для следующего окна скорости; full gate20 ещё не запускался.
+
+## Интегрированный CMake build: gate подготовлен
+
+После общей сборки `codex-m31-port4-build-integrated-v1` используется настоящий
+`build-m31-cuda/m31_generate` (CPU-compatible CUDA option ON), включая новые
+CPU packed IDs/dense decode caches, uploader и остальные интегрированные изменения.
+Новый code128 `job-gpu-integrated-code128-v1.json` выполняется против исходного
+CPU golden128, оба decode cache включены, measurement=false. Результат ждать.
+
+Полный gate изменён на matched **chunk2048/decode_tail32 в обоих процессах**:
+`job-gpu-integrated-suite20-c2048-d32-v1.json`. Новый CPU oracle создаётся отдельно,
+все20/28723logits сохраняются, compare требует полный suite. Это одновременно
+проверяет целевой batch и decode/MSA после2048; отдельный long128 пока оставлен
+только для диагностики. Gate не запускать до разрешения координатора после
+ACK/speed окна.
+
+Самосогласованные источники и manifests сохранены в
+`/mnt/ai/logs/m31-port/gpu-integrated-gate-sources-v1/`.
+Для полного gate argv уже используют отдельные frozen binary copies с mode0555,
+отдельными inode и SHA256 в `frozen-manifest.json`; последующие сборки их не меняют.
+Исторические hardlinks сохранены дополнительно, но gate их не исполняет.
+
+### Интегрированный code128 PASS
+
+`gpu-integrated-code128-compare-v1.json`:128/128 top1, KL0/maxabs0,
+побитно исходному CPU golden128. Источник — интегрированная CMake сборка,
+CPU_QUANTS=1, PREFILL_ASYNC=1, cpu/dense decode caches=1.
+Один диагностический forward11.742с, sourceuploads133227327744B,
+hostquant234.123мс, H2D/kernel/D2H1090.579мс; это не скоростной замер.
+Полный suite2048tail32 ждёт завершения окна координатора.
+
+## Полный integrated GPU gate20 ПРИНЯТ
+
+`gpu-integrated-suite20-c2048-d32-compare-v1.json`: scope=M1-complete-logits,
+**20/20,28723позиции,top1=1,meanKL=maxKL=maxabs=0 по каждому case**.
+Все logits побитно fresh CPU-routed oracle с теми же chunk2048/decode_tail32.
+Юнит `codex-m31-port4-gpu-integrated-suite20-c2048-d32-v1` rc0; cleanup выполнен.
+Golden128 остаётся отдельно и тоже принят. Это correctness, не speed benchmark.
+
+## Следующий candidate: hostpool + route schedule + seed + hostreads
+
+В текущие main sources применены проверенные opt-in host/route prototypes.
+Host quantization и OAI используют один persistent GpuHostExecutor. Runtime
+без M31_GPU_HOST_THREADS остаётсяserial1; явное32 создаётparallelpool. Worker
+FP environment/MXCSR наследуется и sticky flags возвращаются вызывающему потоку.
+GPU route worklist включается только M31_GPU_EXPERT_SORT_ROUTES=1,n>=32;
+меняется расписание, input IDs/full histogram/output indices не меняются.
+Seed API/env и protected hot region сохранены. THPheader новый,self-consistent,
+но M31_ARENA_THP в GPU candidate gates выключен.
+
+Общая CMakeсборка v1 rc0: CPUtiny/comparatorPASS,22server/vocabtestsPASS,
+385hostCPUchecksPASS,48route-layoutchecksPASS. После CPU HOSTREADSOURCEFREEZE
+инкрементальная v2 rc0, tiny с M31_REUSE_HOST_READS=1 побитно; engine/frontends
+пересобраны согласованно. Сохранены отдельные executable copies и source hashes
+в `gpu-candidate-gates-v1/manifest.json`, включая latest m31_serve fdb source.
+
+`gpu-candidate-probe-{default,host32,route,combined}-accept-v1.json`:
+все4варианта PASS, каждый36cases/117стадий/21307392F32 побитно CPU.
+Probe теперь проводит full FFN OAI через тот же host executor.
+Новый корректный routeproofv2 (отдельные процессы envрежимов) PASS36cases;
+v1 имел8ожидаемых CPU-reference ошибок из-за staticonce_flag env caching,
+при этом sorting сам побитен во всех36. Существовавший frozen v1 ELF не менялся.
+Seed F32 API/env probe тоже PASS, включая recovery и partial seed terminal.
+
+Запущены только два новых real128 gates: combined host32+route+hostreads+async
+с seed0, затем combined+seed20 через fresh sealed preflight receipt.
+`job-gpu-candidate-combined-code128-v1.json`, `job-gpu-candidate-seed20-code128-v1.json`.
+Четыре отдельных полных startup/pack не запускаются. Численных/скоростных
+результатов этих двух gates пока нет; runtime performance окно у координатора.

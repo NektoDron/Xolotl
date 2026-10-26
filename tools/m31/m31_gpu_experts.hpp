@@ -4,9 +4,11 @@
 
 #include <cstdint>
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace strata::m31 {
+namespace cache_seed { struct ExpectedRank; }
 
 // Borrows the backend and arena, which must outlive this object. Serialized use only.
 // The VRAM budget covers one fixed expert-slot pool; graph scratch/dense/KV are separate.
@@ -16,6 +18,7 @@ public:
     struct Stats {
         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
         uint64_t graph_batches = 0, forwards = 0;
+        size_t seeded_slots = 0;
         size_t resident_bytes = 0, peak_resident_bytes = 0, budget_bytes = 0;
         size_t scratch_bytes = 0, minimum_budget_bytes = 0;
         size_t slot_stride = 0, slot_count = 0, pool_bytes = 0, occupied_slots = 0;
@@ -39,6 +42,10 @@ public:
     std::vector<float> forward(int layer, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids,
                                const std::vector<float> & weights);
+    // Caller first runs cache_seed_preflight.py against current GGUF headers/stats.
+    // Expected identity/content hashes come from its trusted receipt, not the rank itself.
+    // Cold-cache initialization only; seed DMA is complete before returning.
+    void seed_hot(const std::string & rank_path, const cache_seed::ExpectedRank & expected, size_t hot_count);
     const Stats & stats() const;
     void reset_stats(); // Keeps warm cache entries; counters restart at current residency.
 private:

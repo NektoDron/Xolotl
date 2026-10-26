@@ -42,7 +42,12 @@ if(STRATA_M31_CPU_QUANTS_CUDA)
   if(NOT TARGET ggml-cuda OR NOT TARGET m31_engine)
     message(FATAL_ERROR "STRATA_M31_CPU_QUANTS_CUDA requires M31 CUDA")
   endif()
-  target_sources(m31_engine PRIVATE ${_m31_dir}/gpu_cpu_quants.cu)
+  find_package(Threads REQUIRED)
+  target_sources(m31_engine PRIVATE ${_m31_dir}/gpu_cpu_quants.cu
+    ${_m31_dir}/cpu_gpu_host_executor.cpp ${_m31_dir}/cpu_gpu_host_ops.cpp)
+  target_link_libraries(m31_engine PRIVATE Threads::Threads)
+  set_source_files_properties(${_m31_dir}/cpu_gpu_host_executor.cpp ${_m31_dir}/cpu_gpu_host_ops.cpp
+    PROPERTIES COMPILE_OPTIONS "-frounding-math;-fno-fast-math")
   set_target_properties(m31_engine PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON)
   target_include_directories(m31_engine PRIVATE ${strata_llamacpp_SOURCE_DIR}/ggml/src)
   target_compile_definitions(m31_engine PRIVATE M31_CPU_QUANTS_CUDA=1)

@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22)
+project(m31_seed_reader LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+add_executable(m31_cache_seed_reader ../cache_seed_reader.cpp)
+target_compile_options(m31_cache_seed_reader PRIVATE -Wall -Wextra -Wpedantic)

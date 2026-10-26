@@ -1,0 +1,120 @@
+--- a/tools/m31/m31_gpu_experts.hpp
++++ b/tools/m31/m31_gpu_experts.hpp
+@@ -4,9 +4,11 @@
+ 
+ #include <cstdint>
+ #include <memory>
++#include <string>
+ #include <vector>
+ 
+ namespace strata::m31 {
++namespace cache_seed { struct ExpectedRank; }
+ 
+ // Borrows the backend and arena, which must outlive this object. Serialized use only.
+ // The VRAM budget covers one fixed expert-slot pool; graph scratch/dense/KV are separate.
+@@ -16,6 +18,7 @@
+     struct Stats {
+         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
+         uint64_t graph_batches = 0, forwards = 0;
++        size_t seeded_slots = 0;
+         size_t resident_bytes = 0, peak_resident_bytes = 0, budget_bytes = 0;
+         size_t scratch_bytes = 0, minimum_budget_bytes = 0;
+         size_t slot_stride = 0, slot_count = 0, pool_bytes = 0, occupied_slots = 0;
+@@ -39,6 +42,10 @@
+     std::vector<float> forward(int layer, int n, const std::vector<float> & x,
+                                const std::vector<int32_t> & ids,
+                                const std::vector<float> & weights);
++    // Caller first runs cache_seed_preflight.py against current GGUF headers/stats.
++    // Expected identity/content hashes come from its trusted receipt, not the rank itself.
++    // Cold-cache initialization only; seed DMA is complete before returning.
++    void seed_hot(const std::string & rank_path, const cache_seed::ExpectedRank & expected, size_t hot_count);
+     const Stats & stats() const;
+     void reset_stats(); // Keeps warm cache entries; counters restart at current residency.
+ private:
+--- a/tools/m31/m31_gpu_experts.cpp
++++ b/tools/m31/m31_gpu_experts.cpp
+@@ -1,4 +1,5 @@
+ #include "m31_gpu_experts.hpp"
++#include "cache_seed_rank.hpp"
+ #include "prefill_pipeline.hpp"
+ 
+ #include "ggml-alloc.h"
+@@ -85,6 +86,7 @@
+     ggml_gallocr_t allocator = nullptr;
+     std::vector<Layer> layers;
+     std::map<uint64_t, Entry> entries;
++    std::set<uint64_t> seeded_keys;
+     Stats stat;
+     uint64_t clock = 0;
+     int max_chunk = 0;
+@@ -131,7 +133,7 @@
+         } else {
+             auto victim = entries.end();
+             for (auto it = entries.begin(); it != entries.end(); ++it)
+-                if (!protected_keys.count(it->first) &&
++                if (!protected_keys.count(it->first) && !seeded_keys.count(it->first) &&
+                     (victim == entries.end() || it->second.last_used < victim->second.last_used)) victim = it;
+             check(victim != entries.end(), "all cache slots are protected; increase expert cache budget");
+             slot = victim->second.slot;
+@@ -508,6 +510,8 @@
+             p_->cpu_quants.reset(); // cudaFree also drains its independent raw stream.
+ #endif
+             p_->entries.clear();
++            p_->seeded_keys.clear();
++            p_->stat.seeded_slots = 0;
+             p_->free_slots.clear();
+             for (size_t slot = 0; slot < p_->stat.slot_count; ++slot)
+                 p_->free_slots.push_back(p_->stat.slot_count-slot-1);
+@@ -521,6 +525,45 @@
+                 p_->ready = false; // Failed recovery is terminal; forward refuses reuse.
+             }
+         }
++        throw;
++    }
++}
++
++void GpuExperts::seed_hot(const std::string & rank_path, const cache_seed::ExpectedRank & expected,
++                           size_t hot_count) {
++    check(p_->ready, "seed initialization requires a ready cache");
++    check(p_->entries.empty() && p_->stat.forwards == 0 && p_->seeded_keys.empty(),
++          "seed initialization is allowed only before the first forward on a cold cache");
++    check(expected.layers == uint32_t(p_->g.layers) && expected.experts == uint32_t(p_->g.experts) &&
++          expected.dense_lead == uint32_t(p_->g.dense_lead), "seed geometry differs from loaded model");
++    const auto ranking = cache_seed::read(rank_path, expected);
++    const auto plan = cache_seed::budget(p_->stat.slot_count, uint32_t(p_->g.experts),
++        uint32_t(p_->g.layers), uint32_t(p_->g.dense_lead), uint32_t(p_->g.used), hot_count);
++    std::set<uint64_t> pins;
++    for (size_t i = 0; i < plan.hot; ++i) pins.insert(ranking.ids[i]);
++    try {
++        if (p_->uploads) p_->uploads->begin_batch();
++        for (size_t i = 0; i < plan.hot; ++i) {
++            const uint32_t id = ranking.ids[i];
++            p_->load(int(id / p_->g.experts), int(id % p_->g.experts), pins);
++        }
++        if (p_->uploads) {
++            p_->uploads->finish();
++            p_->uploads->synchronize(); // Cover ggml and exact-dot CUDA streams before publishing pins.
++        }
++        ggml_backend_synchronize(p_->backend);
++        p_->seeded_keys = std::move(pins);
++        p_->stat.seeded_slots = plan.hot;
++        std::fprintf(stderr, "M31 seed cache: hot=%zu stream=%zu maximum_hot=%zu recommendation=%zu\n",
++                     plan.hot, plan.stream, plan.maximum_hot, plan.recommended_hot);
++    } catch (...) {
++        // A partial seed is never exposed as a usable cache. A fresh Engine is required.
++        p_->ready = false;
++        p_->uploads.reset(); // Drain any queued DMA before discarding metadata.
++        p_->entries.clear();
++        p_->seeded_keys.clear();
++        p_->stat.seeded_slots = 0;
++        p_->stat.occupied_slots = 0;
+         throw;
+     }
+ }
+@@ -540,5 +583,6 @@
+     p_->stat.slot_count = old.slot_count;
+     p_->stat.pool_bytes = old.pool_bytes;
+     p_->stat.occupied_slots = old.occupied_slots;
++    p_->stat.seeded_slots = old.seeded_slots;
+ }
+ } // namespace strata::m31

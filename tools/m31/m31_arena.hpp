@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "prefill_thp_mapping.hpp"
 
 #include <array>
 #include <chrono>
@@ -90,7 +91,18 @@ public:
                 break;
             }
         }
+        if (PrefillThpMapping::requested()) {
+            thp_ = PrefillThpMapping::create(bytes_);
+            if (thp_->data()) {
+                // This wrapper borrows data: it is freed by ~ExpertArena before
+                // the last-declared RAII mapping owner unmaps its reservation.
+                buffer_ = ggml_backend_cpu_buffer_from_ptr(thp_->data(), bytes_);
+                if (!buffer_) throw std::runtime_error("M31 arena: THP CPU buffer wrapper failed");
+            }
+        }
+        if (!buffer_) {
         buffer_ = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), bytes_);
+        }
         if (!buffer_) throw std::runtime_error("M31 arena: CPU allocation failed");
         ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer_));
@@ -122,6 +134,13 @@ public:
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         std::fprintf(stderr, "M31 RAM arena: bytes=%zu experts=%lld seconds=%.3f (exact packed weights, pageable)\n",
                      bytes_, (long long) (g.experts * (g.layers - g.dense_lead)), seconds);
+        if (thp_) {
+            const auto & stat = thp_->stats();
+            const auto actual = thp_->anon_huge_pages();
+            std::fprintf(stderr, "M31 arena THP: mapped=%d advised=%d forced=%d mapped_bytes=%zu AnonHugePages=%llu exact=%d; %s\n",
+                         int(stat.mapped), int(stat.advised), int(stat.forced), stat.mapped_bytes,
+                         (unsigned long long) actual.bytes, int(actual.exact), stat.note.c_str());
+        }
     }
     const Slice * find(const std::string & name) const {
         auto it = slices_.find(name);
@@ -130,10 +149,14 @@ public:
     ggml_backend_buffer_t buffer() const { return buffer_; }
     size_t bytes() const { return bytes_; }
     const std::vector<Layer> & layers() const { return layers_; }
+    const PrefillThpMapping * thp_mapping() const { return thp_.get(); }
 private:
     ggml_backend_buffer_t buffer_ = nullptr;
     size_t bytes_ = 0;
     std::vector<Layer> layers_;
     std::map<std::string, Slice> slices_;
+    // Keep existing field offsets unchanged; free the borrowed ggml wrapper in
+    // the destructor body before this owner releases the underlying mmap.
+    std::unique_ptr<PrefillThpMapping> thp_;
 };
 } // namespace strata::m31

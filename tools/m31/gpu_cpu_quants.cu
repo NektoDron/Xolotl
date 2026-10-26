@@ -1,4 +1,6 @@
 #include "gpu_cpu_quants.hpp"
+#include "cpu_gpu_host_ops.hpp"
+#include "prefill_route_worklist.hpp"
 #include "ggml.h"
 #include "ggml-cpu.h"
 #define GGML_COMMON_DECL_CUDA
@@ -29,13 +31,14 @@ template<int Type>
 __global__ void multiply_kernel(const uint8_t * pool, size_t stride, int columns,
                                 int rows, int used, int n, const uint8_t * quant,
                                 size_t quant_row_bytes, bool broadcast,
-                                const int32_t * ids, float * output, bool tiled_fma) {
+                                const int32_t * ids, const int32_t * worklist, float * output, bool tiled_fma) {
     const int lane = threadIdx.x & 7;
     const unsigned group_mask = 0xffu << (threadIdx.x & 24);
     const size_t item = (size_t(blockIdx.x) * blockDim.x + threadIdx.x) / 8;
     const size_t count = size_t(rows) * used * n;
     if (item >= count) return;
-    const int row = int(item % rows), route = int(item / rows);
+    const int row = int(item % rows);
+    const int route = worklist ? worklist[item / rows] : int(item / rows);
     const int input_row = broadcast ? route / used : route;
     const auto * w = pool + size_t(ids[route]) * stride;
     const auto * a = quant + size_t(input_row) * quant_row_bytes;
@@ -124,14 +127,20 @@ __global__ void multiply_kernel(const uint8_t * pool, size_t stride, int columns
         acc = __fadd_rn(acc, __shfl_xor_sync(group_mask, acc, 2, 8));
         acc = __fadd_rn(acc, __shfl_xor_sync(group_mask, acc, 1, 8));
     }
-    if (lane == 0) output[item] = Type == GGML_TYPE_IQ3_XXS && !tiled ? 0.25f*acc : acc;
+    if (lane == 0) output[size_t(route)*rows+row] = Type == GGML_TYPE_IQ3_XXS && !tiled ? 0.25f*acc : acc;
 }
 }
 struct GpuCpuQuants::Impl {
+    GpuHostExecutor host{[] {
+        auto options = gpu_host_options_from_environment();
+        // Parallel host work remains explicit opt-in; the prior serial path is default.
+        if (!std::getenv("M31_GPU_HOST_THREADS")) options.threads = 1;
+        return options;
+    }()};
     uint8_t * quant = nullptr;
-    int32_t * ids = nullptr;
+    int32_t * ids = nullptr, * worklist = nullptr;
     float * out = nullptr;
-    size_t quant_capacity = 0, ids_capacity = 0, out_capacity = 0;
+    size_t quant_capacity = 0, ids_capacity = 0, out_capacity = 0, worklist_capacity = 0;
     size_t calls = 0;
     double quant_seconds = 0, roundtrip_seconds = 0;
     ~Impl() {
@@ -139,8 +148,8 @@ struct GpuCpuQuants::Impl {
         if (profile && std::string(profile) == "1")
             std::fprintf(stderr, "M31 CPU-quants diagnostic calls=%zu host_quant_ms=%.3f H2D_kernel_D2H_ms=%.3f scratch_bytes=%zu (correctness instrumentation, not M2 benchmark)\n",
                          calls, quant_seconds*1000, roundtrip_seconds*1000,
-                         quant_capacity+ids_capacity+out_capacity);
-        cudaFree(quant); cudaFree(ids); cudaFree(out);
+                         quant_capacity+ids_capacity+out_capacity+worklist_capacity);
+        cudaFree(quant); cudaFree(ids); cudaFree(out); cudaFree(worklist);
     }
     template<class T> void reserve(T * & pointer, size_t & capacity, size_t bytes) {
         if (capacity >= bytes) return;
@@ -150,11 +159,14 @@ struct GpuCpuQuants::Impl {
 };
 GpuCpuQuants::GpuCpuQuants() : p_(std::make_unique<Impl>()) {}
 GpuCpuQuants::~GpuCpuQuants() = default;
-size_t GpuCpuQuants::scratch_bytes() const { return p_->quant_capacity+p_->ids_capacity+p_->out_capacity; }
+GpuHostExecutor & GpuCpuQuants::host_executor() { return p_->host; }
+size_t GpuCpuQuants::scratch_bytes() const { return p_->quant_capacity+p_->ids_capacity+p_->out_capacity+p_->worklist_capacity; }
 std::vector<float> GpuCpuQuants::multiply(int type_int, const void * weights, size_t slot_stride,
                                         int columns, int rows, int used, int n,
                                         const std::vector<float> & input,
                                         const std::vector<int32_t> & ids) {
+    const char * sort_env = std::getenv("M31_GPU_EXPERT_SORT_ROUTES");
+    const bool sort_by_expert = n >= 32 && sort_env && std::string(sort_env) == "1";
     if (!ggml_cpu_has_avx2() || !ggml_cpu_has_fma())
         throw std::runtime_error("M31 CPU-quants CUDA diagnostic requires an AVX2+FMA CPU ggml build");
     // GCC14 -O3 contracts even the VNNI epilogue's intrinsic mul+add into
@@ -172,8 +184,7 @@ std::vector<float> GpuCpuQuants::multiply(int type_int, const void * weights, si
     const size_t qbytes = ggml_row_size(traits->vec_dot_type, columns);
     const size_t input_rows = input.size()/columns;
     std::vector<uint8_t> packed(qbytes*input_rows);
-    for (size_t row = 0; row < input_rows; ++row)
-        quant_traits->from_float(input.data()+row*columns, packed.data()+row*qbytes, columns);
+    gpu_host_quantize_rows(p_->host, type, size_t(columns), input, packed);
     const auto quant_end = std::chrono::steady_clock::now();
     p_->quant_seconds += std::chrono::duration<double>(quant_end-quant_start).count();
     const size_t out_count = size_t(rows)*used*n;
@@ -200,9 +211,16 @@ std::vector<float> GpuCpuQuants::multiply(int type_int, const void * weights, si
     p_->reserve(p_->out, p_->out_capacity, out_count*sizeof(float));
     cuda_check(cudaMemcpy(p_->quant, packed.data(), packed.size(), cudaMemcpyHostToDevice));
     cuda_check(cudaMemcpy(p_->ids, dispatch_ids.data(), dispatch_ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+    if (sort_by_expert) {
+        int32_t maximum = 0;
+        for (const auto id : ids) maximum = std::max(maximum, id);
+        const auto order = prefill_route_worklist(ids, size_t(maximum)+1, used, tiled_enabled, tiled_forced);
+        p_->reserve(p_->worklist, p_->worklist_capacity, order.route.size()*sizeof(int32_t));
+        cuda_check(cudaMemcpy(p_->worklist, order.route.data(), order.route.size()*sizeof(int32_t), cudaMemcpyHostToDevice));
+    }
     const int blocks = int((out_count*8+127)/128);
     const bool broadcast = input_rows == size_t(n);
-#define M31_LAUNCH(T) multiply_kernel<T><<<blocks,128>>>(static_cast<const uint8_t *>(weights), slot_stride, columns, rows, used, n, p_->quant, qbytes, broadcast, p_->ids, p_->out, tiled_fma)
+#define M31_LAUNCH(T) multiply_kernel<T><<<blocks,128>>>(static_cast<const uint8_t *>(weights), slot_stride, columns, rows, used, n, p_->quant, qbytes, broadcast, p_->ids, sort_by_expert ? p_->worklist : nullptr, p_->out, tiled_fma)
     if (type == GGML_TYPE_IQ3_XXS) { M31_LAUNCH(GGML_TYPE_IQ3_XXS); }
     else if (type == GGML_TYPE_IQ4_XS) { M31_LAUNCH(GGML_TYPE_IQ4_XS); }
     else { M31_LAUNCH(GGML_TYPE_NVFP4); }

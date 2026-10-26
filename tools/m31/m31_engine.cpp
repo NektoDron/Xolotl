@@ -16,6 +16,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <map>
 #include <stdexcept>
 #include <utility>
@@ -220,6 +221,11 @@ struct Graph {
         ggml_backend_tensor_get(t, result.data(), 0, ggml_nbytes(t));
         return result;
     }
+    static void read_into(ggml_tensor * t, std::vector<float> & result) {
+        require(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t), "expected contiguous F32 readback");
+        result.resize(size_t(ggml_nelements(t)));
+        ggml_backend_tensor_get(t, result.data(), 0, ggml_nbytes(t));
+    }
 };
 
 ggml_tensor * rms(Graph & b, ggml_tensor * x, ggml_tensor * w, float eps) {
@@ -296,6 +302,27 @@ struct Engine::Impl {
     int last_n = 0;
     bool poisoned = false, ready = false;
     std::vector<float> hidden;
+    // Opt-in host ownership only: every graph/backend operation stays unchanged.
+    // Buffers are private to this serialized Engine and survive layer/reset boundaries.
+    bool reuse_host_reads = false;
+    struct HostReads {
+        std::vector<float> input, residual, shared, weights, moe;
+        std::vector<int32_t> ids;
+        uint64_t reads = 0, reuses = 0, growths = 0, bytes = 0;
+    } host_reads;
+    void read_host(ggml_tensor * tensor, std::vector<float> & out) {
+        const auto previous_capacity = out.capacity();
+        Graph::read_into(tensor, out);
+        ++host_reads.reads;
+        host_reads.bytes += ggml_nbytes(tensor);
+        if (out.capacity() > previous_capacity) ++host_reads.growths;
+        else ++host_reads.reuses;
+    }
+    size_t host_retained_bytes() const {
+        return (host_reads.input.capacity() + host_reads.residual.capacity() + host_reads.shared.capacity() +
+                host_reads.weights.capacity() + host_reads.moe.capacity()) * sizeof(float) +
+               host_reads.ids.capacity() * sizeof(int32_t);
+    }
 
     ~Impl() {
         if (gpu_experts && cfg.profile) {
@@ -448,6 +475,14 @@ struct Engine::Impl {
     std::vector<float> routed(int l, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids, const std::vector<float> & weights) {
         if (gpu_experts && n >= cfg.gpu_experts_min_tokens) return gpu_experts->forward(l, n, x, ids, weights);
+        std::vector<float> output;
+        routed_cpu_into(l, n, x, ids, weights, output);
+        return output;
+    }
+
+    void routed_cpu_into(int l, int n, const std::vector<float> & x,
+                          const std::vector<int32_t> & ids, const std::vector<float> & weights,
+                          std::vector<float> & output) {
         const auto setup_start = cfg.profile ? Clock::now() : Clock::time_point{};
         RoutedGraph temporary;
         RoutedGraph * cached = &temporary;
@@ -474,9 +509,9 @@ struct Engine::Impl {
         b.compute();
         if (cfg.profile) timings.routed_compute += elapsed(compute_start);
         const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
-        auto output = Graph::read(cached->output);
+        if (reuse_host_reads) read_host(cached->output, output);
+        else output = Graph::read(cached->output);
         if (cfg.profile) timings.routed_read += elapsed(read_start);
-        return output;
     }
 
     void build_routed(int l, int n, RoutedGraph & storage) {
@@ -574,9 +609,19 @@ struct Engine::Impl {
 
     void layer(int l, int n) {
         const auto dense_start = cfg.profile ? Clock::now() : Clock::time_point{};
-        std::vector<float> ffn_input, residual, shared;
-        std::vector<int32_t> ids(size_t(g.used * n));
-        std::vector<float> route_weights;
+        std::vector<float> local_input, local_residual, local_shared, local_weights;
+        std::vector<int32_t> local_ids;
+        auto & ffn_input = reuse_host_reads ? host_reads.input : local_input;
+        auto & residual = reuse_host_reads ? host_reads.residual : local_residual;
+        auto & shared = reuse_host_reads ? host_reads.shared : local_shared;
+        auto & route_weights = reuse_host_reads ? host_reads.weights : local_weights;
+        auto & ids = reuse_host_reads ? host_reads.ids : local_ids;
+        const auto ids_capacity = ids.capacity();
+        ids.resize(size_t(g.used * n));
+        if (reuse_host_reads) {
+            if (ids.capacity() > ids_capacity) ++host_reads.growths;
+            else ++host_reads.reuses;
+        }
         DenseGraph temporary;
         DenseGraph * storage = &temporary;
         const bool stable_decode = cfg.dense_decode_cache && n == 1 && !cfg.tap;
@@ -603,11 +648,20 @@ struct Engine::Impl {
         b.compute();
         if (cfg.profile) timings.dense_compute += elapsed(compute_start);
         const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
-        if (!g.routed(l)) hidden = Graph::read(storage->output);
+        if (!g.routed(l)) {
+            if (reuse_host_reads) read_host(storage->output, hidden);
+            else hidden = Graph::read(storage->output);
+        }
         else {
-            residual = Graph::read(storage->residual);
-            ffn_input = Graph::read(storage->norm);
-            shared = Graph::read(storage->shared);
+            if (reuse_host_reads) {
+                read_host(storage->residual, residual);
+                read_host(storage->norm, ffn_input);
+                read_host(storage->shared, shared);
+            } else {
+                residual = Graph::read(storage->residual);
+                ffn_input = Graph::read(storage->norm);
+                shared = Graph::read(storage->shared);
+            }
             if (ggml_is_contiguous(storage->ids)) {
                 ggml_backend_tensor_get(storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
             } else {
@@ -615,7 +669,11 @@ struct Engine::Impl {
                     ggml_backend_tensor_get(storage->ids, ids.data() + t * g.used,
                         size_t(t) * storage->ids->nb[1], size_t(g.used) * sizeof(int32_t));
             }
-            route_weights = Graph::read(storage->weights);
+            if (reuse_host_reads) {
+                ++host_reads.reads;
+                host_reads.bytes += ids.size() * sizeof(int32_t);
+                read_host(storage->weights, route_weights);
+            } else route_weights = Graph::read(storage->weights);
         }
         if (cfg.profile) timings.dense_read += elapsed(read_start);
         const auto destroy_start = cfg.profile ? Clock::now() : Clock::time_point{};
@@ -626,7 +684,17 @@ struct Engine::Impl {
         }
         if (!g.routed(l)) return;
         if (cfg.route_observer) cfg.route_observer(l, n, ids, route_weights);
-        const auto moe = routed(l, n, ffn_input, ids, route_weights);
+        std::vector<float> local_moe;
+        const std::vector<float> * moe_result = nullptr;
+        if (reuse_host_reads && !(gpu_experts && n >= cfg.gpu_experts_min_tokens)) {
+            routed_cpu_into(l, n, ffn_input, ids, route_weights, host_reads.moe);
+            moe_result = &host_reads.moe;
+        } else {
+            // GPUExperts retains its existing owned-vector API and lifetime.
+            local_moe = routed(l, n, ffn_input, ids, route_weights);
+            moe_result = &local_moe;
+        }
+        const auto & moe = *moe_result;
         const auto residual_start = cfg.profile ? Clock::now() : Clock::time_point{};
         if (cfg.cpu_residual && !cfg.tap) {
             hidden.resize(moe.size());
@@ -648,7 +716,8 @@ struct Engine::Impl {
         ggml_backend_tensor_set(s, shared.data(), 0, ggml_nbytes(s));
         ggml_backend_tensor_set(m, moe.data(), 0, ggml_nbytes(m));
         residual_graph.compute();
-        hidden = Graph::read(out);
+        if (reuse_host_reads) read_host(out, hidden);
+        else hidden = Graph::read(out);
         if (cfg.profile) timings.residual += elapsed(residual_start);
     }
 
@@ -694,6 +763,11 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         require(!cfg.dense_decode_cache || (cfg.reuse_allocations && cfg.cpu_residual),
                 "dense decode cache requires reuse-allocations and cpu-residual");
         p_->cfg = cfg;
+        const char * host_read_mode = std::getenv("M31_REUSE_HOST_READS");
+        const bool host_read_requested = host_read_mode && std::string(host_read_mode) == "1";
+        p_->reuse_host_reads = host_read_requested && cfg.reuse_allocations && !cfg.tap;
+        if (cfg.profile && host_read_requested)
+            std::fprintf(stderr, "M31 host read reuse: enabled=%d (requires reuse-allocations and no taps)\n", int(p_->reuse_host_reads));
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
         p_->cpu_decode_graphs.resize(size_t(p_->g.layers));
@@ -782,6 +856,10 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             p_->fill_attention(inputs.positions, inputs.mask, inputs.bias, inputs.blocks, n, nk, nk / g.block);
         }
         const auto started = std::chrono::steady_clock::now();
+        const auto previous_host_reads = p_->host_reads.reads;
+        const auto previous_host_reuses = p_->host_reads.reuses;
+        const auto previous_host_growths = p_->host_reads.growths;
+        const auto previous_host_bytes = p_->host_reads.bytes;
         const double prepare_seconds = p_->cfg.profile ? Impl::elapsed(prepare_started) : 0;
         p_->timings = {};
         for (int l = 0; l < g.layers; ++l) p_->layer(l, n);
@@ -796,6 +874,13 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             std::fprintf(stderr, "M31 dense-stages pos=%lld n=%d build_ms=%.3f allocate_ms=%.3f upload_ms=%.3f compute_ms=%.3f read_ms=%.3f destroy_ms=%.3f dense_cache=%d\n",
                          (long long)p_->pos, n, 1000*t.dense_build, 1000*t.dense_allocate, 1000*t.dense_upload,
                          1000*t.dense_compute, 1000*t.dense_read, 1000*t.dense_destroy, int(p_->cfg.dense_decode_cache));
+            if (p_->reuse_host_reads) std::fprintf(stderr,
+                "M31 host-reads pos=%lld n=%d reads=%llu reuses=%llu growths=%llu bytes=%llu retained_bytes=%zu\n",
+                (long long)p_->pos, n,
+                (unsigned long long)(p_->host_reads.reads-previous_host_reads),
+                (unsigned long long)(p_->host_reads.reuses-previous_host_reuses),
+                (unsigned long long)(p_->host_reads.growths-previous_host_growths),
+                (unsigned long long)(p_->host_reads.bytes-previous_host_bytes), p_->host_retained_bytes());
         }
         p_->pos += n;
         p_->last_n = n;

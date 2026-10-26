@@ -1,0 +1,7 @@
+{
+  "proposal_only": true,
+  "base_files": {
+    "tools/m31/m31_gpu_experts.hpp": "53146d1b7e89cc6748298b4ce2d4cec3856de0ffa61938be4d9c0dacbaaac788",
+    "tools/m31/m31_gpu_experts.cpp": "80efb0391c1bdac1d67bdb32e994dc8418ded2d87187cf4a855ad723032b822a"
+  }
+}

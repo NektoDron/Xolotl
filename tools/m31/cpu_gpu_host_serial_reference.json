@@ -1,0 +1,18 @@
+{
+  "source_head": "4cef01d3504268c0090f82d70f648bc4576e46ab",
+  "source_sha256": {
+    "tools/m31/gpu_cpu_quants.hpp": "aaff8af65648cf0ef2f8a96e09bdaa51fb8d59ce0cba54bc7f63e937ec361d84",
+    "tools/m31/gpu_cpu_quants.cu": "5cae72878899ab37d3f712c4e899f63fd0d5af10341926cd6608123b5f7ed56d",
+    "tools/m31/m31_gpu_experts.cpp": "2fd752d791d3ad35051270d953fabf08cbd61c5aa21e5c59d87a443134ab86ee",
+    "tools/m31/cmake/m31.cmake": "08ca948cb9dd0ebc08cc2df605665fe56b3bb70ab3082bc96fde4f97e1b9f46b"
+  },
+  "old_serial_quantization_loop": "    for (size_t row = 0; row < input_rows; ++row)\n        quant_traits->from_float(input.data()+row*columns, packed.data()+row*qbytes, columns);",
+  "old_serial_oai_loop": "            for (size_t i = 0; i < gate.size(); ++i) {\n                const float a = std::min(gate[i], 7.f), b = std::clamp(up[i], -7.f, 7.f);\n                const float glu = a / (1.f + expf(1.702f*(-a)));\n                activation[i] = glu*(b+1.f);\n            }",
+  "reference_fixture": "/mnt/ai/logs/m31-port/expert-probe-raw-v1",
+  "fixture_sha256": {
+    "l10_n128_full_input.f32": "60d440c7c7a7a22145f14901378b36630a9f3cb4e7ae1ccd894ffa358bd8920d",
+    "l10_n128_full_cpu_id_gate_scaled.f32": "a8d4a430f9966233236f29e891ff9a5395a55e9b36e3027da26db43783455143",
+    "l10_n128_full_cpu_id_up_scaled.f32": "dd330f77fc7e6217b6beff1386b01e087668746bebef26e16ac000420eee7165",
+    "l10_n128_full_cpu_id_oai.f32": "f769d06df88cca532e81ff66191714902056d4eeb0af314b9a2e353d60f26141"
+  }
+}

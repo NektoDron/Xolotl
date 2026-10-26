@@ -5,6 +5,7 @@
 #include <memory>
 #include <vector>
 namespace strata::m31 {
+class GpuHostExecutor;
 class GpuCpuQuants {
 public:
     GpuCpuQuants();
@@ -18,6 +19,7 @@ public:
                                const std::vector<float> & input,
                                const std::vector<int32_t> & ids);
     size_t scratch_bytes() const;
+    GpuHostExecutor & host_executor();
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

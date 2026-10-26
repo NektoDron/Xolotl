@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 #ifdef M31_CPU_QUANTS_CUDA
 #include "gpu_cpu_quants.hpp"
+#include "cpu_gpu_host_ops.hpp"
 #endif
 #ifdef M31_HAVE_CUDA
 #include "ggml-cuda.h"
@@ -194,11 +195,7 @@ Outputs evaluate(const Mode & mode, int role, int n, const std::vector<float> & 
             const auto gate = mm(0, input, "gate");
             const auto up = mm(1, input, "up");
             std::vector<float> activation(gate.size());
-            for (size_t i = 0; i < gate.size(); ++i) {
-                const float x = std::min(gate[i], 7.f), y = std::clamp(up[i], -7.f, 7.f);
-                const float glu = x / (1.f + expf(1.702f * (-x)));
-                activation[i] = glu * (y + 1.f);
-            }
+            gpu_host_oai_rows(gpu.host_executor(), size_t(w.tensors[0]->ne[1]), gate, up, activation);
             output["oai"] = activation;
             mm(2, activation, "down");
         }
