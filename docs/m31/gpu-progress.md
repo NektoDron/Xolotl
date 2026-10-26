@@ -87,3 +87,59 @@ misses5142, uploads133227327744B. CPU OAI, pageable small activation packing,
 Build option STRATA_M31_CPU_QUANTS_CUDA=ON и env M31_GPU_CPU_QUANTS=1 обязательны;
 default остаётся штатный ggml CUDA, который побитен GPU-offload oracle, но
 не соответствует исходному CPU oracle. Полный gate20 пока не запускался.
+
+## Pipeline integration начата
+
+Opt-in `M31_GPU_PREFILL_ASYNC=1` подключает PrefillUploads: два pinned staging
+буфера, исходные три slices, zero padding, begin/finish вокруг полного слоя.
+Для raw CPU-quants dot после finish вызывается synchronize: его default stream
+не получает event wait ggml compute backend автоматически. При исключении
+uploader сначала дренируется, затем все cache entries инвалидируются и free
+slots восстанавливаются; uploader пересоздаётся, при неудаче recovery forward
+запрещён. Default sync path и проверенная арифметика не менялись.
+
+Сборка `codex-m31-port4-gpu-build-pipeline-v1` rc0, отдельный бинарник
+`build-gpu-correctness/m31_generate-pipeline`. Engine/header/generate взяты из
+прежнего самосогласованного source snapshot, обновлены только GPU cpp и новый
+header транспорта. Код нового dense decode engine не смешивается.
+`job-gpu-pipeline-code128-v1.json` запущен на отдельный CPU-oracle gate.
+
+Подготовлен (НЕ запущен) `job-gpu-pipeline-suite20-c2048-v1.json`:
+новый CPU-routed oracle chunk2048 → GPU pipeline chunk2048 → require-suite.
+Старый golden chunk128 для сравнения с chunk2048 не используется: per-expert
+CPU tiled threshold зависит от размера исходного батча. Golden128 отдельный.
+
+### Async transport code128 PASS
+
+`gpu-pipeline-code128-compare-v1.json`:128/128, top1=1, KL0/maxabs0,
+побитно с неизменённым CPU oracle. Worker `job-gpu-pipeline-code128-v1.result.json`
+rc0. Pinned async ring:57батчей,5142передачи,133227327744байт,
+51819264байт staging,5140reuses. Диагностический forward18.383с, не benchmark;
+ускорение не заявляется. Arithmetic/source bytes/padding/IDs сохранены.
+
+Session unit отдельно rc127: `card_session.sh: line58: ual: command not found`.
+Во время нашего активного shell coordinator обновил этот файл, что сместило
+чтение его продолжающегося исполнения. Cleanup down+rollback всё же выполнен;
+aictl status подтверждает обоих майнеров и дежурную8084. Следующие GPU jobs
+используют immutable snapshot `gpu-card-session-port4-immutable-v1.sh` в logs.
+Не смешивать успешный worker parity gate с ошибкой lifecycle controller.
+
+Подготовлен recovery probe с compile-only `M31_GPU_PREFILL_TESTING`:
+искусственная ошибка после2го queued upload, отсутствие stale entries, затем
+повторные батчи/evictions против синхронного baseline. В обычной сборке fault
+injection полностью исключён препроцессором. Результат ниже после выполнения.
+
+### Recovery контракт проверен на GPU
+
+`gpu-uploader-recovery-v1.json`:PASS. Compile-only fault injection выбрасывает
+исключение после2гоqueuedcopy; после drain/recovery occupied_slots=0. Тот же
+GpuExperts объект затем выполняет9батчей по3слоям,2016F32 значений побитно
+с синхронным baseline;32evictions проверяют повторное использование слотов.
+Два staging буфера24576B,36успешныхuploads/442368B,34ring reuses.
+`codex-m31-port4-gpu-uploader-recovery-v1` и build unit rc0, cleanup завершён.
+Probe обходит attention, поэтому ограничение tiny CUDA FA к нему не относится.
+
+Все новые карточные jobs далее должны запускаться через `card_launch.py`,
+создающий read-only runner snapshot и SHA manifest. Recovery был запущен до
+появления launcher через собственный immutable snapshot, результаты не затронуты.
+GPU source freeze для следующего окна скорости; full gate20 ещё не запускался.

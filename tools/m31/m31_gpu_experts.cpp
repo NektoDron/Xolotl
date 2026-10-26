@@ -1,4 +1,5 @@
 #include "m31_gpu_experts.hpp"
+#include "prefill_pipeline.hpp"
 
 #include "ggml-alloc.h"
 #ifdef M31_CPU_QUANTS_CUDA
@@ -75,6 +76,7 @@ struct GpuExperts::Impl {
     ggml_backend_dev_t device = nullptr;
     ggml_backend_buffer_type_t buffer_type = nullptr;
     ggml_backend_buffer_t pool = nullptr, staging = nullptr;
+    std::unique_ptr<PrefillUploads> uploads;
     std::unique_ptr<Context> slot_metadata;
     ggml_tensor * pool_proxy = nullptr;
     std::vector<ggml_tensor *> slot_proxies;
@@ -87,11 +89,22 @@ struct GpuExperts::Impl {
     uint64_t clock = 0;
     int max_chunk = 0;
     bool ready = false;
+#ifdef M31_GPU_PREFILL_TESTING
+    bool test_upload_failure_fired = false;
+#endif
 #ifdef M31_CPU_QUANTS_CUDA
     std::unique_ptr<GpuCpuQuants> cpu_quants;
 #endif
 
     ~Impl() {
+        if (uploads) {
+            const auto & u = uploads->stats();
+            std::fprintf(stderr, "M31 prefill uploads: batches=%llu uploads=%llu upload_bytes=%llu staging_bytes=%zu reuses=%llu pinned=%d async=%d\n",
+                         (unsigned long long)u.batches, (unsigned long long)u.uploads,
+                         (unsigned long long)u.upload_bytes, u.staging_bytes,
+                         (unsigned long long)u.staging_reuses, int(u.pinned), int(u.asynchronous));
+            uploads.reset(); // Transfer/computation streams drain before slot tensors/pool die.
+        }
         if (backend) {
             ggml_backend_synchronize(backend);
             clear_captures(backend);
@@ -126,17 +139,33 @@ struct GpuExperts::Impl {
             ++stat.evictions;
         }
         const auto & source = layers[size_t(layer)];
-        auto * stage = staging ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(staging)) : pageable_staging.data();
-        // Includes each role's CUDA quant padding and slot-alignment padding. External
-        // NVFP4 scales live in the graph, not in any role's byte stride.
-        std::memset(stage, 0, stat.slot_stride);
-        for (int r = 0; r < 3; ++r) {
-            const auto * slice = source.sources[size_t(r)];
-            std::memcpy(stage + source.offsets[size_t(r)],
-                        slice->data + size_t(expert) * slice->expert_stride, source.raw_bytes[size_t(r)]);
+        if (uploads) {
+            // Identical original role bytes and zero padding, packed into a bounded
+            // two-buffer ring while the preceding slot is transferred on its stream.
+            uploads->enqueue(slot_proxies[slot], {
+                {source.offsets[0], source.sources[0]->data + size_t(expert)*source.sources[0]->expert_stride, source.raw_bytes[0]},
+                {source.offsets[1], source.sources[1]->data + size_t(expert)*source.sources[1]->expert_stride, source.raw_bytes[1]},
+                {source.offsets[2], source.sources[2]->data + size_t(expert)*source.sources[2]->expert_stride, source.raw_bytes[2]},
+            });
+#ifdef M31_GPU_PREFILL_TESTING
+            const char * inject = std::getenv("M31_GPU_PREFILL_TEST_FAIL_AFTER");
+            if (inject && !test_upload_failure_fired && std::strtoull(inject, nullptr, 10) == stat.misses+1) {
+                test_upload_failure_fired = true;
+                throw std::runtime_error("M31 prefill injected upload failure");
+            }
+#endif
+        } else {
+            auto * stage = staging ? static_cast<uint8_t *>(ggml_backend_buffer_get_base(staging)) : pageable_staging.data();
+            // Includes each role's CUDA quant padding and slot-alignment padding.
+            // External NVFP4 scales live in the graph, not in the byte stride.
+            std::memset(stage, 0, stat.slot_stride);
+            for (int r = 0; r < 3; ++r) {
+                const auto * slice = source.sources[size_t(r)];
+                std::memcpy(stage + source.offsets[size_t(r)],
+                            slice->data + size_t(expert)*slice->expert_stride, source.raw_bytes[size_t(r)]);
+            }
+            ggml_backend_tensor_set(slot_proxies[slot], stage, 0, stat.slot_stride);
         }
-        // A single synchronous H2D copy, with no cudaMalloc/cudaFree on a cache miss.
-        ggml_backend_tensor_set(slot_proxies[slot], stage, 0, stat.slot_stride);
         stat.upload_bytes += stat.slot_stride;
         ++stat.misses;
         entries.emplace(id, Entry{slot, ++clock});
@@ -395,10 +424,18 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
     }
     p_->allocator = ggml_gallocr_new(p_->buffer_type);
     check(p_->allocator != nullptr, "graph allocator initialization failed");
-    const auto host_type = ggml_backend_dev_host_buffer_type(p_->device);
-    if (host_type) p_->staging = ggml_backend_buft_alloc_buffer(host_type, p_->stat.slot_stride);
-    p_->stat.pinned_staging = p_->staging != nullptr;
-    if (!p_->staging) p_->pageable_staging.resize(p_->stat.slot_stride);
+    const char * async = std::getenv("M31_GPU_PREFILL_ASYNC");
+    if (async && std::string(async) == "1") {
+        p_->uploads = std::make_unique<PrefillUploads>(backend, p_->stat.slot_stride, 2);
+        p_->stat.pinned_staging = p_->uploads->stats().pinned;
+        std::fprintf(stderr, "M31 GPU experts: opt-in prefill upload ring async=%d depth=%zu staging_bytes=%zu\n",
+                     int(p_->uploads->stats().asynchronous), p_->uploads->stats().depth, p_->uploads->stats().staging_bytes);
+    } else {
+        const auto host_type = ggml_backend_dev_host_buffer_type(p_->device);
+        if (host_type) p_->staging = ggml_backend_buft_alloc_buffer(host_type, p_->stat.slot_stride);
+        p_->stat.pinned_staging = p_->staging != nullptr;
+        if (!p_->staging) p_->pageable_staging.resize(p_->stat.slot_stride);
+    }
     std::fprintf(stderr, "M31 GPU experts: fixed_slots=%zu slot_stride=%zu pool_bytes=%zu budget=%zu pinned=%d source_q8=%d (layer mul_mat_id; graph scratch separate)\n",
                  p_->stat.slot_count, p_->stat.slot_stride, p_->stat.pool_bytes, p_->stat.budget_bytes,
                  int(p_->stat.pinned_staging), int(p_->stat.q8_activations));
@@ -437,20 +474,55 @@ std::vector<float> GpuExperts::forward(int layer, int n, const std::vector<float
     check(selected.size() <= p_->stat.slot_count,
           "layer needs " + std::to_string(selected.size()) + " distinct expert slots; cache has " + std::to_string(p_->stat.slot_count) +
           "; minimum batch cache bytes=" + std::to_string(selected.size() * p_->stat.slot_stride));
-    std::vector<int32_t> expert_to_slot(size_t(g.experts), -1);
-    std::array<std::vector<float>, 3> scales;
-    for (auto & values : scales) values.assign(p_->stat.slot_count, 1.0f);
-    for (int expert : selected) {
-        const size_t slot = p_->load(layer, expert, protected_keys);
-        expert_to_slot[size_t(expert)] = int32_t(slot);
-        for (int role = 0; role < 3; ++role)
-            scales[size_t(role)][slot] = p_->layers[size_t(layer)].scales[size_t(role)][size_t(expert)];
+    try {
+        if (p_->uploads) p_->uploads->begin_batch();
+        std::vector<int32_t> expert_to_slot(size_t(g.experts), -1);
+        std::array<std::vector<float>, 3> scales;
+        for (auto & values : scales) values.assign(p_->stat.slot_count, 1.0f);
+        for (int expert : selected) {
+            const size_t slot = p_->load(layer, expert, protected_keys);
+            expert_to_slot[size_t(expert)] = int32_t(slot);
+            for (int role = 0; role < 3; ++role)
+                scales[size_t(role)][slot] = p_->layers[size_t(layer)].scales[size_t(role)][size_t(expert)];
+        }
+        std::vector<int32_t> mapped_ids(ids.size());
+        for (size_t i = 0; i < ids.size(); ++i) mapped_ids[i] = expert_to_slot[size_t(ids[i])];
+        if (p_->uploads) {
+            p_->uploads->finish();
+#ifdef M31_CPU_QUANTS_CUDA
+            // The diagnostic exact-CPU dot uses CUDA's default stream, separate
+            // from ggml's compute stream on which finish() installs its event wait.
+            if (p_->cpu_quants) p_->uploads->synchronize();
+#endif
+        }
+        auto output = p_->execute(layer, n, x, mapped_ids, weights, scales);
+        ++p_->stat.forwards;
+        return output;
+    } catch (...) {
+        if (p_->uploads) {
+            // A failed enqueue may already have evicted a slot or queued a DMA.
+            // Drain first, then discard ALL metadata; no pending bytes become hits.
+            p_->uploads.reset();
+#ifdef M31_CPU_QUANTS_CUDA
+            const bool exact_cpu = bool(p_->cpu_quants);
+            p_->cpu_quants.reset(); // cudaFree also drains its independent raw stream.
+#endif
+            p_->entries.clear();
+            p_->free_slots.clear();
+            for (size_t slot = 0; slot < p_->stat.slot_count; ++slot)
+                p_->free_slots.push_back(p_->stat.slot_count-slot-1);
+            p_->stat.occupied_slots = 0;
+            try {
+                p_->uploads = std::make_unique<PrefillUploads>(p_->backend, p_->stat.slot_stride, 2);
+#ifdef M31_CPU_QUANTS_CUDA
+                if (exact_cpu) p_->cpu_quants = std::make_unique<GpuCpuQuants>();
+#endif
+            } catch (...) {
+                p_->ready = false; // Failed recovery is terminal; forward refuses reuse.
+            }
+        }
+        throw;
     }
-    std::vector<int32_t> mapped_ids(ids.size());
-    for (size_t i = 0; i < ids.size(); ++i) mapped_ids[i] = expert_to_slot[size_t(ids[i])];
-    auto output = p_->execute(layer, n, x, mapped_ids, weights, scales);
-    ++p_->stat.forwards;
-    return output;
 }
 
 const GpuExperts::Stats & GpuExperts::stats() const { return p_->stat; }
