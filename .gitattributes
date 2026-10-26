@@ -10,3 +10,7 @@ tests/data/native_experts/** -text
 
 # the quant yardstick's text set: tokenized byte for byte (set.ids.json), never convert its line endings
 data/quant_quality/** -text
+
+# Stored M31 integration proposals contain required single-space diff context lines.
+# Check the applied source normally, without treating those patch context markers as errors.
+tools/m31/*.patch whitespace=-blank-at-eol
