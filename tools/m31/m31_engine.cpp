@@ -161,18 +161,19 @@ struct Graph {
     int64_t pos0 = 0;
     std::vector<std::pair<std::string, ggml_tensor *>> taps;
     bool borrowed = false;
-    Graph(ggml_backend_t b, const Config & cfg, int64_t pos, Workspace * workspace = nullptr)
+    Graph(ggml_backend_t b, const Config & cfg, int64_t pos, Workspace * workspace = nullptr,
+          size_t metadata_bytes = 32 * 1024 * 1024, size_t graph_nodes = 8192)
         : backend(b), config(cfg), pos0(pos), borrowed(workspace != nullptr) {
         if (workspace) {
             c = workspace->context;
             ggml_reset(c);
             allocator = workspace->allocator;
         } else {
-            c = ggml_init({32 * 1024 * 1024, nullptr, true});
+            c = ggml_init({metadata_bytes, nullptr, true});
             allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         }
         require(c != nullptr, "graph metadata allocation failed");
-        graph = ggml_new_graph_custom(c, 8192, false);
+        graph = ggml_new_graph_custom(c, graph_nodes, false);
         require(allocator != nullptr, "graph allocator failed");
     }
     ~Graph() {
@@ -260,6 +261,16 @@ struct Engine::Impl {
     ggml_threadpool_t cpu_pool = nullptr;
     std::unique_ptr<Workspace> dense_workspace, cpu_workspace;
     std::unique_ptr<AttentionInputs> attention_inputs;
+    struct RoutedGraph {
+        std::unique_ptr<Graph> graph;
+        ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
+    };
+    std::vector<std::unique_ptr<RoutedGraph>> cpu_decode_graphs;
+    struct Timings {
+        double dense = 0, routed_setup = 0, routed_compute = 0, routed_read = 0, residual = 0;
+    } timings;
+    using Clock = std::chrono::steady_clock;
+    static double elapsed(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
     Weights host, device;
     std::unique_ptr<GpuExperts> gpu_experts;
     const Weights * dense = nullptr;
@@ -280,6 +291,7 @@ struct Engine::Impl {
                          (unsigned long long)s.upload_bytes, s.resident_bytes, s.peak_resident_bytes, s.scratch_bytes, s.pinned_staging);
         }
         gpu_experts.reset();
+        cpu_decode_graphs.clear();
         dense_workspace.reset();
         cpu_workspace.reset();
         attention_inputs.reset();
@@ -406,7 +418,39 @@ struct Engine::Impl {
     std::vector<float> routed(int l, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids, const std::vector<float> & weights) {
         if (gpu_experts && n >= cfg.gpu_experts_min_tokens) return gpu_experts->forward(l, n, x, ids, weights);
-        Graph b(cpu, cfg, pos, cpu_workspace.get());
+        const auto setup_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        RoutedGraph temporary;
+        RoutedGraph * cached = &temporary;
+        if (cfg.cpu_decode_cache && n == 1 && !cfg.tap) {
+            if (!cpu_decode_graphs[size_t(l)]) cpu_decode_graphs[size_t(l)] = std::make_unique<RoutedGraph>();
+            cached = cpu_decode_graphs[size_t(l)].get();
+        }
+        if (!cached->graph) {
+            // One token has fixed tensor shapes and only IDs/activation/route weights
+            // vary. Keep the original ggml graph and its alias plan, not a new graph
+            // with an assumed equivalent node count. Taps retain the uncached path.
+            cached->graph = std::make_unique<Graph>(cpu, cfg, pos,
+                cached == &temporary ? cpu_workspace.get() : nullptr,
+                cached == &temporary ? 32 * 1024 * 1024 : 1024 * 1024,
+                cached == &temporary ? 8192 : 512);
+            build_routed(l, n, *cached);
+        }
+        auto & b = *cached->graph;
+        ggml_backend_tensor_set(cached->input, x.data(), 0, ggml_nbytes(cached->input));
+        ggml_backend_tensor_set(cached->ids, ids.data(), 0, ggml_nbytes(cached->ids));
+        ggml_backend_tensor_set(cached->weights, weights.data(), 0, ggml_nbytes(cached->weights));
+        if (cfg.profile) timings.routed_setup += elapsed(setup_start);
+        const auto compute_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        b.compute();
+        if (cfg.profile) timings.routed_compute += elapsed(compute_start);
+        const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        auto output = Graph::read(cached->output);
+        if (cfg.profile) timings.routed_read += elapsed(read_start);
+        return output;
+    }
+
+    void build_routed(int l, int n, RoutedGraph & storage) {
+        auto & b = *storage.graph;
         auto c = b.c;
         auto inp = b.input(GGML_TYPE_F32, g.embd, 1, n);
         auto id = b.input(GGML_TYPE_I32, g.used, n);
@@ -435,14 +479,14 @@ struct Engine::Impl {
         }
         result = b.tap(ggml_cont(c, result), "ffn_moe_out", l);
         b.allocate({result});
-        ggml_backend_tensor_set(inp, x.data(), 0, ggml_nbytes(inp));
-        ggml_backend_tensor_set(id, ids.data(), 0, ggml_nbytes(id));
-        ggml_backend_tensor_set(rw, weights.data(), 0, ggml_nbytes(rw));
-        b.compute();
-        return Graph::read(result);
+        storage.input = inp;
+        storage.ids = id;
+        storage.weights = rw;
+        storage.output = result;
     }
 
     void layer(int l, int n) {
+        const auto dense_start = cfg.profile ? Clock::now() : Clock::time_point{};
         std::vector<float> ffn_input, residual, shared;
         std::vector<int32_t> ids(size_t(g.used * n));
         std::vector<float> route_weights;
@@ -466,6 +510,7 @@ struct Engine::Impl {
                 upload_attention(b, x, positions, mask, bias, n, nk, nb);
                 b.compute();
                 hidden = Graph::read(out);
+                if (cfg.profile) timings.dense += elapsed(dense_start);
                 return;
             }
             auto shexp = b.tap(ffn(b, *dense, norm, prefix, "_shexp"), "ffn_shexp", l);
@@ -489,13 +534,17 @@ struct Engine::Impl {
                 ggml_backend_tensor_get(selected, ids.data() + t * g.used, size_t(t) * selected->nb[1], size_t(g.used) * sizeof(int32_t));
             route_weights = Graph::read(weight);
         }
+        if (cfg.profile) timings.dense += elapsed(dense_start);
+        if (cfg.route_observer) cfg.route_observer(l, n, ids, route_weights);
         const auto moe = routed(l, n, ffn_input, ids, route_weights);
+        const auto residual_start = cfg.profile ? Clock::now() : Clock::time_point{};
         if (cfg.cpu_residual && !cfg.tap) {
             hidden.resize(moe.size());
             for (size_t i = 0; i < moe.size(); ++i) {
                 const float ff = moe[i] + shared[i];
                 hidden[i] = ff + residual[i];
             }
+            if (cfg.profile) timings.residual += elapsed(residual_start);
             return;
         }
         Graph b(backend, cfg, pos, dense_workspace.get());
@@ -510,6 +559,7 @@ struct Engine::Impl {
         ggml_backend_tensor_set(m, moe.data(), 0, ggml_nbytes(m));
         b.compute();
         hidden = Graph::read(out);
+        if (cfg.profile) timings.residual += elapsed(residual_start);
     }
 
     void upload_attention(Graph &, ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask,
@@ -554,6 +604,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->cfg = cfg;
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
+        p_->cpu_decode_graphs.resize(size_t(p_->g.layers));
         require(cfg.context <= p_->g.context && cfg.context <= INT32_MAX, "context exceeds model maximum");
         p_->capacity = kv_length(cfg.context, p_->g);
         p_->cpu = ggml_backend_cpu_init();
@@ -609,6 +660,7 @@ void Engine::reset() { p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->pois
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
     try {
+        const auto prepare_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned, "not initialized or reset required after a failed pass");
         require(tokens && n > 0 && n <= p_->cfg.max_chunk && p_->pos + n <= p_->cfg.context, "invalid pass size/context");
         const auto & g = p_->g;
@@ -632,11 +684,17 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             p_->fill_attention(inputs.positions, inputs.mask, inputs.bias, inputs.blocks, n, nk, nk / g.block);
         }
         const auto started = std::chrono::steady_clock::now();
+        const double prepare_seconds = p_->cfg.profile ? Impl::elapsed(prepare_started) : 0;
+        p_->timings = {};
         for (int l = 0; l < g.layers; ++l) p_->layer(l, n);
         if (p_->cfg.profile) {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             std::fprintf(stderr, "M31 forward pos=%lld n=%d seconds=%.6f tps=%.3f\n",
                          (long long)p_->pos, n, seconds, n / seconds);
+            const auto & t = p_->timings;
+            std::fprintf(stderr, "M31 stages pos=%lld n=%d prepare_ms=%.3f dense_ms=%.3f routed_setup_ms=%.3f routed_compute_ms=%.3f routed_read_ms=%.3f residual_ms=%.3f decode_cache=%d\n",
+                         (long long)p_->pos, n, 1000*prepare_seconds, 1000*t.dense, 1000*t.routed_setup, 1000*t.routed_compute,
+                         1000*t.routed_read, 1000*t.residual, int(p_->cfg.cpu_decode_cache));
         }
         p_->pos += n;
         p_->last_n = n;
@@ -647,6 +705,7 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
 
 bool Engine::logits(int row, int count, std::vector<float> & out, std::string & error) {
     try {
+        const auto head_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned && row >= 0 && count > 0 && row + count <= p_->last_n, "invalid logits rows/state");
         Graph b(p_->backend, p_->cfg, p_->pos - p_->last_n + row, p_->dense_workspace.get());
         auto x = b.input(GGML_TYPE_F32, p_->g.embd, count);
@@ -654,8 +713,15 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
         auto output = b.tap(ggml_mul_mat(b.c, p_->dense->get("output.weight"), norm), "result_output");
         b.allocate({output});
         ggml_backend_tensor_set(x, p_->hidden.data() + size_t(row) * p_->g.embd, 0, ggml_nbytes(x));
+        const double setup_seconds = p_->cfg.profile ? Impl::elapsed(head_started) : 0;
+        const auto compute_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         b.compute();
+        const double compute_seconds = p_->cfg.profile ? Impl::elapsed(compute_started) : 0;
+        const auto read_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         out = Graph::read(output);
+        if (p_->cfg.profile) std::fprintf(stderr,
+            "M31 head pos=%lld n=%d setup_ms=%.3f compute_ms=%.3f read_ms=%.3f\n",
+            (long long)(p_->pos-p_->last_n+row), count, 1000*setup_seconds, 1000*compute_seconds, 1000*Impl::elapsed(read_started));
         return true;
     } catch (const std::exception & e) { error = e.what(); return false; }
 }

@@ -24,6 +24,9 @@ struct Config {
     bool cpu_residual = false; // same F32 addition order, avoids an extra GPU round trip
     bool cpu_decode_cache = false; // keep per-layer CPU MoE graphs for single-token steps
     bool profile = false;
+    // Optional calibration observer; IDs/weights are token-major [n,used].
+    std::function<void(int layer, int n, const std::vector<int32_t> &,
+                       const std::vector<float> &)> route_observer;
     // Called after compute, before the graph is freed. Tensor data may live on the GPU:
     // read with ggml_backend_tensor_get(). Names follow minimax-m3.cpp's cb names.
     std::function<void(const std::string &, int64_t pos0, const ggml_tensor *)> tap;
