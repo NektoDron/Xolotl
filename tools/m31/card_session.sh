@@ -12,11 +12,21 @@ if name not in ('m31-xolotl-check', 'm31-xolotl'):
 print(name)
 PY
 )
+M31_BUILD_LOCK_MODE=$(python3 - "$M31_JOB" <<'PY'
+import json, sys
+measurement = json.load(open(sys.argv[1])).get('measurement', True)
+if not isinstance(measurement, bool):
+    raise ValueError('measurement must be boolean')
+print('x' if measurement else 's')
+PY
+)
 exec >>"/mnt/ai/logs/m31-port/${M31_STEM}.session.log" 2>&1
 exec 9>/mnt/ai/logs/.xolotl-card.lock
 flock -w 86400 9
 exec 8>/mnt/ai/logs/m31-port/.build.lock
-flock -w 86400 8
+# Existing jobs stay exclusive. Explicit correctness jobs can share CPU/build
+# resources; speed jobs must retain the exclusive lock for their whole session.
+flock "-$M31_BUILD_LOCK_MODE" -w 86400 8
 M31_BACKUP="/etc/aictl/config.json.bak-m31-port-${M31_STEM}"
 M31_STOP=0
 M31_INSTALLED=0
