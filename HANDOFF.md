@@ -1,3 +1,91 @@
+# MiniMax-M3.1 → Xolotl: передача работы
+
+Работать ТОЛЬКО в `/mnt/ai/Xolotl-m31`, ветка `aiserver/m31-port`.
+Base: origin/main `961d390fea6d848431822f7c6e94a6e5c0775133`.
+Ниже сохранён унаследованный upstream HANDOFF; исходный также доступен
+через `git show 961d390f:HANDOFF.md`.
+
+## Состояние
+
+M0 завершён: [docs/m31/M0.md](docs/m31/M0.md). M1 в разработке, НЕ принят.
+Написан отдельный opt-in модуль `tools/m31`, без правок продовых движков.
+Статус/внешние исходники: `/mnt/ai/logs/m31-port/STATUS.md`, `refs/manifest.json`.
+
+Написано (ещё НЕ собранно и НЕ протестировано):
+
+- `m31_geometry.hpp` / `m31_inspect`: полная shape/type/bounds карта, NVFP4 scales,
+  обязательный indexer на первых dense FFN слоях, расчёт байтов.
+- `m31_engine.{hpp,cpp}` / `m31_generate`: свои ggml MSA mask/gather, partial NeoX,
+  per-head QK RMS, dense/shared OAI, unbiased router weights и CPU ggml experts.
+  Загружает оригинальные типы, без requant. Transient CUDA graph cache очищается
+  перед освобождением графа (иначе риск stale pointers, как был у GLM).
+- `oracle/`: отдельный процесс, линкуется с готовыми STATIC библиотеками ref-агента
+  или shared build PR; SHA source проверяется. Vocab-only tokenize режим.
+- `make_prompts.py`, `compare_logits.py`, `compare_taps.py`: 20 prompts 64..3000,
+  raw-logits gate, проверка ID/модели/позиций, first-layer localization.
+- `tests/`: маленький F32 GGUF, независимый NumPy reference, missing-index/extra
+  tensor rejection, chunk1/7/29, тесты KL/неполных и испорченных dump.
+
+## Ближайшие действия M1
+
+1. Проверить ref unit; пока active НЕ запускать даже compiler/py_compile/tests.
+2. После его окончания прочитать REPORT.md. Через systemd-run выполнить
+   `bash /mnt/ai/Xolotl-m31/tools/m31/build.sh cpu`, исправить compile/fixture ошибки.
+   Логи build-*.log; см. [tools/m31/README.md](tools/m31/README.md).
+3. Аналогично `build.sh cuda`. Он строит также oracle, используя библиотеки
+   `/mnt/ai/llama.cpp-m31pr-1026/build` (BUILD_SHARED_LIBS=OFF; не пересобирать ref).
+4. `make_prompts.py` → oracle vocab-only tokenize → общие .i32. Сначала короткий
+   и один 3000-token кейс, затем весь набор. Скоростной benchmark ещё не запускать.
+5. До GPU-прохода сделать собственный временный aictl launcher/preset с backup,
+   rollback-командой и trap down после возврата up под card lock; **preset пока нет**.
+   Из preset запускать сам GPU process, не резервировать чужой сервер и не запускать
+   модель отдельной командой мимо aictl. Только GPU0, CUDA_VISIBLE_DEVICES=0.
+6. Native и oracle выводят новые каталоги per-case. `compare_logits.py --require-suite`
+   принимает только двадцать полных prompt (не stride), top1>=99%, meanKL<1e-5,
+   maxKL<1e-3 на каждом кейсе. Не выдавать synthetic test или smoke за M1.
+7. При ошибке одинаковый chunk и --taps layers, найти первый l_out, затем --taps all
+   на одном кейсе. Сверить ещё chunk1/decode с chunk128/mask после включения MSA.
+
+Настоящих logits, top1, KL и t/s пока НЕТ. M1 не завершён. M2/M3/M4 не начаты.
+Перед M2 потребуются OAI+scratch+NVFP4 изменения общего тиринга (см. M0), GPU cache,
+layer batch и сервер. Не добавлять route bias/skip/prune/requant для прохождения gate.
+
+**Сборок и inference пока не было:** `codex-m31-ref` активен. Сначала проверить
+`systemctl is-active -q codex-m31-ref`. Пока active — только чтение/запись/проектирование.
+Не запускать даже CPU oracle или компиляцию. После завершения читать
+`/mnt/ai/logs/m31-ref/REPORT.md` и сравнивать с лучшим GPU-0 плечом.
+
+## Важные находки
+
+- MSA — не V4.1 lightning-indexer: F32 dot, causal mask до max-pool по блокам128,
+  top16 на каждую GQA-группу, local force. На ВСЕХ слоях, включая 0–2.
+- OAI FFN: alpha1.702, limit7, `up+1`. Общий Ds4MoeTier пока не умеет эту активацию.
+- CPU scratch пределы 5840/2628/2304 меньше M31 7008/3504/3072.
+- NVFP4 down только52/58/59, обязательные `.scale`. Ds4GgufBlobs их не читает,
+  и расчёт down stride с tail нужно исправлять до подключения арены.
+- Не копировать GLM BF16→Q8_0 requant в M1. Gemma +1 уже в GGUF.
+- M31 DSpark — dflash, не Ds41DSpark. Tap layers брать из metadata draft.
+  Уже прочитан реальный draft: GGUF target_layers=[4,18,32,46,60], HF IDs=
+  [3,17,31,45,59]; проверить input/output semantics, не ошибиться на один слой.
+  5 dense draft blocks, block7/window4096, noise200058, payload1.94GiB.
+- Свежий root CMake pin ggml `6050b467...`; helper fetch-llama.sh ещё содержит
+  `3cf03257...`. Не запускать helper вслепую; собственный vendor, ни одной правки up*.
+
+## Неизменные правила
+
+Карты только aictl под `flock -w 86400 /mnt/ai/logs/.xolotl-card.lock`.
+Только карта0; карта1 остаётся майнеру. Trap с down после завершившегося up.
+Долгое — `sudo systemd-run --unit=codex-m31-port-... -p User=nekto`, лог в
+`/mnt/ai/logs/m31-port`. Не мерить поверх сборок/конвертаций. Test preset:
+backup `/etc/aictl/config.json`, явная rollback-команда, убрать после этапа.
+Прод hxq3k, `/home/nekto/xolotl_up_engine.sh`, `/mnt/ai/Xolotl-up*` не менять.
+Ничего чужого не удалять; коммиты только локально в своей ветке, без attribution,
+никакого push/PR. Отчёты по-русски. После M2 при слабом/нулевом выигрыше остановиться.
+
+---
+
+# Унаследованный upstream HANDOFF (сохранён для справки)
+
 # Xolotl — HANDOFF (2026-10-17, session 6 — CURRENT; sessions 5 and earlier below are history)
 
 ## S7 Session 7 (2026-10-18 08:00-) - running log, newest last
