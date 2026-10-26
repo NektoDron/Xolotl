@@ -125,3 +125,5 @@ MAP_HUGETLB pool не настроен. Копирование150GiB, mlock, hug
 не выполнялись. Такой эксперимент требует отдельного согласованного запуска и
 окна: сначала измерить baseline arena170 безTHP, затем backing/pack latency и
 TG на THP, не выводить выигрыш из одной лишь замены allocator.
+
+Финальная отметка координатора: исторический integration patch уже применён и не предназначен для повторного применения к текущему дереву. Integrated candidate прошёл4×117 expert стадий и code128 seed0/20 побитно CPU oracle. CPU-compatible GPU benchmark дал46.2PP/21.375TG, выигрыша над reference не получено.

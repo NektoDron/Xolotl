@@ -1,5 +1,13 @@
 # GPU correctness, port4
 
+**Итог сессии:** два раздельных полных численных контракта проверены (frozen
+CPU-exact и stock GgmlGPUoracle), но выигрыша M2 нет. Best native CPU-overlap:
+PP183.3/TG22.155; stock GPU:PP95.35/TG20.75; exact GPU:PP46.2/TG21.375.
+Референс llama.cpp1GPU:PP4K425 (32K433),TG4K23.33. Новые модели/сборки/замеры
+после этих окон не запускаются; M3 не продолжаем. Финальные scope/ограничения
+и разбор stock window находятся в последнем разделе ниже.
+
+
 2026-10-26. Fixed VRAM slots + layer `mul_mat_id` проверены на code128.
 
 - `gpu-slot-code128-compare-v2.json`: против GPU-offload oracle **128/128 top1, KL0, maxabs0, побитно**.
@@ -212,3 +220,207 @@ Seed F32 API/env probe тоже PASS, включая recovery и partial seed te
 `job-gpu-candidate-combined-code128-v1.json`, `job-gpu-candidate-seed20-code128-v1.json`.
 Четыре отдельных полных startup/pack не запускаются. Численных/скоростных
 результатов этих двух gates пока нет; runtime performance окно у координатора.
+
+## Итог GPU speed4K: M2 отрицательный, остановка
+
+Строгое отдельное окно без сборок/heavyCPU, одно принятое frozen candidate плечо:
+`port4-gpu-candidate-speed-v1/manifest.json`. Порядок: generic HTTP109 PASS,
+затем исходный `~/om_bench.py`, OM_OFF={"reasoning_effort":"low"}, warmup/4K/4K.
+Session и внешний unit rc0, cleanup выполнен. Никаких дополнительных экспериментов
+для объяснения результата не запускалось.
+
+| Повтор | Prompt | PP,t/s | TG,t/s | Gen | Prompt,s | Wall,s |
+|---|---:|---:|---:|---:|---:|---:|
+|4K №1|4350|46.2|21.57|256|94.2|106.1|
+|4K №2|4352|46.2|21.18|256|94.1|106.2|
+
+Медианы TSV:PP46.2,TG21.375. Против лучшего llama.cpp1GPU PP425/TG23.33:
+10.87%/91.62% скорости соответственно. PP также ниже принятого CPU-плеча124.5
+(37.11% его скорости). Выигрыша нет; полный M2 benchmark16K/32K и M3 не продолжаем
+по исходному критерию Андрея. F16KV8192 здесь отличается от refQ8_0KV65536;
+точное клиентское тело low, скрипт и корпус сохранены/хешированы.
+
+Telemetry:peakGPU0=19475MiB; peak суммы RSS engine+adapter+helper317.02GiB,
+включая file mappings и отдельную точную RAM-арену. Это RSS, не private RAM.
+
+### Что измерено именно в этом speed window
+
+`port4-gpu-candidate-speed-v1/profile-analysis-final.json` содержит расчёт по
+native stage counters, отдельно для каждого из двух4K запросов:
+
+- Prompt94.229/94.099с. Forward-сумма94.151/94.058с.
+- Dense stage2.117/2.046с; внутри GPU compute0.869/0.869с,
+  dense read0.950/0.880с. CPU residual0.605/0.594с.
+- Остаток routed-MoE+control91.350/91.379с, около97%prompt времени.
+  Это разность forward и известных stage counters, а не измерение PCIe/kernel.
+- Каждый полный2048chunk занимает39.58–40.05с; хвост254/256 —14.35/14.43с.
+- Generation11.820/12.039с; суммарный interactive ACK wait58.9/49.8мс,
+  sampling92.6/91.6мс. Grammar checks/rejections/wait=0. IPC/sampling по этим
+  таймерам не объясняют ни94с префилла, ни основную задержку генерации.
+
+**Отдельных CPUquant/OAI/H2D/kernel/D2H чисел именно для этого HTTP speed run нет.**
+GpuCpuQuants печатает host_quant и H2D_kernel_D2H только в destructor, а текущий
+RPC.close завершает C++engine SIGTERM. В server.log0таких строк и0финальных
+uploader summaries. Числа одношаговых code128 correctness runs выше не переносим
+на этот benchmark. Остаток91.4с включает packing/zeroing/upload/sync, quant/OAI,
+CUDA dot, activation/output transfers, allocations/route metadata и ordered reduce;
+разложить его на эти компоненты данными этого окна нельзя.
+
+### Что следует из кода, но не является отдельным измерением
+
+Проверенный CUDA dot — точный скалярный прототип:8lanes на одну пару
+(output row,route). Каждая такая пара снова декодирует исходные IQ3/IQ4/NVFP4
+blocks. Stable sort сближает маршруты одного эксперта, но не создаёт совместный
+M×N tile, shared weight decode или гарантированное переиспользование между
+CUDA blocks; возможные L2 hits не устраняют повторные integer decode инструкции.
+Загрузка всех выбранных слотов заканчивается до execute, так что нынешний uploader
+перекрывает CPU packing с H2D, но не H2D с MoE compute. При следующем token chunk
+последовательный обход60слоёв снова вытесняет большую часть рабочего набора.
+Эти свойства объясняют направления оптимизации; профиль не доказывает, какая
+доля91.4с приходится на каждый из них. Утверждать, что всё время —PCIe, нельзя.
+
+Следующий порт: CPU-compatible batched MMQ/DP4A/IMMA для IQ3/IQ4, с tile по
+output rows и токенам одного эксперта, unpack исходных весов один раз на tile,
+shared staging и повторным использованием quantized activations. Сохранить
+исходные full-batch histograms (>=8CPUtiled), exact integer subblock scales,
+накопление по256 и CPU FP/FMA порядок. Для редких<8 и NVFP4 оставить проверенный
+fallback, пока отдельный быстрый kernel не докажет тот же контракт. Тот же GGUF,
+без requant/prune. Сначала component probes и code128, затем полный20/28723 и
+только после них новое окно скорости. Следующий ресурс следует тратить на
+матричное переиспользование, а не очередные hostpool настройки.
+
+### Граница численных доказательств и source fingerprint
+
+Полный20/28723 относится к **предыдущей frozen integrated версии**, chunk2048/
+decode_tail32 в обоих процессах. Дополнительно `gpu-fullgate-bytecmp-v1.json`
+проверил ОС `cmp`:20/20rc0,5746438272F32 значений — реально побитно, не только KL0.
+
+Измеренный более новый candidate включает hostpool32, route sort, host reads,
+seed20 и новый совместимый arenaheader (THPoff). Для него проверены4×117стадий
+standalone и два realcode128 (seed0/20), top1=1/KL0/maxabs0. **Полный20 для этой
+новой комбинации не повторялся**; не подменять его старым fullgate. HTTP109 пройден.
+
+`gpu-candidate-gates-v1/manifest.json` хранит исходники/ELF SHA и независимые copies:
+
+- generate SHA256 `744f710ef55c3ed33cb141448464dbc20f9c36f3eee4e63638565901a84c4432`;
+- serve SHA256 `10644555845043ae8e2ff3c35a24bbb34d97d276aaea47fbfbcb1ae22c0d3b36`.
+
+Speed manifest дополнительно фиксирует PythonACK/helper/client/corpus/ref/rank
+fingerprints, всю CLI/env, sealed seed preflight и telemetry/profile paths.
+Default host threads1, sort/seed/hostreads/THP opt-in; production не менялся.
+
+## Дополнительный диагностический потолок штатного CUDA MMQ
+
+Координатор отдельно разрешил исключить цену CPU-compatible scalar kernel из
+M2 решения: те же frozen ELF, но M31_GPU_CPU_QUANTS=0. Это штатный ggml CUDA
+`mul_mat_id`, async/hostreads/seed20 сохранены; hostpool/route-worklist exact-kernel
+здесь не используются. **Этот контракт назван GgmlGPUoracle и не заменяет M1CPU.**
+Его CUDA activation quantization отличается от принятого CPU oracle: исторический
+128 comparison даёт top1=.78125,meanKL=.77857093. Смена oracle для этой диагностики
+не делает эти CPU расхождения пройденным M1 gate.
+
+Fresh `gpu-ggml-gpuoracle-code128-compare-v1.json`:PASS128/128,KL0/maxabs0 против
+сохранённого GPU-offload oracle128. Session rc0. После этого запущен отдельный
+`job-gpu-ggml-gpuoracle-suite20-c2048-d32-v1.json`: новый oracle-op-offload1 и native
+CPU_QUANTS0,chunk2048/tail32,все20/28723. Итоговый scope специальный
+GgmlGPUoracle-complete-logits, не M1-complete-logits. Пока результат ожидается.
+Завершённый code3000 промежуточно совпал численно на всех3000позициях, но это
+не заменяет полный suite. Stock speed не запускался; только после PASS и нового
+окна координатора. Источники/библиотеки не менялись и не пересобирались.
+
+Read-only sidecar `gpu-ggml-gpuoracle-policy-v1.json` фиксирует SHA job/runner/ELF,
+разные CPU/GPU контракты, env, seed, исходные CPU proof paths. Числа ранее
+измеренного exact-mode46.2/21.375 остаются действительными для своего candidate.
+
+### GgmlGPUoracle full20 PASS, скорость ещё не измерена
+
+`gpu-ggml-gpuoracle-suite20-c2048-d32-compare-v1.json`:20/20,28723строки,
+top1=1,mean/maxKL=0,maxabs=0; scope=GgmlGPUoracle-complete-logits.
+Native CPU_QUANTS0 совпадает с fresh oracle-op-offload1 при chunk2048/tail32.
+Внешний unit rc0, cleanup выполнен. Это численное совпадение по полным logits;
+дополнительный файловый bytecmp этого нового режима не выполнялся.
+CPU-exact fullgate/bytecmp остаются отдельным доказательством прежнего режима.
+
+Подготовлен один reviewable stock speed job (не запускался при подготовке):
+`port4-ggml-gpuoracle-speed-v1/m31-port4-ggml-gpuoracle-v1-card-job.json`.
+Физически те же frozen ELF/runtime, меняется только envCPU_QUANTS0 и отключаются
+неиспользуемые hostpool/route flags. Seed20/arena170/cache6,ctx8192/chunk2048/t64,
+F16,bothcaches,async,hostreads сохранены. ExactOM_OFFlow,generic109→warmup/4K/4K.
+Stock speed пока ждёт нового отдельного окна координатора. Его manifest явно
+называет альтернативный контракт и содержит известное отличие от CPU oracle.
+
+## Заключительный stock MMQ benchmark и отрицательный M2
+
+Официальный новый speed window завершился rc0, generic HTTP109 PASS,
+исходный om_bench warmup/4K/4K,256tokens,length в обоих измерениях.
+Результат `port4-ggml-gpuoracle-speed-v1/stock-summary.json`;
+разбор `port4-ggml-gpuoracle-speed-v1/profile-analysis-final.json`.
+
+| Путь | PP4K,t/s (медиана) | TG4K,t/s (медиана) | Численная граница |
+|---|---:|---:|---|
+| Best native CPU-overlap |183.3|22.155|Отдельный CPU-overlap gate3000/d32; не frozenfull20|
+| Stock ggml CUDA, GgmlGPUoracle |95.35|20.75|Full20/28723 с matching GPU-placement oracle|
+| Exact CUDA + host32/route/reads/seed20 |46.2|21.375|4×117 component stages и code128 seed0/20; не новыйfull20|
+| llama.cpp best1GPU ref |425|23.33|Конфигурация отчёта ref|
+
+Stock повторы PP96.5/94.2,TG20.92/20.58; prompt4348/4347,
+prompt45.0/46.1с,wall57.3/58.6с. Медиана stock PP в2.064раза выше scalar exact
+варианта, но составляет22.44%отref425 и52.02%отbest native CPU183.3.
+Stock TG составляет88.94%отref. Это наблюдаемое сравнение **целых путей**:
+меняются не только CUDA kernel, но activation quantization, GLU placement и
+обмен промежуточными данными; выделять из него причинный эффект одной операции
+нельзя. Ни stock путь, ни exact путь M2 выигрыша не дали; дальнейшие feature
+loops/full M2 bench/M3 прекращаются по условию Андрея.
+
+### Измеренные части stock profile
+
+Для двух официальных4K запросов сумма prefill forward44.966/46.077с.
+Dense stage2.136/2.066с (внутри GPUcompute0.862/0.862с,
+dense read0.976/0.908с),CPUresidual0.604/0.599с.
+Неатрибутированный routed+control остаток42.151/43.358с —93.58%/93.99%
+полного prompt времени. Для exact варианта аналогичный остаток91.350/91.379с
+(~97%). Эти остатки измерены вычитанием известных stage counters, но не являются
+таймером PCIe. В stock mode CPUquant/OAI из GpuCpuQuants вообще не исполняются;
+GPU quantization/GLU, MMQ, packing/upload/sync, allocator и служебные операции
+содержатся внутри общей MoE части. Раздельного PCIe/kernel split здесь нет.
+Данные не позволяют назвать весь остаток загрузкой весов или всем CUDA compute.
+
+Медианы показывают, что scalar exact путь действительно имеет существенную
+совокупную цену относительно штатного MMQ, однако и штатный backend не достигает
+скорости референса. По коду остаются serial staging/zero+copy, ожидание всех
+uploads до execute и отсутствие слоевого переиспользования на весь prompt;
+их отдельная доля не измерена. Следующий отдельный порт должен рассматривать
+CPU-compatible tiled MMQ/DP4A/IMMA и матричное/слоевое переиспользование, сохраняя
+проверенный integer-scale/FMA контракт, а не объявлять hostpool исправлением
+основного ограничения. Новых экспериментов для этих выводов не делалось.
+
+Stock telemetry:peakGPU0=19621MiB,peak суммы RSS316.55GiB (с file mappings,
+engine+adapter+helper). Source/env/ELF/runtime fingerprints записаны в speed
+manifest; используется тот же новый frozen candidate ELF, что в candidate128
+и stock full20. Прежний CPU-exact full20 использовал ДРУГОЙ старый frozen ELF;
+не переносить его доказательство на новую exact-mode комбинацию автоматически.
+
+### Контракты и ограничения сравнения
+
+1. Frozen CPU-exact20/d32 — top1=1,KL0,maxabs0 и отдельный bytecmp20/20,
+   5746438272F32. Это прежняя frozen integrated версия.
+2. Stock GgmlGPUoracle20/d32 — top1=1,KL0,maxabs0 против oracle-op-offload1;
+   это отдельная standard-CUDA activation policy. Дополнительный bytecmp stock
+   файлов не запускался. Известный128 CPU-vs-stock diff .78125top1/.77857meanKL
+   остаётся непройденным **для CPU контракта**, он не скрыт сменой oracle.
+3. Более новый exact host32/sort/reads/seed candidate проверен component probes
+   и code128, а CPU-overlap — своим3000/d32 gate. Старый frozenfull20 не выдаём
+   за доказательство полного20 для этих новых комбинаций.
+
+Общими в speed comparison являются исходные GGUF, GPU0/host hardware,
+клиент/корпус и exact OM_OFF low добавка к запросу. **Это не полностью matched
+optimization arm:** все native варианты требуют GGML_CUDA_DISABLE_FUSION=1;
+reference scripts не показывают явного DISABLE_FUSION, тождественность этой
+настройки не установлена. NativeF16KV/8192 также отличается отrefQ8_0KV/65536.
+Нельзя приписывать весь разрыв одному движку при идентичных настройках.
+
+Финальная read-only проверка: своих активных GPU/build units нет, aictl active=null,
+`m31-xolotl`/`m31-xolotl-check` отсутствуют, исходные `m31`/`hxq3k` сохранены.
+GPU0майнер, GPU1Pearl и дежурная8084 работают. Никаких дополнительных моделей,
+сборок, численных/скоростных тестов или больших логитных сравнений после окна
+не запускалось.

@@ -1,114 +1,145 @@
-# MiniMax-M3.1 → Xolotl: передача работы
+# MiniMax-M3.1 → Xolotl: итог port4
 
 Рабочее дерево `/mnt/ai/Xolotl-m31`, ветка `aiserver/m31-port`.
-Base origin/main `961d390fea6d848431822f7c6e94a6e5c0775133`.
-HEAD `cd4cc85c726448a6a90d9cb85475fd95e777aeea` (коммиты предыдущей сессии).
-В текущей сессии commits/push/PR НЕ делались. Изменения сейчас незакоммичены.
+Проверенный source checkpoint `8361b5e8`; далее итоговый docs commit.
+Пуша и PR нет. Полный итог:
+`/mnt/ai/logs/m31-port/REPORT-port4.final.md`, machine summary
+`port4-final-summary.json`, хронология `STATUS.md`.
 
-## Текущее состояние (26.10.2026, финальная контрольная точка)
+## Активных задач нет
 
-M0 завершён. **M1 ПРИНЯТ:20/20 prompts/28723 позиций, все logits ПОБИТНО**
-(top1=1, mean/maxKL=0, maxabs0). Decode-tail32 на3000 тоже побитно.
-Отчёт `docs/m31/M1.md`; настройки nofusion/CPU routed/F16 KV обязательны.
-M2 НАЧАТ: opt-in exact RAM arena собрана и проверена на настоящем GGUF,
-code128 все logits побитно,7296 экспертов/152.51GiB, pack73.160с.
-Отчёт `docs/m31/M2.md`. GPU cache/layer batch/server/скоростей пока НЕТ,
-M2 НЕ завершён. M3/M4 не начаты. Критерий слабого выигрыша M2 пока не применялся.
+Все наши model/build/measure units завершены. Только root Codex service
+может оставаться active до выхода процесса. GPU0 возвращена майнеру,
+GPU1 не резервировалась, дежурная8084 работает. Temporary m31-xolotl и
+m31-xolotl-check сняты. Full aictl config семантически равен стартовому
+backup, protected presets unchanged: `port4-final-config-audit.json`.
+Prod, `/mnt/ai/Xolotl-up*`, hxq3k и reference preset m31 не менялись.
 
-## Активной работы сейчас нет
+## M1 пройден, контракты не смешивать
 
-suite20, M2 CPU/CUDA build и real arena128 завершены rc0. Карты возвращены майнерам
-(Keryx0, SRBMiner/Pearl1), CPU llm-chat active. Temporary preset снят.
-Аудит `/mnt/ai/logs/m31-port/final-config-audit.json`: config.json семантически
-полностью равен состоянию до первого GPU job, ref m31 и prod hxq3k сохранены.
-НЕ нужно выполнять down или rollback повторно.
+1. Исходный CPU M1 принят20/20 и28 723 позиции побитно.
+2. Exact GPU + async прошёл fresh CPU oracle: chunk2048/decode-tail32,
+   F16/ctx4096/t64/nofusion, все20/28 723, top1=100%, KL/maxabs0.
+   `gpu-integrated-suite20-c2048-d32-compare-v1.json`. GNU cmp отдельно
+   подтвердил20 файлов/5 746 438 272 F32 значений побайтово:
+   `gpu-fullgate-bytecmp-v1.json`.
+3. Stock CUDA/MMQ отдельно прошёл20/28 723 против GPU-offload oracle
+   (op_offload=true), KL/maxabs0:
+   `gpu-ggml-gpuoracle-suite20-c2048-d32-compare-v1.json`,
+   scope `GgmlGPUoracle-complete-logits`. Это Q8_1 placement контракт,
+   **не подмена CPU strict oracle**. Stock-vs-CPU code128 известен:
+   top1=.78125, meanKL=.77857.
 
-Все jobs/результаты/логи: `/mnt/ai/logs/m31-port/`.
+GPU divergence исправлен в exact режиме: CPU Q8_K/Q8_0 и FP порядки
+vecdot/tiled, порог≥8 назначений эксперту, включая фактический gcc14 FMA
+и NVFP4 scales. Стандартный ggml GPU сохранён отдельно. Fusion должна
+оставаться выключенной: GGML_CUDA_DISABLE_FUSION=1.
 
-- M1 `suite20-compare-v1.json`, raw `suite20-{oracle,native}-v1`, inputs ids-v1.
-- Decode `decode-compare-v1.json` (prefix2968/128 + tail32/1), все3000 побитно.
-- Arena `arena-compare-v1.json`, raw arena-native-v1, oracle code128-oracle-v1,
-  job-arena-v1*. native --arena-gib170, ctx4096/chunk128/threads64, все128 побитно.
-- Golden M1 binaries: logs/m31-port/m31_generate-m1, m31_oracle-m1.
-- M1 source hashes/patch: suite20-v1-source.{json,patch}. Эти hashes ДО M2 изменений.
-- Последние CPU/CUDA builds: build-cpu-20261026T180120Z.log,
-  build-cuda-20261026T180128Z.log; включают packed/mmap bit gate и budget rejection.
+Поздние host32/worklist/host-read/seed режимы приняты на4×117 expert
+стадиях и real code128 seed0/20, побитно CPU oracle. Им не приписывается
+автоматически full20 старого frozen ELF. Shared overlap принят на
+real3000/d32 и tiny/reset/failure/fallback; Nsight455/456 CPU интервалов
+пересекались с реальными GPU kernels. Это не замер speedup.
 
-Дальше продолжать M2 по docs/m31/M2.md: pinned DMA+GPU expert cache, grouped
-layer-batched prefill, persistent graphs/pool, OpenAI server, затем speed и quality.
-`m31_arena.hpp` — готовые Layer/Slice descriptors и packed source bytes; CPU ggml
-уже читает их через custom nb[2]. Общий Ds4MoeTier пока НЕ подключён: для него
-по-прежнему нужны OAI/scratch/NVFP4 fixes. Продовые движки/скрипты не менялись.
+## M2 не принят: итоговые4K окна
 
-## Проверенные результаты и настройки
+Неизменённый om_bench, exact ref request reasoning_effort=low, warmup
+и два4K,256 generated. Native F16/8192/chunk2048/t64/nofusion; ref лучший
+1GPU q8_0/65536/ubatch2048,3 GPU expert layers. Настройки placement/KV
+и fusion не полностью совпадают; сравнивается с лучшим ref arm.
 
-- CPU baseline M1: gcc/g++14; `build-cpu-20261026T172422Z.log`.
-  Compare tests4/4, invalid loader fixtures; NumPy math chunk1/7/29 maxabs.00011285.
-- CUDA/oracle baseline M1: `codex-m31-port-build-cuda-r7`, rc0,
-  `build-cuda-*.log` (конец17:41:52 UTC). CUDA13.1 sm120a gcc/g++14.
-  CUDA binary повторно прошёл CPU fixtures. Oracle STATIC libs неизменённого
-  PR SHA `6b95a9908d2c7b242817a447708aec38e937e2c0`, source проверен CMake.
-- `short-compare-nofuse-v1.json`:64RU всё побитно.
-- `long-compare-pad256-v2.json`:3000code всё побитно.
-- `decode-compare-v1.json`: prefix2968 chunk128 + tail32 chunk1, все3000 побитно.
-- Текущий M1: dense CUDA0, routed CPU ggml оригинальных IQ3_XXS/IQ4_XS/NVFP4,
-  threads64, ctx4096, chunk128, F16 main/index KV, без requant/skip/route bias.
-  Oracle op_offload=false: CPU placement сам по себе не запрещает GPU offload.
-- ОБЯЗАТЕЛЬНО `GGML_CUDA_DISABLE_FUSION=1` в ОБОИХ процессах (worker ставит).
-  Fusion даёт неверные logits в этой M1-конфигурации и у native, и у oracle.
-  Точная fusion ещё НЕ локализована. Попытка bare gallocr→scheduler НЕ помогла
-  и ОТМЕНЕНА. Нельзя выдавать её за исправление или включать fusion без gate.
+| Режим | TG4K, два прогона | PP4K, два прогона |
+|---|---|---|
+| CPU graphs/ACK |21.34/21.31|124.5/124.6|
+| CPU host buffers/shared overlap |22.38/21.93|181.2/185.4|
+| Exact GPU host32/sort/seed20 |21.57/21.18|46.2/46.2|
+| Stock GPU/MMQ, GPU-oracle |20.92/20.58|96.5/94.2|
+| llama.cpp ref |23.33|425 (32K433)|
 
+Лучший native CPU median22.155/183.3, всё ещё ниже ref на5.04% TG
+и56.87% PP. PP улучшили host buffers, overlap действует только n1.
+Ранние enable_thinking=false окна — диагностические, это не low.
+Полные native16K/32K и GSM8K100 не запускались; M3/DSpark не начинался.
+На текущем4K выигрыша нет, следующая сессия должна сначала устранить
+MoE/control и обмены, а не идти к M3.
 
-## Исправления и важные контракты
+## Что готово
 
-- PR MSA get_n_pos/get_n_kv pad>=256. Native теперь тоже pad256. При pad128
-  FA выбирала другое ядро/tiling; ~1e-4 relative attention усиливалось по60 слоям.
-- Index cache хранится F16, но ПЕРЕД dot переводится в F32, как PR get_rows;
-  иначе запрос дополнительно округлялся к F16 и мог менять top16.
-- CPU FA получает F32 V с исходными F16-значениями (stock CPU FA иначе округляет
-  накопитель на каждом key даже при GGML_PREC_F32). GPU F16 caches сохранены.
-- Head одним chunk, как PR: MMV vs MMQ — другое округление активаций.
-- Oracle capture фильтрует повторные Qcur/Kcur (только post-RoPE), Vcur view,
-  служебные copy names; capture error НЕ прерывает scheduler split (иначе SIGSEGV).
-- `--decode-tail N`: батчевый prefix и последниеN по одному, одинаково в обоих CLI.
-  Manifest записывает decode_tail, threads, cuda_fusion_disabled.
-- MSA на всех60 слоях, включая первые3 dense; top16 blocks128, local force,
-  per-GQA group, causal mask ДО pooling. OAI alpha1.702/limit7/(up+1), route scale2.
-- GGUF нормам Gemma +1 уже добавлен конвертером. NVFP4 down52/58/59, scale128F32.
-- DSpark — dflash, не V4.1 drafter. target_layers GGUF=[4,18,32,46,60],
-  HF IDs=[3,17,31,45,59]; block7/window4096, noise200058,5 dense blocks.
+- Persistent CPU/dense/head graphs, bulk expert IDs, indexed KV writes,
+  CPU residual sum в прежнем F32 порядке. Default пути сохранены.
+- Host-read vectors и persistent quant/OAI executor:385 checks, FPenv,
+  exceptions/recovery/lifetime. Без env дополнительных workers нет.
+- Pinned upload ring2/events, recovery и bounded memory. Worklist
+  sorting36 GPU cases сохраняет original IDs/full histogram/output.
+- Rank7296 на448 train+512 held-out RU/EN/code/math, real runtime seed
+  API/env с sealed preflight. Seed F32 probe:9 batches/4032 values,
+  protection/28 evictions/forward recovery/terminal partial failure.
+  Offline248slots LRU22.085% → hot20+stream22823.166%; это не speed.
+  Full content SHA наследуется из ref; проверяются текущие header/stat.
+- THP opt-in: small16MiB получил16MiB huge pages,8 tiny arena cycles
+  побитны. Большая152.51GiB арена THP не запускалась, FORCE=0,
+  conservative fragmentation guard; sysctl не менялись.
+- OpenAI HTTP/SSE, настоящий PR lazy grammar через vocab helper, NFC,
+  tool/think parser, greedy parity1416, ACK до PEG, nonstream final-only
+  parse.22 CPU/vocab и живые109+38 проверки пройдены.
+- Tools23:20/23, ref19/23, один stochastic прогон,453.89с,0 length/leaks.
+  Tools не исполняются. Quality effort по ref default adaptive, temp1,
+  top_p.95,max6000. GSM96/100 — ref, не наш результат.
+- M4 CPU adapter: PNG515/299, video3863/3588/12 кадров, grid/spans
+  совпали с ref. Single/batch F32 побитны; mixed3863 positions и
+  visual[3588,6144]88 178 688 bytes готовы. Внутри encoder12 отдельных
+  frame batches. Native forward_embeddings/main logits/HTTP vision нет.
 
-## Дальше
+## Сборки и воспроизведение
 
-1. M1 принят, отчёт готов. Продолжать M2 (docs/m31/M2.md). Нужны OAI activation в CPU/CUDA/grouped/MMQ путях,
-   CPU scratch минимум7008/3504/3072 (сейчас5840/2628/2304), NVFP4 external scales
-   и исправление down stride (tail16 не часть GGUF expert stride) в blob source.
-   RAM arena уже есть; дальше pinned DMA/VRAM cache, persistent graphs/pool, layer batch, OpenAI server.
-   Нельзя включать tier с обычным SwiGLU или без масштаба NVFP4.
-2. M2 цель из REPORT: лучший1GPU TG4K/16K/32K23.33/22.63/21.92, PP4K/32K425/433,
-   GSM8K96/100/tools19/23. Референс speed с обычным op_offload и q8_0, не M1 oracle.
-   om_bench.py/GSM8K100/tools23. При слабом/нулевом выигрыше после M2 остановиться.
+`build-m31-cpu` и `build-m31-cuda` обновлены к итоговому source, final
+CPU/CUDA builds rc0. CUDA final22/22 vocab/protocol; CPU-only8 optional
+vocab skips. GPU sm120a/gcc14/CUDA13.1. Другие backend не проверены.
+Oracle `build-m31-oracle`, неизменённый PR6b95a990.
 
-## Запуск/восстановление
+Все benchmark/proof ELF и source hashes сохранены отдельно; не менять
+frozen artifacts. Последние best CPU settings — JSON в
+`port4-cpu-overlap-speed-v1/`, stock — `port4-ggml-gpuoracle-speed-v1/`,
+exact GPU — `port4-gpu-candidate-speed-v1/`. Для повтора нужны НОВЫЕ
+job/output names, старые результаты не перезаписывать.
 
-Долгое: sudo systemd-run --unit=codex-m31-port-НОВОЕ -p User=nekto ...;
-логи `/mnt/ai/logs/m31-port/`. `tools/m31/build.sh cpu|cuda` берёт .build.lock,
-CUDA переиспользует НАШ CPU vendor fetch, up*/PR не меняет. Явный nvcc path.
-Не редактировать работающий bash-скрипт: bash читает его постепенно.
-GPU batch: `card_session.sh /mnt/ai/logs/m31-port/НОВЫЙ-job.json`, JSON commands
-array argv. Controller держит card+build locks, отказывается трогать активную
-чужую модель, ставит ТОЛЬКО temporary `m31-xolotl-check`, запускает сам worker и
-модели из aictl, ждёт up/result, EXIT trap down/rollback. Worker health8179 живёт
-до down. Backup `/etc/aictl/config.json.bak-m31-port-<jobstem>`; точная команда
-отката только своего ключа в session log. Чужие настройки сохраняются.
+Запуск GPU только через `python3 tools/m31/card_launch.py NEW.json
+--unit NAME`: runner0444+SHA, systemd User=nekto, card flock/aictl,
+backup/down/targeted rollback. Никогда не менять живой shell.
+measurement:true(default) держит exclusive build lock на speed;
+явное false — shared для correctness. GPU0 only, ждать up до down.
+Сборки-j24, максимум3; никакой тяжёлой CPU работы в окно скорости.
 
-Правила: только карта0; карта1 майнеру. Карты ТОЛЬКО aictl под
-flock -w86400 /mnt/ai/logs/.xolotl-card.lock. Прод hxq3k,
-/home/nekto/xolotl_up_engine.sh и /mnt/ai/Xolotl-up* не трогать. Ничего не удалять.
-Не коммитить/пушить без просьбы Андрея. Не мерить поверх сборок/конвертаций.
-Старые неудачные dumps/логи сохранены; прошлый текст M31 handoff сохранён
-в `/mnt/ai/logs/m31-port/HANDOFF-before-suite20.md`.
+Exact GPU: CMake STRATA_M31_CPU_QUANTS_CUDA=ON и env CPU_QUANTS1;
+stock mode CPU_QUANTS0. Async M31_GPU_PREFILL_ASYNC1. Другие env
+см. docs/m31: HOST_THREADS32, SORT_ROUTES1, REUSE_HOST_READS1,
+CPU_SHARED_OVERLAP1, seed receipt. GPU arms arena170/cache6/min32;
+decode при min32 остаётся CPU, cached-only hybrid ещё не реализован.
+
+## Следующие действия
+
+1. Разделить MoE/control CPU pack, H2D, kernel, D2H и снять counters
+   до завершения процесса: SIGTERM лишает HTTP лог destructor counters.
+   Не объявлять весь routed residual исключительно PCIe/compute.
+2. Direct DMA/role spans из контролируемой pinned arena, меньше
+   повторного zero/copy и fixed-slot padding. Не force THP150GiB.
+3. Для CPU-strict GPU — batched MMQ/DP4A/IMMA с integer256/FMA
+   контрактом, без повторного scalar decode каждого(row,route).
+4. Persistent GPU hidden/residual/shared для decode и cached-only
+   expert hits без uploads на misses; затем isolated gates/windows.
+5. Только после первичного выигрыша — full16K/32K/GSM100, затем
+   решение по M3 и отдельная native vision интеграция.
+
+Reviews в docs/m31/acceptance-*.md: blocking findings нет. Исправлены
+Python bounded reads (18 checks, sparse150GiB отказ до чтения).
+Косвенные циклы двух host executors не поддерживаются; quant/OAI их
+не используют. Исторические ошибки shell rc127 и routeproof-v1 env
+зафиксированы в report, последующие immutable-runner gates rc0.
+
+Шесть субагентов завершили этапы и followup. Все исходники коммитит
+только координатор. Ничего не пушить, PR не открывать, prod/up*/m31
+не менять и чужие файлы не удалять. Исходное задание:
+`/mnt/ai/logs/codex-m31-port.prompt.md`, ref `m31-ref/REPORT.md`.
 
 ---
 

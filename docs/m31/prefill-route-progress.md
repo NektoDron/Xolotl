@@ -116,3 +116,5 @@ CUDA block scheduler не гарантирует последовательно�
 нужно измерить. Если kernel ограничен integer decode/инструкциями, уменьшение
 weight DRAM traffic может не дать выигрыша. TensorCore kernel в этой задаче
 не реализуется.
+
+Финальная отметка координатора: исторический integration patch уже применён и не предназначен для повторного применения к текущему дереву. Integrated candidate прошёл4×117 expert стадий и code128 seed0/20 побитно CPU oracle. CPU-compatible GPU benchmark дал46.2PP/21.375TG, выигрыша над reference не получено.

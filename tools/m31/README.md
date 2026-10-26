@@ -1,17 +1,40 @@
-# MiniMax-M3.1: M1 принят, M2 в работе
+# MiniMax-M3.1: M1 принят, M2 выигрыш не получен
 
-На 2026-10-26 **M1 принят**:20/20 промптов,28723 позиций, top1=100%, KL0,
-maxabs0, все logits побитно; decode-tail32 на3000 тоже побитно. **M2 в работе.**
-Фактические результаты и следующий шаг: `/mnt/ai/logs/m31-port/STATUS.md`, `HANDOFF.md`.
-Проект M0: [../../docs/m31/M0.md](../../docs/m31/M0.md).
+26.10.2026, port4. Exact GPU + async прошёл20/20/28 723 к CPU strict
+oracle побайтово, KL0. Stock CUDA отдельно прошёл full20 к GPU-offload
+oracle; контракты квантизации активаций не смешивать.
 
-Модуль включается `-DSTRATA_M31=ON` и не меняет пути других моделей.
-Это собственный граф M3.1: GQA с per-head RMS/partial NeoX RoPE, MSA на каждом
-слое, sigmoid router и `swigluoai`. CPU ggml вычисляет исходные routed tensors;
-GPU держит исходные dense/shared weights, F16 main/index KV. BF16/Q6_K автоматически
-не переквантываются. Opt-in RAM-арена подключена и проверена; VRAM-кеш, сервер,
-драфт и vision ещё не подключены.
-Transient graphs и копирование промежуточных активаций оставлены для M1, не для M2.
+Последний best native CPU median: TG22.155, PP183.3; ref23.33/425,
+ref PP32K433. Exact GPU46.2PP/21.375TG, stockGPU95.35PP/20.75TG.
+M2 не принят, M3 не запускался; full16K/32K иGSM100 ещё не измерялись.
+Tools20/23vsref19/23; M4 CPU embeddings PNG/12frames приняты, native
+vision ещё нет. Все результаты в [M2](../../docs/m31/M2.md),
+`HANDOFF.md`, `/mnt/ai/logs/m31-port/REPORT-port4.final.md`.
+
+Последние source CPU/CUDA builds обновлены и прошли checks. Все изменения
+opt-in; production пути не менялись. Reproducible frozen ELF/source/env
+и TSV/JSON находятся в `/mnt/ai/logs/m31-port/`.
+
+GPU jobs только через immutable launcher с НОВЫМИ job/output именами:
+
+```bash
+python3 tools/m31/card_launch.py /mnt/ai/logs/m31-port/NEW.json --unit codex-m31-NEW
+```
+
+Runner0444+SHA, systemd User=nekto, card flock/aictl/backup/down/rollback.
+measurement:true(default) — exclusive build lock для скорости; false —
+shared для correctness. GPU0 only, nofusion. GPU1/prod/up*/hxq3k/m31
+не трогать. Не редактировать живые shell.
+
+Exact GPU: STRATA_M31_CPU_QUANTS_CUDA=ON и M31_GPU_CPU_QUANTS=1.
+Stock GPU: M31_GPU_CPU_QUANTS=0, другой placement oracle. Async uploader
+M31_GPU_PREFILL_ASYNC=1, явные arena/cache budgets. Env HOST_THREADS,
+EXPERT_SORT_ROUTES, REUSE_HOST_READS, CPU_SHARED_OVERLAP и seed receipt
+описаны в direction docs. CPU decode остаётся CPU при min_tokens32;
+shared overlap только CUDA+n1+CPU-routed, без taps и с graph caches.
+Большую THP арену не форсировать;64K memory budget ещё не замерен.
+
+Ниже исходная последовательность M1 для справки.
 
 ## После завершения референса
 

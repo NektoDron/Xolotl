@@ -66,3 +66,5 @@ Nsight/CUDA event trace (`job-cpu-shared-overlap-events-v1.json` подгото�
 В timing label joined_ns дополнительно входит shared readback после drain.
 Этот review и численный gate не являются заявлением ускорения; speed требует
 отдельного изолированного окна.
+
+Финальная отметка координатора: rolling M2/HANDOFF/README синхронизированы после завершения окон. Stock GgmlGPUoracle full20 принят отдельно; shared-overlap real3000/d32 и CUDA/NVTX proof завершены, benchmark ниже ref. Все окончательные числа/границы — REPORT-port4.final.md и port4-final-summary.json, незапущенные GSM100/16K/32K явно перечислены.

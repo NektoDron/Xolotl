@@ -107,3 +107,5 @@ Job wrapper после сравнения явно меняет scope на `Ggml
 и отдельное окно; быстрый mode не получает strict CPU M1 по названию oracle.
 В policy отмечена известная stockGPU-vsCPU разница code128: top1.78125,
 meanKL.77857. Fastmode speed на момент аудита ещё не запускался.
+
+Финальная отметка координатора: rolling M2/HANDOFF/README синхронизированы после завершения окон. Stock GgmlGPUoracle full20 принят отдельно; shared-overlap real3000/d32 и CUDA/NVTX proof завершены, benchmark ниже ref. Все окончательные числа/границы — REPORT-port4.final.md и port4-final-summary.json, незапущенные GSM100/16K/32K явно перечислены.
