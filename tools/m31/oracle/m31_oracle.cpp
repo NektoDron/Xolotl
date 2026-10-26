@@ -108,7 +108,8 @@ int main(int argc, char ** argv) {
         if (argc > 1 && std::string(argv[1]) == "tokenize") return tokenize(argc, argv);
         const auto args = run::parse(argc, argv);
         if (args.arena_gib) throw std::runtime_error("--arena-gib is native-only; oracle retains original GGUF layout");
-        if (args.gpu_experts_gib || args.reuse_allocations || args.persistent_cpu_pool || args.cpu_residual || args.profile)
+        if (args.gpu_experts_gib || args.reuse_allocations || args.persistent_cpu_pool || args.cpu_residual ||
+            args.cpu_decode_cache || args.dense_decode_cache || args.profile)
             throw std::runtime_error("M2 optimization flags are native-only");
         const auto cases = run::cases(args);
         if (args.backend == "cpu") setenv("CUDA_VISIBLE_DEVICES", "", 1);

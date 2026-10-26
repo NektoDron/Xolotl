@@ -23,6 +23,7 @@ struct Config {
     bool persistent_cpu_pool = false;
     bool cpu_residual = false; // same F32 addition order, avoids an extra GPU round trip
     bool cpu_decode_cache = false; // keep per-layer CPU MoE graphs for single-token steps
+    bool dense_decode_cache = false; // stable dense/head graphs, indexed KV writes; requires reuse/cpu_residual
     bool profile = false;
     // Optional calibration observer; IDs/weights are token-major [n,used].
     std::function<void(int layer, int n, const std::vector<int32_t> &,

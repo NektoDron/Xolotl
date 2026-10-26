@@ -26,6 +26,7 @@ struct Args {
     int gpu_experts_min_tokens = 32;
     bool reuse_allocations = false, persistent_cpu_pool = false, cpu_residual = false, profile = false;
     bool cpu_decode_cache = false;
+    bool dense_decode_cache = false;
     bool oracle_op_offload = false; // separate placement diagnostic; accepted M1 remains false
 };
 inline Args parse(int argc, char ** argv) {
@@ -56,12 +57,13 @@ inline Args parse(int argc, char ** argv) {
             if (v != "0" && v != "1") throw std::runtime_error("expected 0|1 for " + k);
             a.oracle_op_offload = v == "1";
         }
-        else if (k == "--reuse-allocations" || k == "--persistent-cpu-pool" || k == "--cpu-residual" || k == "--cpu-decode-cache" || k == "--profile") {
+        else if (k == "--reuse-allocations" || k == "--persistent-cpu-pool" || k == "--cpu-residual" || k == "--cpu-decode-cache" || k == "--dense-decode-cache" || k == "--profile") {
             if (v != "0" && v != "1") throw std::runtime_error("expected 0|1 for " + k);
             if (k == "--reuse-allocations") a.reuse_allocations = v == "1";
             if (k == "--persistent-cpu-pool") a.persistent_cpu_pool = v == "1";
             if (k == "--cpu-residual") a.cpu_residual = v == "1";
             if (k == "--cpu-decode-cache") a.cpu_decode_cache = v == "1";
+            if (k == "--dense-decode-cache") a.dense_decode_cache = v == "1";
             if (k == "--profile") a.profile = v == "1";
         }
         else if (k == "--arena-gib") {
@@ -229,7 +231,12 @@ struct Dump {
           << ",\"persistent_cpu_pool\":" << (args.persistent_cpu_pool ? "true" : "false")
           << ",\"cpu_residual\":" << (args.cpu_residual ? "true" : "false")
           << ",\"cpu_decode_cache\":" << (args.cpu_decode_cache ? "true" : "false")
+          << ",\"dense_decode_cache\":" << (args.dense_decode_cache ? "true" : "false")
           << ",\"cuda_mmq_precision\":" << quote(std::getenv("GGML_CUDA_MMQ_PREC") ? std::getenv("GGML_CUDA_MMQ_PREC") : "auto")
+          << ",\"gpu_cpu_quants_requested\":" <<
+             ((std::getenv("M31_GPU_CPU_QUANTS") && std::string(std::getenv("M31_GPU_CPU_QUANTS")) == "1") ? "true" : "false")
+          << ",\"gpu_prefill_async_requested\":" <<
+             ((std::getenv("M31_GPU_PREFILL_ASYNC") && std::string(std::getenv("M31_GPU_PREFILL_ASYNC")) == "1") ? "true" : "false")
           << ",\"oracle_op_offload\":" << (args.oracle_op_offload ? "true" : "false")
           << ",\"cuda_fusion_disabled\":" <<
              ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")

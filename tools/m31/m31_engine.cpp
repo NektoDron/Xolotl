@@ -266,8 +266,22 @@ struct Engine::Impl {
         ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
     };
     std::vector<std::unique_ptr<RoutedGraph>> cpu_decode_graphs;
+    struct DenseGraph {
+        std::unique_ptr<Graph> graph;
+        ggml_tensor * input = nullptr, * positions = nullptr, * mask = nullptr, * bias = nullptr;
+        ggml_tensor * residual = nullptr, * norm = nullptr, * shared = nullptr;
+        ggml_tensor * ids = nullptr, * weights = nullptr, * output = nullptr;
+        int64_t nk = 0;
+    };
+    struct HeadGraph {
+        std::unique_ptr<Graph> graph;
+        ggml_tensor * input = nullptr, * output = nullptr;
+    };
+    std::vector<std::unique_ptr<DenseGraph>> dense_decode_graphs;
+    HeadGraph head_decode_graph;
     struct Timings {
         double dense = 0, routed_setup = 0, routed_compute = 0, routed_read = 0, residual = 0;
+        double dense_build = 0, dense_allocate = 0, dense_upload = 0, dense_compute = 0, dense_read = 0, dense_destroy = 0;
     } timings;
     using Clock = std::chrono::steady_clock;
     static double elapsed(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
@@ -292,6 +306,8 @@ struct Engine::Impl {
         }
         gpu_experts.reset();
         cpu_decode_graphs.clear();
+        dense_decode_graphs.clear();
+        head_decode_graph.graph.reset();
         dense_workspace.reset();
         cpu_workspace.reset();
         attention_inputs.reset();
@@ -317,7 +333,8 @@ struct Engine::Impl {
     }
 
     ggml_tensor * attention(Graph & b, int l, int64_t start, int n, ggml_tensor * x,
-                             ggml_tensor * positions, ggml_tensor * pos_mask, ggml_tensor * bias) {
+                             ggml_tensor * positions, ggml_tensor * pos_mask, ggml_tensor * bias,
+                             bool indexed_kv_write = false) {
         auto c = b.c;
         const std::string prefix = "blk." + std::to_string(l) + ".";
         auto wt = [&](const char * name) { return dense->get(prefix + name); };
@@ -340,12 +357,25 @@ struct Engine::Impl {
         ik = rope(rms(b, ik, wt("indexer.k_norm.weight"), g.rms_eps));
 
         auto & kv = cache[size_t(l)];
-        auto kdst = ggml_view_3d(c, kv.k, g.head_dim, g.kv_heads, n, kv.k->nb[1], kv.k->nb[2], size_t(start) * kv.k->nb[2]);
-        auto vdst = ggml_view_3d(c, kv.v, g.head_dim, g.kv_heads, n, kv.v->nb[1], kv.v->nb[2], size_t(start) * kv.v->nb[2]);
-        auto idst = ggml_view_2d(c, kv.index, g.index_dim, n, kv.index->nb[1], size_t(start) * kv.index->nb[1]);
-        ggml_build_forward_expand(b.graph, ggml_cpy(c, k, kdst));
-        ggml_build_forward_expand(b.graph, ggml_cpy(c, v, vdst));
-        ggml_build_forward_expand(b.graph, ggml_cpy(c, ggml_reshape_2d(c, ik, g.index_dim, n), idst));
+        if (indexed_kv_write) {
+            // Keep pointers and graph topology stable across decode positions. Only
+            // the positions tensor contents change. F32 -> F16 conversion is the
+            // same storage operation as CPY; cache row order/precision are unchanged.
+            for (const auto & item : {std::make_pair(kv.k, k), std::make_pair(kv.v, v)}) {
+                auto dst = ggml_reshape_2d(c, item.first, g.head_dim * g.kv_heads, capacity);
+                auto src = ggml_reshape_2d(c, item.second, g.head_dim * g.kv_heads, n);
+                ggml_build_forward_expand(b.graph, ggml_set_rows(c, dst, src, positions));
+            }
+            ggml_build_forward_expand(b.graph, ggml_set_rows(c, kv.index,
+                ggml_reshape_2d(c, ik, g.index_dim, n), positions));
+        } else {
+            auto kdst = ggml_view_3d(c, kv.k, g.head_dim, g.kv_heads, n, kv.k->nb[1], kv.k->nb[2], size_t(start) * kv.k->nb[2]);
+            auto vdst = ggml_view_3d(c, kv.v, g.head_dim, g.kv_heads, n, kv.v->nb[1], kv.v->nb[2], size_t(start) * kv.v->nb[2]);
+            auto idst = ggml_view_2d(c, kv.index, g.index_dim, n, kv.index->nb[1], size_t(start) * kv.index->nb[1]);
+            ggml_build_forward_expand(b.graph, ggml_cpy(c, k, kdst));
+            ggml_build_forward_expand(b.graph, ggml_cpy(c, v, vdst));
+            ggml_build_forward_expand(b.graph, ggml_cpy(c, ggml_reshape_2d(c, ik, g.index_dim, n), idst));
+        }
 
         const int64_t nk = kv_length(start + n, g), blocks = nk / g.block;
         const int64_t top = std::min(g.top_blocks, blocks);
@@ -485,56 +515,116 @@ struct Engine::Impl {
         storage.output = result;
     }
 
+    void clear_dense_decode_cache() {
+        // CUDA's captures reference tensor metadata and shared attention inputs.
+        // Destroy them before either ownership group can be replaced/freed.
+        for (auto & graph : dense_decode_graphs) graph.reset();
+        head_decode_graph.graph.reset();
+        head_decode_graph.input = head_decode_graph.output = nullptr;
+    }
+
+    void build_dense(int l, int n, DenseGraph & storage, bool stable_decode) {
+        const auto build_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        auto & b = *storage.graph;
+        auto c = b.c;
+        storage.input = b.input(GGML_TYPE_F32, g.embd, n);
+        storage.nk = kv_length(pos + n, g);
+        const int64_t nb = storage.nk / g.block;
+        storage.positions = attention_inputs ? attention_inputs->positions : b.input(GGML_TYPE_I32, n);
+        storage.mask = attention_inputs ? attention_inputs->mask : b.input(GGML_TYPE_F32, storage.nk, 1, n);
+        storage.bias = attention_inputs ? attention_inputs->bias : b.input(GGML_TYPE_F32, nb, 1, n);
+        cell_blocks_input = nullptr;
+        auto a = attention(b, l, pos, n, storage.input, storage.positions, storage.mask, storage.bias, stable_decode);
+        auto ffn_inp = b.tap(ggml_add(c, a, storage.input), "ffn_inp", l);
+        const std::string prefix = "blk." + std::to_string(l) + ".";
+        auto norm = b.tap(rms(b, ffn_inp, dense->get(prefix + "ffn_norm.weight"), g.rms_eps), "ffn_norm", l);
+        auto allocate = [&](std::initializer_list<ggml_tensor *> outputs) {
+            if (cfg.profile) timings.dense_build += elapsed(build_start);
+            const auto alloc_start = cfg.profile ? Clock::now() : Clock::time_point{};
+            b.allocate(outputs);
+            if (cfg.profile) timings.dense_allocate += elapsed(alloc_start);
+        };
+        if (!g.routed(l)) {
+            auto ff = b.tap(ffn(b, *dense, norm, prefix, ""), "ffn_out", l);
+            storage.output = b.tap(ggml_add(c, ff, ffn_inp), "l_out", l);
+            allocate({storage.output});
+            return;
+        }
+        storage.residual = ffn_inp;
+        storage.norm = norm;
+        storage.shared = b.tap(ffn(b, *dense, norm, prefix, "_shexp"), "ffn_shexp", l);
+        auto probs = ggml_sigmoid(c, ggml_mul_mat(c, dense->get(prefix + "ffn_gate_inp.weight"), norm));
+        storage.ids = b.tap(ggml_top_k(c, ggml_add(c, probs, dense->get(prefix + "exp_probs_b.bias")), int(g.used)), "ffn_moe_topk", l);
+        auto weight = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, g.experts, n), storage.ids);
+        weight = ggml_reshape_2d(c, weight, g.used, n);
+        if (g.norm_routes) {
+            auto sum = ggml_clamp(c, ggml_sum_rows(c, weight), 6.103515625e-5f, INFINITY);
+            weight = ggml_div(c, weight, sum);
+        }
+        if (g.route_scale != 1) weight = ggml_scale(c, weight, g.route_scale);
+        storage.weights = weight;
+        // top_k is a strided view of the full expert argsort. A single device
+        // pack replaces n synchronous tiny readbacks per layer during prefill.
+        // Keep the default correctness graph untouched; the opt-in allocation
+        // path replans its alias topology after this extra integer-only node.
+        if (cfg.reuse_allocations && !ggml_is_contiguous(storage.ids))
+            storage.ids = ggml_cont(c, storage.ids);
+        allocate({storage.residual, storage.norm, storage.shared, storage.ids, storage.weights});
+    }
+
     void layer(int l, int n) {
         const auto dense_start = cfg.profile ? Clock::now() : Clock::time_point{};
         std::vector<float> ffn_input, residual, shared;
         std::vector<int32_t> ids(size_t(g.used * n));
         std::vector<float> route_weights;
-        {
-            Graph b(backend, cfg, pos, dense_workspace.get());
-            auto c = b.c;
-            auto x = b.input(GGML_TYPE_F32, g.embd, n);
-            const int64_t nk = kv_length(pos + n, g), nb = nk / g.block;
-            auto positions = attention_inputs ? attention_inputs->positions : b.input(GGML_TYPE_I32, n);
-            auto mask = attention_inputs ? attention_inputs->mask : b.input(GGML_TYPE_F32, nk, 1, n);
-            auto bias = attention_inputs ? attention_inputs->bias : b.input(GGML_TYPE_F32, nb, 1, n);
-            cell_blocks_input = nullptr;
-            auto a = attention(b, l, pos, n, x, positions, mask, bias);
-            auto ffn_inp = b.tap(ggml_add(c, a, x), "ffn_inp", l);
-            const std::string prefix = "blk." + std::to_string(l) + ".";
-            auto norm = b.tap(rms(b, ffn_inp, dense->get(prefix + "ffn_norm.weight"), g.rms_eps), "ffn_norm", l);
-            if (!g.routed(l)) {
-                auto ff = b.tap(ffn(b, *dense, norm, prefix, ""), "ffn_out", l);
-                auto out = b.tap(ggml_add(c, ff, ffn_inp), "l_out", l);
-                b.allocate({out});
-                upload_attention(b, x, positions, mask, bias, n, nk, nb);
-                b.compute();
-                hidden = Graph::read(out);
-                if (cfg.profile) timings.dense += elapsed(dense_start);
-                return;
-            }
-            auto shexp = b.tap(ffn(b, *dense, norm, prefix, "_shexp"), "ffn_shexp", l);
-            auto probs = ggml_sigmoid(c, ggml_mul_mat(c, dense->get(prefix + "ffn_gate_inp.weight"), norm));
-            auto selected = b.tap(ggml_top_k(c, ggml_add(c, probs, dense->get(prefix + "exp_probs_b.bias")), int(g.used)), "ffn_moe_topk", l);
-            auto weight = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, g.experts, n), selected);
-            weight = ggml_reshape_2d(c, weight, g.used, n);
-            if (g.norm_routes) {
-                auto sum = ggml_clamp(c, ggml_sum_rows(c, weight), 6.103515625e-5f, INFINITY);
-                weight = ggml_div(c, weight, sum);
-            }
-            if (g.route_scale != 1) weight = ggml_scale(c, weight, g.route_scale);
-            b.allocate({ffn_inp, norm, shexp, selected, weight});
-            upload_attention(b, x, positions, mask, bias, n, nk, nb);
-            b.compute();
-            residual = Graph::read(ffn_inp);
-            ffn_input = Graph::read(norm);
-            shared = Graph::read(shexp);
-            // top_k can be a non-contiguous view; read each token column explicitly.
-            for (int t = 0; t < n; ++t)
-                ggml_backend_tensor_get(selected, ids.data() + t * g.used, size_t(t) * selected->nb[1], size_t(g.used) * sizeof(int32_t));
-            route_weights = Graph::read(weight);
+        DenseGraph temporary;
+        DenseGraph * storage = &temporary;
+        const bool stable_decode = cfg.dense_decode_cache && n == 1 && !cfg.tap;
+        if (stable_decode) {
+            if (!dense_decode_graphs[size_t(l)]) dense_decode_graphs[size_t(l)] = std::make_unique<DenseGraph>();
+            storage = dense_decode_graphs[size_t(l)].get();
         }
-        if (cfg.profile) timings.dense += elapsed(dense_start);
+        if (!storage->graph) {
+            const auto create_start = cfg.profile ? Clock::now() : Clock::time_point{};
+            storage->graph = std::make_unique<Graph>(backend, cfg, pos,
+                stable_decode ? nullptr : dense_workspace.get(),
+                stable_decode ? 4 * 1024 * 1024 : 32 * 1024 * 1024,
+                stable_decode ? 2048 : 8192);
+            if (cfg.profile) timings.dense_build += elapsed(create_start);
+            build_dense(l, n, *storage, stable_decode);
+        }
+        require(storage->nk == kv_length(pos + n, g), "stale dense decode bucket");
+        auto & b = *storage->graph;
+        const auto upload_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        upload_attention(b, storage->input, storage->positions, storage->mask, storage->bias,
+                         n, storage->nk, storage->nk / g.block);
+        if (cfg.profile) timings.dense_upload += elapsed(upload_start);
+        const auto compute_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        b.compute();
+        if (cfg.profile) timings.dense_compute += elapsed(compute_start);
+        const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        if (!g.routed(l)) hidden = Graph::read(storage->output);
+        else {
+            residual = Graph::read(storage->residual);
+            ffn_input = Graph::read(storage->norm);
+            shared = Graph::read(storage->shared);
+            if (ggml_is_contiguous(storage->ids)) {
+                ggml_backend_tensor_get(storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+            } else {
+                for (int t = 0; t < n; ++t)
+                    ggml_backend_tensor_get(storage->ids, ids.data() + t * g.used,
+                        size_t(t) * storage->ids->nb[1], size_t(g.used) * sizeof(int32_t));
+            }
+            route_weights = Graph::read(storage->weights);
+        }
+        if (cfg.profile) timings.dense_read += elapsed(read_start);
+        const auto destroy_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        temporary.graph.reset(); // cached graphs/captures retain their buffers and tensor addresses
+        if (cfg.profile) {
+            timings.dense_destroy += elapsed(destroy_start);
+            timings.dense += elapsed(dense_start);
+        }
+        if (!g.routed(l)) return;
         if (cfg.route_observer) cfg.route_observer(l, n, ids, route_weights);
         const auto moe = routed(l, n, ffn_input, ids, route_weights);
         const auto residual_start = cfg.profile ? Clock::now() : Clock::time_point{};
@@ -547,17 +637,17 @@ struct Engine::Impl {
             if (cfg.profile) timings.residual += elapsed(residual_start);
             return;
         }
-        Graph b(backend, cfg, pos, dense_workspace.get());
-        auto r = b.input(GGML_TYPE_F32, g.embd, n);
-        auto s = b.input(GGML_TYPE_F32, g.embd, n);
-        auto m = b.input(GGML_TYPE_F32, g.embd, n);
-        auto ff = b.tap(ggml_add(b.c, m, s), "ffn_out", l);
-        auto out = b.tap(ggml_add(b.c, ff, r), "l_out", l);
-        b.allocate({out});
+        Graph residual_graph(backend, cfg, pos, dense_workspace.get());
+        auto r = residual_graph.input(GGML_TYPE_F32, g.embd, n);
+        auto s = residual_graph.input(GGML_TYPE_F32, g.embd, n);
+        auto m = residual_graph.input(GGML_TYPE_F32, g.embd, n);
+        auto ff = residual_graph.tap(ggml_add(residual_graph.c, m, s), "ffn_out", l);
+        auto out = residual_graph.tap(ggml_add(residual_graph.c, ff, r), "l_out", l);
+        residual_graph.allocate({out});
         ggml_backend_tensor_set(r, residual.data(), 0, ggml_nbytes(r));
         ggml_backend_tensor_set(s, shared.data(), 0, ggml_nbytes(s));
         ggml_backend_tensor_set(m, moe.data(), 0, ggml_nbytes(m));
-        b.compute();
+        residual_graph.compute();
         hidden = Graph::read(out);
         if (cfg.profile) timings.residual += elapsed(residual_start);
     }
@@ -601,10 +691,13 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         require(std::isfinite(cfg.gpu_experts_gib) && cfg.gpu_experts_gib >= 0, "invalid GPU expert budget");
         require(cfg.gpu_experts_min_tokens > 0 && cfg.gpu_experts_min_tokens <= 2048, "invalid GPU expert token threshold");
         require(!cfg.gpu_experts_gib || cfg.arena_gib > 0, "GPU expert cache requires the complete RAM arena");
+        require(!cfg.dense_decode_cache || (cfg.reuse_allocations && cfg.cpu_residual),
+                "dense decode cache requires reuse-allocations and cpu-residual");
         p_->cfg = cfg;
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
         p_->cpu_decode_graphs.resize(size_t(p_->g.layers));
+        p_->dense_decode_graphs.resize(size_t(p_->g.layers));
         require(cfg.context <= p_->g.context && cfg.context <= INT32_MAX, "context exceeds model maximum");
         p_->capacity = kv_length(cfg.context, p_->g);
         p_->cpu = ggml_backend_cpu_init();
@@ -656,7 +749,10 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
 
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
-void Engine::reset() { p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false; }
+void Engine::reset() {
+    p_->clear_dense_decode_cache();
+    p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false;
+}
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
     try {
@@ -678,8 +774,10 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         p_->poisoned = true;
         if (p_->cfg.reuse_allocations) {
             const auto nk = kv_length(p_->pos + n, g);
-            if (!p_->attention_inputs || p_->attention_inputs->n != n || p_->attention_inputs->nk != nk)
+            if (!p_->attention_inputs || p_->attention_inputs->n != n || p_->attention_inputs->nk != nk) {
+                p_->clear_dense_decode_cache(); // references the old shared positions/mask/bias
                 p_->attention_inputs = std::make_unique<AttentionInputs>(p_->backend, g, n, nk);
+            }
             auto & inputs = *p_->attention_inputs;
             p_->fill_attention(inputs.positions, inputs.mask, inputs.bias, inputs.blocks, n, nk, nk / g.block);
         }
@@ -695,6 +793,9 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             std::fprintf(stderr, "M31 stages pos=%lld n=%d prepare_ms=%.3f dense_ms=%.3f routed_setup_ms=%.3f routed_compute_ms=%.3f routed_read_ms=%.3f residual_ms=%.3f decode_cache=%d\n",
                          (long long)p_->pos, n, 1000*prepare_seconds, 1000*t.dense, 1000*t.routed_setup, 1000*t.routed_compute,
                          1000*t.routed_read, 1000*t.residual, int(p_->cfg.cpu_decode_cache));
+            std::fprintf(stderr, "M31 dense-stages pos=%lld n=%d build_ms=%.3f allocate_ms=%.3f upload_ms=%.3f compute_ms=%.3f read_ms=%.3f destroy_ms=%.3f dense_cache=%d\n",
+                         (long long)p_->pos, n, 1000*t.dense_build, 1000*t.dense_allocate, 1000*t.dense_upload,
+                         1000*t.dense_compute, 1000*t.dense_read, 1000*t.dense_destroy, int(p_->cfg.dense_decode_cache));
         }
         p_->pos += n;
         p_->last_n = n;
@@ -707,18 +808,28 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
     try {
         const auto head_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned && row >= 0 && count > 0 && row + count <= p_->last_n, "invalid logits rows/state");
-        Graph b(p_->backend, p_->cfg, p_->pos - p_->last_n + row, p_->dense_workspace.get());
-        auto x = b.input(GGML_TYPE_F32, p_->g.embd, count);
-        auto norm = b.tap(rms(b, x, p_->dense->get("output_norm.weight"), p_->g.rms_eps), "result_norm");
-        auto output = b.tap(ggml_mul_mat(b.c, p_->dense->get("output.weight"), norm), "result_output");
-        b.allocate({output});
-        ggml_backend_tensor_set(x, p_->hidden.data() + size_t(row) * p_->g.embd, 0, ggml_nbytes(x));
+        Impl::HeadGraph temporary;
+        const bool stable_decode = p_->cfg.dense_decode_cache && count == 1 && p_->last_n == 1 && !p_->cfg.tap;
+        auto & storage = stable_decode ? p_->head_decode_graph : temporary;
+        if (!storage.graph) {
+            storage.graph = std::make_unique<Graph>(p_->backend, p_->cfg, p_->pos - p_->last_n + row,
+                stable_decode ? nullptr : p_->dense_workspace.get(),
+                stable_decode ? 1024 * 1024 : 32 * 1024 * 1024,
+                stable_decode ? 512 : 8192);
+            auto & b = *storage.graph;
+            storage.input = b.input(GGML_TYPE_F32, p_->g.embd, count);
+            auto norm = b.tap(rms(b, storage.input, p_->dense->get("output_norm.weight"), p_->g.rms_eps), "result_norm");
+            storage.output = b.tap(ggml_mul_mat(b.c, p_->dense->get("output.weight"), norm), "result_output");
+            b.allocate({storage.output});
+        }
+        auto & b = *storage.graph;
+        ggml_backend_tensor_set(storage.input, p_->hidden.data() + size_t(row) * p_->g.embd, 0, ggml_nbytes(storage.input));
         const double setup_seconds = p_->cfg.profile ? Impl::elapsed(head_started) : 0;
         const auto compute_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         b.compute();
         const double compute_seconds = p_->cfg.profile ? Impl::elapsed(compute_started) : 0;
         const auto read_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
-        out = Graph::read(output);
+        out = Graph::read(storage.output);
         if (p_->cfg.profile) std::fprintf(stderr,
             "M31 head pos=%lld n=%d setup_ms=%.3f compute_ms=%.3f read_ms=%.3f\n",
             (long long)(p_->pos-p_->last_n+row), count, 1000*setup_seconds, 1000*compute_seconds, 1000*Impl::elapsed(read_started));

@@ -35,6 +35,7 @@ int main(int argc, char ** argv) {
             cfg.persistent_cpu_pool = args.persistent_cpu_pool;
             cfg.cpu_residual = args.cpu_residual;
             cfg.cpu_decode_cache = args.cpu_decode_cache;
+            cfg.dense_decode_cache = args.dense_decode_cache;
             cfg.profile = args.profile;
             run::Dump * active_dump = nullptr;
             if (args.taps != "none") cfg.tap = [&](const auto & name, int64_t pos, const auto * tensor) {
