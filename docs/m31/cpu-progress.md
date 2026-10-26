@@ -199,3 +199,5 @@ launch/roundtrip цена способна съесть4–5мс экономи�
 one-token resident-expert microbench с нулевым upload_bytes, затем exact
 per-rank gate и лишь после этого integration/speed окно. Код этого режима не
 реализовывался; engine source оставлен frozen для общей сборки.
+
+Примечание координатора: окна speed выше использовали enable_thinking=false. Референс speed задавал reasoning_effort=low; это не эквивалентные template параметры. Между нашими окнами сравнение диагностическое, строгое matched сравнение с23.33 требует нового прогона после исправления bench plan. См. BENCH.md и STATUS.md.
