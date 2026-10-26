@@ -9,7 +9,10 @@ import sys
 
 config = Path('/etc/aictl/config.json')
 backup = Path(sys.argv[2])
-name = 'm31-xolotl-check'
+name = (json.loads(Path(sys.argv[3]).read_text()).get('preset', 'm31-xolotl-check')
+        if sys.argv[1] == 'put' else (sys.argv[3] if len(sys.argv) > 3 else 'm31-xolotl-check'))
+if name not in ('m31-xolotl-check', 'm31-xolotl'):
+    raise ValueError('preset must be one of the two owned temporary M31 keys')
 unit = 'codex-m31-port-card-worker'
 with open('/run/aictl.lock', 'a') as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -22,7 +25,7 @@ with open('/run/aictl.lock', 'a') as lock:
         shutil.copy2(config, backup)
         job = str(Path(sys.argv[3]).resolve())
         current['models'][name] = {
-            'desc': 'временный M31 correctness batch, только GPU0', 'gpu': '0', 'port': 8179,
+            'desc': 'временный M31 experimental batch/server, только GPU0', 'gpu': '0', 'port': 8179,
             'start': ['systemd-run', '--collect', '--unit=' + unit, '-p', 'User=nekto',
                       '-p', 'LimitCORE=0',
                       '-p', 'StandardOutput=append:/mnt/ai/logs/m31-port/card-worker.log',
@@ -45,4 +48,4 @@ with open('/run/aictl.lock', 'a') as lock:
     os.chmod(temporary, config.stat().st_mode & 0o777)
     os.replace(temporary, config)
 print('Бэкап:', backup)
-print('Откат: sudo python3 /mnt/ai/Xolotl-m31/tools/m31/card_preset.py rollback ' + str(backup))
+print('Откат: sudo python3 /mnt/ai/Xolotl-m31/tools/m31/card_preset.py rollback ' + str(backup) + ' ' + name)

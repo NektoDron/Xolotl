@@ -22,6 +22,11 @@ struct Args {
     std::string model, ids, cases, out, backend = "cpu", rows = "all", taps = "none";
     int chunk = 128, context = 4096, threads = 32, decode_tail = 0;
     double arena_gib = 0;
+    double gpu_experts_gib = 0;
+    int gpu_experts_min_tokens = 32;
+    bool reuse_allocations = false, persistent_cpu_pool = false, cpu_residual = false, profile = false;
+    bool cpu_decode_cache = false;
+    bool oracle_op_offload = false; // separate placement diagnostic; accepted M1 remains false
 };
 inline Args parse(int argc, char ** argv) {
     Args a;
@@ -46,11 +51,30 @@ inline Args parse(int argc, char ** argv) {
         else if (k == "--ctx") a.context = integer();
         else if (k == "--threads") a.threads = integer();
         else if (k == "--decode-tail") a.decode_tail = integer();
+        else if (k == "--gpu-experts-min-tokens") a.gpu_experts_min_tokens = integer();
+        else if (k == "--oracle-op-offload") {
+            if (v != "0" && v != "1") throw std::runtime_error("expected 0|1 for " + k);
+            a.oracle_op_offload = v == "1";
+        }
+        else if (k == "--reuse-allocations" || k == "--persistent-cpu-pool" || k == "--cpu-residual" || k == "--cpu-decode-cache" || k == "--profile") {
+            if (v != "0" && v != "1") throw std::runtime_error("expected 0|1 for " + k);
+            if (k == "--reuse-allocations") a.reuse_allocations = v == "1";
+            if (k == "--persistent-cpu-pool") a.persistent_cpu_pool = v == "1";
+            if (k == "--cpu-residual") a.cpu_residual = v == "1";
+            if (k == "--cpu-decode-cache") a.cpu_decode_cache = v == "1";
+            if (k == "--profile") a.profile = v == "1";
+        }
         else if (k == "--arena-gib") {
             size_t end = 0;
             a.arena_gib = std::stod(v, &end);
             if (end != v.size() || !std::isfinite(a.arena_gib) || a.arena_gib <= 0 || a.arena_gib > 512)
                 throw std::runtime_error("invalid arena budget");
+        }
+        else if (k == "--gpu-experts-gib") {
+            size_t end = 0;
+            a.gpu_experts_gib = std::stod(v, &end);
+            if (end != v.size() || !std::isfinite(a.gpu_experts_gib) || a.gpu_experts_gib <= 0 || a.gpu_experts_gib > 32)
+                throw std::runtime_error("invalid GPU expert budget");
         }
         else throw std::runtime_error("unknown option " + k);
     }
@@ -199,6 +223,14 @@ struct Dump {
           << ",\"chunk\":" << args.chunk << ",\"context\":" << args.context
           << ",\"decode_tail\":" << args.decode_tail << ",\"threads\":" << args.threads
           << ",\"arena_gib\":" << args.arena_gib
+          << ",\"gpu_experts_gib\":" << args.gpu_experts_gib
+          << ",\"gpu_experts_min_tokens\":" << args.gpu_experts_min_tokens
+          << ",\"reuse_allocations\":" << (args.reuse_allocations ? "true" : "false")
+          << ",\"persistent_cpu_pool\":" << (args.persistent_cpu_pool ? "true" : "false")
+          << ",\"cpu_residual\":" << (args.cpu_residual ? "true" : "false")
+          << ",\"cpu_decode_cache\":" << (args.cpu_decode_cache ? "true" : "false")
+          << ",\"cuda_mmq_precision\":" << quote(std::getenv("GGML_CUDA_MMQ_PREC") ? std::getenv("GGML_CUDA_MMQ_PREC") : "auto")
+          << ",\"oracle_op_offload\":" << (args.oracle_op_offload ? "true" : "false")
           << ",\"cuda_fusion_disabled\":" <<
              ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")
           << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"positions\":[";

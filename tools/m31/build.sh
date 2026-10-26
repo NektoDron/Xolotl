@@ -48,11 +48,12 @@ if ! grep -q '^STRATA_M31:BOOL=ON$' "$M31_BUILD/CMakeCache.txt"; then
     cmake -S "$M31_ROOT" -B "$M31_BUILD" "${M31_FLAGS[@]}"
 fi
 check_ref
-cmake --build "$M31_BUILD" --target m31_inspect m31_generate -j "${M31_JOBS:-16}"
+cmake --build "$M31_BUILD" --target m31_inspect m31_generate m31_serve m31_expert_check -j "${M31_JOBS:-16}"
 check_ref
 export OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2 CUDA_VISIBLE_DEVICES=
 python3 "$M31_ROOT/tools/m31/tests/test_compare.py"
 python3 "$M31_ROOT/tools/m31/tests/test_math.py" --engine "$M31_BUILD/m31_generate" --inspect "$M31_BUILD/m31_inspect"
+python3 "$M31_ROOT/tools/m31/test_server.py"
 if [ "$M31_MODE" = cuda ]; then
     check_ref
     cmake -S "$M31_ROOT/tools/m31/oracle" -B "$M31_ROOT/build-m31-oracle" \

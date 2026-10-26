@@ -4,6 +4,14 @@ set -euo pipefail
 M31_ROOT=/mnt/ai/Xolotl-m31
 M31_JOB=$(realpath "$1")
 M31_STEM=$(basename "$M31_JOB" .json)
+M31_PRESET=$(python3 - "$M31_JOB" <<'PY'
+import json, sys
+name = json.load(open(sys.argv[1])).get('preset', 'm31-xolotl-check')
+if name not in ('m31-xolotl-check', 'm31-xolotl'):
+    raise ValueError('unexpected temporary preset')
+print(name)
+PY
+)
 exec >>"/mnt/ai/logs/m31-port/${M31_STEM}.session.log" 2>&1
 exec 9>/mnt/ai/logs/.xolotl-card.lock
 flock -w 86400 9
@@ -18,7 +26,7 @@ cleanup() {
     # up's wait has completed before reaching EXIT, including a received TERM/INT.
     if [ "$M31_UP_STARTED" = 1 ]; then sudo aictl down; fi
     if [ "$M31_INSTALLED" = 1 ]; then
-        sudo python3 "$M31_ROOT/tools/m31/card_preset.py" rollback "$M31_BACKUP"
+        sudo python3 "$M31_ROOT/tools/m31/card_preset.py" rollback "$M31_BACKUP" "$M31_PRESET"
     fi
 }
 trap cleanup EXIT
@@ -32,7 +40,7 @@ PY
 sudo python3 "$M31_ROOT/tools/m31/card_preset.py" put "$M31_BACKUP" "$M31_JOB"
 M31_INSTALLED=1
 M31_UP_STARTED=1
-sudo aictl up m31-xolotl-check &
+sudo aictl up "$M31_PRESET" &
 M31_UP_PID=$!
 M31_UP_RC=0
 # Interrupted wait is retried until the actual up process has returned.

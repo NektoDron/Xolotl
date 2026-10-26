@@ -108,6 +108,8 @@ int main(int argc, char ** argv) {
         if (argc > 1 && std::string(argv[1]) == "tokenize") return tokenize(argc, argv);
         const auto args = run::parse(argc, argv);
         if (args.arena_gib) throw std::runtime_error("--arena-gib is native-only; oracle retains original GGUF layout");
+        if (args.gpu_experts_gib || args.reuse_allocations || args.persistent_cpu_pool || args.cpu_residual || args.profile)
+            throw std::runtime_error("M2 optimization flags are native-only");
         const auto cases = run::cases(args);
         if (args.backend == "cpu") setenv("CUDA_VISIBLE_DEVICES", "", 1);
         if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
@@ -140,7 +142,7 @@ int main(int argc, char ** argv) {
         // Keep that backend identical in the oracle; otherwise CPU-placed expert
         // tensors may still be copied to CUDA for mul_mat_id by op_offload.
         // M2 benchmarks use the reference server's normal op_offload=true.
-        cp.op_offload = false;
+        cp.op_offload = args.oracle_op_offload;
         cp.kv_unified = false;
         cp.no_perf = true;
         if (args.taps != "none") { cp.cb_eval = callback; cp.cb_eval_user_data = &capture; }

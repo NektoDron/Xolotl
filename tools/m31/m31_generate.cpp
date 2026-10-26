@@ -10,6 +10,7 @@ int main(int argc, char ** argv) {
     try {
         using namespace strata::m31;
         const auto args = run::parse(argc, argv);
+        if (args.oracle_op_offload) throw std::runtime_error("--oracle-op-offload is oracle-only");
         const auto cases = run::cases(args);
         if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
         if (args.backend == "cuda") {
@@ -28,6 +29,13 @@ int main(int argc, char ** argv) {
             cfg.context = args.context;
             cfg.max_chunk = args.chunk;
             cfg.arena_gib = args.arena_gib;
+            cfg.gpu_experts_gib = args.gpu_experts_gib;
+            cfg.gpu_experts_min_tokens = args.gpu_experts_min_tokens;
+            cfg.reuse_allocations = args.reuse_allocations;
+            cfg.persistent_cpu_pool = args.persistent_cpu_pool;
+            cfg.cpu_residual = args.cpu_residual;
+            cfg.cpu_decode_cache = args.cpu_decode_cache;
+            cfg.profile = args.profile;
             run::Dump * active_dump = nullptr;
             if (args.taps != "none") cfg.tap = [&](const auto & name, int64_t pos, const auto * tensor) {
                 if (active_dump) active_dump->tensor(name, pos, tensor);

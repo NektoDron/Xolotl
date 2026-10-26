@@ -17,6 +17,13 @@ struct Config {
     int64_t context = 4096;
     int max_chunk = 128;
     double arena_gib = 0; // opt-in exact per-expert RAM repack; 0 retains GGUF mappings
+    double gpu_experts_gib = 0; // opt-in original-type individual expert LRU, requires arena/CUDA
+    int gpu_experts_min_tokens = 32; // PR's default op-offload threshold; CPU decode remains exact
+    bool reuse_allocations = false; // retain scratch buffers/metadata across sequential graphs
+    bool persistent_cpu_pool = false;
+    bool cpu_residual = false; // same F32 addition order, avoids an extra GPU round trip
+    bool cpu_decode_cache = false; // keep per-layer CPU MoE graphs for single-token steps
+    bool profile = false;
     // Called after compute, before the graph is freed. Tensor data may live on the GPU:
     // read with ggml_backend_tensor_get(). Names follow minimax-m3.cpp's cb names.
     std::function<void(const std::string &, int64_t pos0, const ggml_tensor *)> tap;

@@ -1,0 +1,48 @@
+// Opt-in M2 expert execution. Original GGUF quants, one cache shared by all layers.
+#pragma once
+#include "m31_arena.hpp"
+
+#include <cstdint>
+#include <memory>
+#include <vector>
+
+namespace strata::m31 {
+
+// Borrows the backend and arena, which must outlive this object. Serialized use only.
+// The VRAM budget covers one fixed expert-slot pool; graph scratch/dense/KV are separate.
+// A cache miss copies one complete expert slot through a small pinned staging buffer.
+class GpuExperts {
+public:
+    struct Stats {
+        uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
+        uint64_t graph_batches = 0, forwards = 0;
+        size_t resident_bytes = 0, peak_resident_bytes = 0, budget_bytes = 0;
+        size_t scratch_bytes = 0, minimum_budget_bytes = 0;
+        size_t slot_stride = 0, slot_count = 0, pool_bytes = 0, occupied_slots = 0;
+        bool pinned_staging = false;
+        bool q8_activations = false;
+    };
+    GpuExperts();
+    ~GpuExperts();
+    GpuExperts(const GpuExperts &) = delete;
+    GpuExperts & operator=(const GpuExperts &) = delete;
+
+    // Throws on invalid budget/geometry/backend. Allocates a fixed bounded pool once;
+    // no weights are uploaded until forward(). A batch must fit all its distinct experts.
+    void init(const GgufModel & model, const Geometry & geometry, const ExpertArena & arena,
+              ggml_backend_t backend, double cache_gib, int max_chunk, bool q8_activations = false);
+
+    // x: [embd,n]; ids and weights: [used,n], all in contiguous GGML order.
+    // Runs one layer-batched mul_mat_id graph with the original [used,n] shape and
+    // slot-remapped IDs. Contributions are summed on GPU in the original top-k order.
+    // Uses OAI SwiGLU(alpha=1.702,limit=7) and each role's external NVFP4 scale.
+    std::vector<float> forward(int layer, int n, const std::vector<float> & x,
+                               const std::vector<int32_t> & ids,
+                               const std::vector<float> & weights);
+    const Stats & stats() const;
+    void reset_stats(); // Keeps warm cache entries; counters restart at current residency.
+private:
+    struct Impl;
+    std::unique_ptr<Impl> p_;
+};
+} // namespace strata::m31

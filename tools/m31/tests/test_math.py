@@ -68,6 +68,15 @@ def main():
         values = np.fromfile(packed / "tiny/logits.f32", dtype="<f4").reshape(len(ids), 64)
         np.testing.assert_array_equal(values, got[1])
         print("packed arena: logits bit-identical to mapped weights", flush=True)
+        for chunk in (1, 7, 29):
+            optimized = root / f"reuse{chunk}"
+            subprocess.run([str(a.engine), "-m", str(model), "--ids-file", str(tokens), "--out", str(optimized),
+                            "--backend", "cpu", "--ctx", "32", "--chunk", str(chunk), "--threads", "2",
+                            "--reuse-allocations", "1", "--persistent-cpu-pool", "1", "--cpu-residual", "1"],
+                           check=True, env=env)
+            values = np.fromfile(optimized / "tiny/logits.f32", dtype="<f4").reshape(len(ids), 64)
+            np.testing.assert_array_equal(values, got[(1, 7, 29).index(chunk)])
+        print("workspace/pool/shared-mask/CPU-residual: logits bit-identical in all three chunks", flush=True)
         insufficient = subprocess.run([str(a.engine), "-m", str(model), "--ids-file", str(tokens),
             "--out", str(root / "insufficient"), "--backend", "cpu", "--ctx", "32", "--arena-gib", ".000001"],
             env=env, capture_output=True, text=True)

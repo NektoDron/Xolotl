@@ -3,6 +3,7 @@
 // Append-only, one sequence, F16 caches. This deliberately starts with stock ggml ops.
 #include "m31_engine.hpp"
 #include "m31_arena.hpp"
+#include "m31_gpu_experts.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -12,6 +13,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -104,6 +106,52 @@ struct Weights {
     }
 };
 
+struct Workspace {
+    ggml_context * context = nullptr;
+    ggml_gallocr_t allocator = nullptr;
+    explicit Workspace(ggml_backend_t backend) {
+        context = ggml_init({32 * 1024 * 1024, nullptr, true});
+        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        if (!context || !allocator) {
+            if (allocator) ggml_gallocr_free(allocator);
+            if (context) ggml_free(context);
+            throw std::runtime_error("M31: workspace allocation failed");
+        }
+    }
+    ~Workspace() {
+        if (allocator) ggml_gallocr_free(allocator);
+        if (context) ggml_free(context);
+    }
+};
+
+// Shared, immutable during a chunk: all layers have the same causal positions.
+// Keep these outside transient graph scratch so the large mask is uploaded once.
+struct AttentionInputs {
+    ggml_context * context = nullptr;
+    ggml_backend_buffer_t buffer = nullptr;
+    ggml_tensor * positions = nullptr, * mask = nullptr, * bias = nullptr, * blocks = nullptr;
+    int n = 0;
+    int64_t nk = 0;
+    ~AttentionInputs() {
+        if (buffer) ggml_backend_buffer_free(buffer);
+        if (context) ggml_free(context);
+    }
+    AttentionInputs(ggml_backend_t backend, const Geometry & g, int count, int64_t keys) : n(count), nk(keys) {
+        context = ggml_init({64 * 1024, nullptr, true});
+        require(context != nullptr, "shared attention input metadata allocation failed");
+        positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, n);
+        mask = ggml_new_tensor_3d(context, GGML_TYPE_F32, nk, 1, n);
+        bias = ggml_new_tensor_3d(context, GGML_TYPE_F32, nk / g.block, 1, n);
+        blocks = ggml_new_tensor_1d(context, GGML_TYPE_I32, nk);
+        for (auto t : {positions, mask, bias, blocks}) ggml_set_input(t);
+        buffer = ggml_backend_alloc_ctx_tensors_from_buft(context, ggml_backend_get_default_buffer_type(backend));
+        if (!buffer) {
+            ggml_free(context);
+            throw std::runtime_error("M31: shared attention input allocation failed");
+        }
+    }
+};
+
 struct Graph {
     ggml_context * c = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -112,11 +160,19 @@ struct Graph {
     const Config & config;
     int64_t pos0 = 0;
     std::vector<std::pair<std::string, ggml_tensor *>> taps;
-    Graph(ggml_backend_t b, const Config & cfg, int64_t pos) : backend(b), config(cfg), pos0(pos) {
-        c = ggml_init({32 * 1024 * 1024, nullptr, true});
+    bool borrowed = false;
+    Graph(ggml_backend_t b, const Config & cfg, int64_t pos, Workspace * workspace = nullptr)
+        : backend(b), config(cfg), pos0(pos), borrowed(workspace != nullptr) {
+        if (workspace) {
+            c = workspace->context;
+            ggml_reset(c);
+            allocator = workspace->allocator;
+        } else {
+            c = ggml_init({32 * 1024 * 1024, nullptr, true});
+            allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+        }
         require(c != nullptr, "graph metadata allocation failed");
         graph = ggml_new_graph_custom(c, 8192, false);
-        allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         require(allocator != nullptr, "graph allocator failed");
     }
     ~Graph() {
@@ -125,8 +181,10 @@ struct Graph {
         // reused by the next transient context: discard captures BEFORE freeing their buffers.
         ggml_backend_cuda_graph_cache_clear(backend);
 #endif
-        if (allocator) ggml_gallocr_free(allocator);
-        if (c) ggml_free(c);
+        if (!borrowed) {
+            if (allocator) ggml_gallocr_free(allocator);
+            if (c) ggml_free(c);
+        }
     }
     ggml_tensor * input(ggml_type type, int64_t n0, int64_t n1 = 1, int64_t n2 = 1) {
         auto t = ggml_new_tensor_3d(c, type, n0, n1, n2);
@@ -145,6 +203,9 @@ struct Graph {
     }
     void allocate(std::initializer_list<ggml_tensor *> outputs) {
         for (auto t : outputs) { ggml_set_output(t); ggml_build_forward_expand(graph, t); }
+        // A reused allocator can see equal node counts with different aliasing topology.
+        // Replan each transient graph while retaining already large scratch buffers.
+        if (borrowed) require(ggml_gallocr_reserve(allocator, graph), "compute reservation failed");
         require(ggml_gallocr_alloc_graph(allocator, graph), "compute allocation failed");
     }
     void compute() {
@@ -196,7 +257,11 @@ struct Engine::Impl {
     std::unique_ptr<GgufModel> model;
     ggml_backend_t backend = nullptr, cpu = nullptr;
     bool own_backend = false;
+    ggml_threadpool_t cpu_pool = nullptr;
+    std::unique_ptr<Workspace> dense_workspace, cpu_workspace;
+    std::unique_ptr<AttentionInputs> attention_inputs;
     Weights host, device;
+    std::unique_ptr<GpuExperts> gpu_experts;
     const Weights * dense = nullptr;
     ggml_context * state = nullptr;
     ggml_backend_buffer_t state_buffer = nullptr;
@@ -208,11 +273,26 @@ struct Engine::Impl {
     std::vector<float> hidden;
 
     ~Impl() {
+        if (gpu_experts && cfg.profile) {
+            const auto & s = gpu_experts->stats();
+            std::fprintf(stderr, "M31 expert cache: hits=%llu misses=%llu evictions=%llu upload_bytes=%llu resident=%zu peak=%zu scratch=%zu pinned=%d\n",
+                         (unsigned long long)s.hits, (unsigned long long)s.misses, (unsigned long long)s.evictions,
+                         (unsigned long long)s.upload_bytes, s.resident_bytes, s.peak_resident_bytes, s.scratch_bytes, s.pinned_staging);
+        }
+        gpu_experts.reset();
+        dense_workspace.reset();
+        cpu_workspace.reset();
+        attention_inputs.reset();
         close_weights();
         if (state_buffer) ggml_backend_buffer_free(state_buffer);
         if (state) ggml_free(state);
+        if (cpu_pool) {
+            if (backend && ggml_backend_is_cpu(backend)) ggml_backend_cpu_set_threadpool(backend, nullptr);
+            if (cpu) ggml_backend_cpu_set_threadpool(cpu, nullptr);
+        }
         if (own_backend && backend) ggml_backend_free(backend);
         if (cpu) ggml_backend_free(cpu);
+        if (cpu_pool) ggml_threadpool_free(cpu_pool);
     }
     void close_weights() {
         for (Weights * w : {&device, &host}) {
@@ -301,7 +381,7 @@ struct Engine::Impl {
             bm = ggml_cont(c, ggml_permute(c, bm, 0, 2, 1, 3)); // [blocks,n,heads]
             b.tap(bm, "msa_block_mask", l);
             auto rows = ggml_cont(c, ggml_transpose(c, ggml_reshape_2d(c, bm, blocks, n * g.index_heads)));
-            auto cell_block = b.input(GGML_TYPE_I32, nk);
+            auto cell_block = attention_inputs ? attention_inputs->blocks : b.input(GGML_TYPE_I32, nk);
             // This extra input is uploaded by the caller after graph allocation.
             ggml_set_name(cell_block, "m31.cell_block");
             cell_blocks_input = cell_block;
@@ -325,7 +405,8 @@ struct Engine::Impl {
 
     std::vector<float> routed(int l, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids, const std::vector<float> & weights) {
-        Graph b(cpu, cfg, pos);
+        if (gpu_experts && n >= cfg.gpu_experts_min_tokens) return gpu_experts->forward(l, n, x, ids, weights);
+        Graph b(cpu, cfg, pos, cpu_workspace.get());
         auto c = b.c;
         auto inp = b.input(GGML_TYPE_F32, g.embd, 1, n);
         auto id = b.input(GGML_TYPE_I32, g.used, n);
@@ -366,13 +447,13 @@ struct Engine::Impl {
         std::vector<int32_t> ids(size_t(g.used * n));
         std::vector<float> route_weights;
         {
-            Graph b(backend, cfg, pos);
+            Graph b(backend, cfg, pos, dense_workspace.get());
             auto c = b.c;
             auto x = b.input(GGML_TYPE_F32, g.embd, n);
-            auto positions = b.input(GGML_TYPE_I32, n);
             const int64_t nk = kv_length(pos + n, g), nb = nk / g.block;
-            auto mask = b.input(GGML_TYPE_F32, nk, 1, n);
-            auto bias = b.input(GGML_TYPE_F32, nb, 1, n);
+            auto positions = attention_inputs ? attention_inputs->positions : b.input(GGML_TYPE_I32, n);
+            auto mask = attention_inputs ? attention_inputs->mask : b.input(GGML_TYPE_F32, nk, 1, n);
+            auto bias = attention_inputs ? attention_inputs->bias : b.input(GGML_TYPE_F32, nb, 1, n);
             cell_blocks_input = nullptr;
             auto a = attention(b, l, pos, n, x, positions, mask, bias);
             auto ffn_inp = b.tap(ggml_add(c, a, x), "ffn_inp", l);
@@ -409,7 +490,15 @@ struct Engine::Impl {
             route_weights = Graph::read(weight);
         }
         const auto moe = routed(l, n, ffn_input, ids, route_weights);
-        Graph b(backend, cfg, pos);
+        if (cfg.cpu_residual && !cfg.tap) {
+            hidden.resize(moe.size());
+            for (size_t i = 0; i < moe.size(); ++i) {
+                const float ff = moe[i] + shared[i];
+                hidden[i] = ff + residual[i];
+            }
+            return;
+        }
+        Graph b(backend, cfg, pos, dense_workspace.get());
         auto r = b.input(GGML_TYPE_F32, g.embd, n);
         auto s = b.input(GGML_TYPE_F32, g.embd, n);
         auto m = b.input(GGML_TYPE_F32, g.embd, n);
@@ -426,6 +515,12 @@ struct Engine::Impl {
     void upload_attention(Graph &, ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask,
                           ggml_tensor * bias, int n, int64_t nk, int64_t nb) {
         ggml_backend_tensor_set(x, hidden.data(), 0, ggml_nbytes(x));
+        if (attention_inputs) return; // uploaded once before the first layer
+        fill_attention(positions, mask, bias, cell_blocks_input, n, nk, nb);
+    }
+
+    void fill_attention(ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * bias,
+                        ggml_tensor * cell_blocks, int n, int64_t nk, int64_t nb) {
         std::vector<int32_t> positions_h(size_t(n), 0);
         std::vector<float> mask_h(size_t(nk * n), -INFINITY), bias_h(size_t(nb * n), 0);
         for (int t = 0; t < n; ++t) {
@@ -437,10 +532,10 @@ struct Engine::Impl {
         ggml_backend_tensor_set(positions, positions_h.data(), 0, ggml_nbytes(positions));
         ggml_backend_tensor_set(mask, mask_h.data(), 0, ggml_nbytes(mask));
         ggml_backend_tensor_set(bias, bias_h.data(), 0, ggml_nbytes(bias));
-        if (cell_blocks_input) {
+        if (cell_blocks) {
             std::vector<int32_t> blocks(size_t(nk), 0);
             for (int64_t i = 0; i < nk; ++i) blocks[size_t(i)] = int32_t(i / g.block);
-            ggml_backend_tensor_set(cell_blocks_input, blocks.data(), 0, ggml_nbytes(cell_blocks_input));
+            ggml_backend_tensor_set(cell_blocks, blocks.data(), 0, ggml_nbytes(cell_blocks));
         }
     }
 };
@@ -453,6 +548,9 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         require(!p_->model, "init may only be called once");
         require(cfg.threads > 0 && cfg.context > 0 && cfg.max_chunk > 0, "invalid configuration");
         require(std::isfinite(cfg.arena_gib) && cfg.arena_gib >= 0, "invalid arena budget");
+        require(std::isfinite(cfg.gpu_experts_gib) && cfg.gpu_experts_gib >= 0, "invalid GPU expert budget");
+        require(cfg.gpu_experts_min_tokens > 0 && cfg.gpu_experts_min_tokens <= 2048, "invalid GPU expert token threshold");
+        require(!cfg.gpu_experts_gib || cfg.arena_gib > 0, "GPU expert cache requires the complete RAM arena");
         p_->cfg = cfg;
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
@@ -468,6 +566,17 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         }
         require(p_->backend != nullptr, "cannot create dense backend");
         if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_n_threads(p_->backend, cfg.threads);
+        if (cfg.persistent_cpu_pool) {
+            auto params = ggml_threadpool_params_default(cfg.threads);
+            p_->cpu_pool = ggml_threadpool_new(&params);
+            require(p_->cpu_pool != nullptr, "cannot create persistent CPU pool");
+            ggml_backend_cpu_set_threadpool(p_->cpu, p_->cpu_pool);
+            if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_threadpool(p_->backend, p_->cpu_pool);
+        }
+        if (cfg.reuse_allocations) {
+            p_->dense_workspace = std::make_unique<Workspace>(p_->backend);
+            p_->cpu_workspace = std::make_unique<Workspace>(p_->cpu);
+        }
         p_->host.load(*p_->model, p_->cpu, false, &p_->g, cfg.arena_gib);
         if (ggml_backend_is_cpu(p_->backend)) p_->dense = &p_->host;
         else { p_->device.load(*p_->model, p_->backend, true); p_->dense = &p_->device; }
@@ -484,6 +593,11 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->state_buffer = ggml_backend_alloc_ctx_tensors_from_buft(p_->state, ggml_backend_get_default_buffer_type(p_->backend));
         require(p_->state_buffer != nullptr, "cannot allocate KV/index caches");
         ggml_backend_buffer_clear(p_->state_buffer, 0); // padded rows must contain finite values
+        if (cfg.gpu_experts_gib > 0) {
+            require(p_->host.arena != nullptr, "GPU expert cache requires an arena");
+            p_->gpu_experts = std::make_unique<GpuExperts>();
+            p_->gpu_experts->init(*p_->model, p_->g, *p_->host.arena, p_->backend, cfg.gpu_experts_gib, cfg.max_chunk);
+        }
         p_->ready = true;
         return true;
     } catch (const std::exception & e) { error = e.what(); return false; }
@@ -510,7 +624,20 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             else traits->to_float(row, dst, g.embd);
         }
         p_->poisoned = true;
+        if (p_->cfg.reuse_allocations) {
+            const auto nk = kv_length(p_->pos + n, g);
+            if (!p_->attention_inputs || p_->attention_inputs->n != n || p_->attention_inputs->nk != nk)
+                p_->attention_inputs = std::make_unique<AttentionInputs>(p_->backend, g, n, nk);
+            auto & inputs = *p_->attention_inputs;
+            p_->fill_attention(inputs.positions, inputs.mask, inputs.bias, inputs.blocks, n, nk, nk / g.block);
+        }
+        const auto started = std::chrono::steady_clock::now();
         for (int l = 0; l < g.layers; ++l) p_->layer(l, n);
+        if (p_->cfg.profile) {
+            const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+            std::fprintf(stderr, "M31 forward pos=%lld n=%d seconds=%.6f tps=%.3f\n",
+                         (long long)p_->pos, n, seconds, n / seconds);
+        }
         p_->pos += n;
         p_->last_n = n;
         p_->poisoned = false;
@@ -521,7 +648,7 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
 bool Engine::logits(int row, int count, std::vector<float> & out, std::string & error) {
     try {
         require(p_->ready && !p_->poisoned && row >= 0 && count > 0 && row + count <= p_->last_n, "invalid logits rows/state");
-        Graph b(p_->backend, p_->cfg, p_->pos - p_->last_n + row);
+        Graph b(p_->backend, p_->cfg, p_->pos - p_->last_n + row, p_->dense_workspace.get());
         auto x = b.input(GGML_TYPE_F32, p_->g.embd, count);
         auto norm = b.tap(rms(b, x, p_->dense->get("output_norm.weight"), p_->g.rms_eps), "result_norm");
         auto output = b.tap(ggml_mul_mat(b.c, p_->dense->get("output.weight"), norm), "result_output");
