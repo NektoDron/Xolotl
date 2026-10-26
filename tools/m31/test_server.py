@@ -105,6 +105,76 @@ class ProtocolTests(unittest.TestCase):
         events.close()
         self.assertEqual(engine.writes[-2:], [{"accepted": True}, {"continue": False}])
 
+    def test_ack_precedes_stream_parse(self):
+        engine = FakeEngine([{"event": "token", "token": 10}, done()])
+        class CheckingTokenizer(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "parse" and req.get("partial"):
+                    self_case.assertEqual(engine.writes[-1], {"continue": True})
+                return super().call(req)
+        self_case = self
+        app = server.Application(engine, CheckingTokenizer({10: b"ok"}))
+        self.assertEqual(list(app.events({"tokens": [1]}, []))[-1]["message"]["content"], "ok")
+
+    def test_parse_error_after_ack_drains_next_token(self):
+        engine = FakeEngine([{"event": "token", "token": 10}, {"event": "token", "token": 11}, done()])
+        class BrokenParser(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "parse": raise RuntimeError("PEG failed")
+                return super().call(req)
+        app = server.Application(engine, BrokenParser({10: b"ok", 11: b"next"}))
+        with self.assertRaisesRegex(RuntimeError, "PEG failed"):
+            list(app.events({"tokens": [1]}, []))
+        self.assertEqual(engine.writes[1:], [{"continue": True}, {"continue": False}])
+        with self.assertRaises(StopIteration): engine.read()
+
+    def test_nonstream_only_parses_final_and_keeps_stop(self):
+        engine = FakeEngine([{"event": "token", "token": 10}, {"event": "token", "token": 11}, done()])
+        parses = []
+        class CountingParser(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "parse": parses.append(req)
+                return super().call(req)
+        app = server.Application(engine, CountingParser({10: b"abcST", 11: b"OPtail"}))
+        events = list(app.events({"tokens": [1]}, ["STOP"], stream_parse=False))
+        self.assertEqual(events[-1]["message"]["content"], "abc")
+        self.assertEqual(parses, [{"op": "parse", "content": "abc", "partial": False}])
+        self.assertEqual(engine.writes[1:], [{"continue": True}, {"continue": False}])
+
+    def test_nonstream_parse_error_after_done_needs_no_drain(self):
+        engine = FakeEngine([{"event": "token", "token": 10}, done()])
+        class BrokenParser(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "parse": raise RuntimeError("PEG failed")
+                return super().call(req)
+        app = server.Application(engine, BrokenParser({10: b"ok"}))
+        with self.assertRaisesRegex(RuntimeError, "PEG failed"):
+            list(app.events({"tokens": [1]}, [], stream_parse=False))
+        self.assertEqual(engine.writes[1:], [{"continue": True}])
+        with self.assertRaises(StopIteration): engine.read()
+
+    def test_reasoning_effort_maps_like_reference_server(self):
+        class ChatTokenizer(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "chat":
+                    self.chat_request = req
+                    return {"tokens": [1]}
+                return super().call(req)
+        tokenizer = ChatTokenizer({})
+        app = server.Application(FakeEngine([]), tokenizer)
+        base = {"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 1}
+        original_kwargs = {"reasoning_effort": "high"}
+        for effort in ("low", "medium", "high"):
+            app.prepare({**base, "reasoning_effort": effort, "chat_template_kwargs": original_kwargs})
+            self.assertEqual(tokenizer.chat_request["chat_template_kwargs"]["reasoning_effort"], effort)
+        self.assertEqual(original_kwargs, {"reasoning_effort": "high"})
+        app.prepare({**base, "reasoning_effort": "", "chat_template_kwargs": original_kwargs})
+        self.assertEqual(tokenizer.chat_request["chat_template_kwargs"]["reasoning_effort"], "high")
+        app.prepare({**base, "reasoning_effort": "none", "chat_template_kwargs": {"reasoning_effort": "high"}})
+        self.assertFalse(tokenizer.chat_request["enable_thinking"])
+        self.assertNotIn("reasoning_effort", tokenizer.chat_request["chat_template_kwargs"])
+        with self.assertRaises(ValueError): app.prepare({**base, "reasoning_effort": 7})
+
     def test_sampling_rejects_invalid_numbers_and_context_overflow(self):
         for body in ({"top_p": float("nan")}, {"temperature": -1}, {"min_p": 1.1}, {"top_k": True}, {"max_tokens": 129}):
             with self.assertRaises(ValueError):
@@ -213,6 +283,44 @@ class RealTokenizerTests(unittest.TestCase):
         self.assertTrue(result["allowed"])
         self.assertNotIn(bad, result["allowed"])
         self.grammar_tokens('probe">')
+
+    def test_stream_nonstream_exact_final_parser_message(self):
+        tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {
+            "value": {"type": "integer"}}, "required": ["value"]}}}]
+        ns = "]<]minimax[>["
+        cases = [("<mm:think>Проверяю</mm:think>Ответ café 🐈STOPхвост", ["STOP"], True),
+                 (ns + '<tool_call>' + ns + '<invoke name="probe">' + ns + '<value>7' + ns + '</value>' + ns + '</invoke>' + ns + '</tool_call>', [], False)]
+        for text, stops, thinking in cases:
+            messages = []
+            for streaming in (True, False):
+                self.chat(tools, thinking=thinking)
+                ids = self.helper.call({"op": "tokenize", "content": text, "parse_special": True})["tokens"]
+                engine = FakeEngine([*({"event": "token", "token": token} for token in ids), done()])
+                app = server.Application(engine, self.helper)
+                result = list(app.events({"tokens": [1]}, stops, stream_parse=streaming))[-1]
+                message = result["message"]
+                for call in message.get("tool_calls", []): call.pop("id", None)
+                messages.append((message, result["finish_reason"], result["timings"]))
+            self.assertEqual(messages[0], messages[1])
+
+    def test_nonstream_truncated_token_prefixes_match_stream_final(self):
+        tools = [{"type": "function", "function": {"name": "probe", "parameters": {"type": "object", "properties": {
+            "value": {"type": "integer"}}, "required": ["value"]}}}]
+        ns = "]<]minimax[>["
+        text = ('<mm:think>Проверяю</mm:think>Ответ ' + ns + '<tool_call>' + ns + '<invoke name="probe">' +
+                ns + '<value>7' + ns + '</value>' + ns + '</invoke>' + ns + '</tool_call>')
+        ids = self.helper.call({"op": "tokenize", "content": text, "parse_special": True})["tokens"]
+        for end in range(1, len(ids) + 1):
+            messages = []
+            for streaming in (True, False):
+                self.chat(tools)
+                engine = FakeEngine([*({"event": "token", "token": token} for token in ids[:end]), done()])
+                app = server.Application(engine, self.helper)
+                result = list(app.events({"tokens": [1]}, [], stream_parse=streaming))[-1]
+                message = result["message"]
+                for call in message.get("tool_calls", []): call.pop("id", None)
+                messages.append((message, result["finish_reason"]))
+            self.assertEqual(messages[0], messages[1], (end, ids[:end]))
 
     def test_nested_xml_tool_and_continuation_template(self):
         tools = [{"type": "function", "function": {"name": "probe", "description": "test",

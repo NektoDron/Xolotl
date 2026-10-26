@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -129,8 +130,9 @@ def clipped_text(text, stops):
 
 
 class Application:
-    def __init__(self, engine, tokenizer, model="m31-xolotl"):
+    def __init__(self, engine, tokenizer, model="m31-xolotl", profile=False):
         self.engine, self.tokenizer, self.model = engine, tokenizer, model
+        self.profile = profile
         self.lock = threading.Lock()
         self.context = int(engine.ready["context"])
         if int(engine.ready["vocab"]) != int(tokenizer.ready["vocab"]):
@@ -152,9 +154,20 @@ class Application:
             kwargs = body.get("chat_template_kwargs", {})
             if not isinstance(kwargs, dict):
                 raise ValueError("chat_template_kwargs must be an object")
+            kwargs = dict(kwargs)
+            enable_thinking = kwargs.get("enable_thinking", True)
+            if "reasoning_effort" in body:
+                effort = body["reasoning_effort"]
+                if not isinstance(effort, str):
+                    raise ValueError("reasoning_effort must be a string")
+                if effort == "none":
+                    enable_thinking = False
+                    kwargs.pop("reasoning_effort", None)
+                elif effort:
+                    kwargs["reasoning_effort"] = effort
             rendered = self.tokenizer.call({"op": "chat", "messages": messages, "tools": tools,
                                            "tool_choice": choice, "parallel_tool_calls": body.get("parallel_tool_calls", True),
-                                           "enable_thinking": kwargs.get("enable_thinking", True), "chat_template_kwargs": kwargs})
+                                           "enable_thinking": enable_thinking, "chat_template_kwargs": kwargs})
             ids = rendered["tokens"]
             extra_stops = rendered.get("additional_stops", [])
             grammar_active = rendered.get("grammar_active", False)
@@ -179,7 +192,7 @@ class Application:
             self.pieces[token] = bytes(self.tokenizer.call({"op": "piece", "token": token})["bytes"])
         return self.pieces[token]
 
-    def events(self, params, stops, chat=True):
+    def events(self, params, stops, chat=True, stream_parse=True):
         """Caller holds self.lock. Consume fully, or close generator to cancel/drain."""
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         text = ""
@@ -202,6 +215,12 @@ class Application:
                     waiting_ack = True
                     text += decoder.decode(self.piece(event["token"]))
                     safe_text, stop = clipped_text(text, stops)
+                    # Stop decisions precede ACK. The native next forward can overlap
+                    # PEG work; cancellation still drains at most one token boundary.
+                    self.engine.write({"continue": not stop})
+                    waiting_ack = False
+                    if not stream_parse:
+                        continue
                     # The audited PEG mapper holds incomplete tags and emits reasoning separately.
                     if chat:
                         message = self.tokenizer.call({"op": "parse", "content": safe_text, "partial": True})["message"]
@@ -215,11 +234,11 @@ class Application:
                         if current != old:
                             delta[key] = current[len(old):]
                     previous = message
-                    self.engine.write({"continue": not stop})
-                    waiting_ack = False
                     if delta:
                         yield {"event": "delta", "delta": delta}
                 elif event["event"] == "done":
+                    if self.profile:
+                        print("M31 request timings " + json.dumps(event.get("timings", {}), separators=(",", ":")), file=sys.stderr, flush=True)
                     completed = True
                     text += decoder.decode(b"", final=True)
                     safe_text, stopped = clipped_text(text, stops)
@@ -356,7 +375,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit("[DONE]")
                 else:
                     done = None
-                    with contextlib.closing(self.app.events(params, stops, chat)) as events:
+                    with contextlib.closing(self.app.events(params, stops, chat, stream_parse=False)) as events:
                         for event in events:
                             if event["event"] == "done":
                                 done = event
@@ -402,7 +421,7 @@ def main():
     parser.add_argument("--arena-gib", type=float, default=0)
     parser.add_argument("--gpu-experts-gib", type=float, default=0)
     parser.add_argument("--gpu-experts-min-tokens", type=int, default=32)
-    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "profile"):
+    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         parser.add_argument("--" + flag, action="store_true")
     args = parser.parse_args()
     if args.backend == "cuda" and os.environ.get("M31_CARD_SESSION") != "1":
@@ -410,14 +429,14 @@ def main():
     argv = [args.engine, "--model", args.model, "--backend", args.backend, "--ctx", str(args.ctx),
             "--chunk", str(args.chunk), "--threads", str(args.threads), "--arena-gib", str(args.arena_gib),
             "--gpu-experts-gib", str(args.gpu_experts_gib), "--gpu-experts-min-tokens", str(args.gpu_experts_min_tokens)]
-    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "profile"):
+    for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
     tokenizer = RPC([args.tokenizer, args.model])
     engine = None
     server = None
     try:
         engine = RPC(argv)
-        app = Application(engine, tokenizer, args.alias)
+        app = Application(engine, tokenizer, args.alias, profile=args.profile)
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.daemon_threads = True
         server.app = app

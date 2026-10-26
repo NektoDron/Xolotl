@@ -50,11 +50,11 @@ def plan(args):
         "required_server": {
             "endpoints": ["/tokenize", "/detokenize", "/v1/chat/completions"],
             "timings": ["prompt_n", "prompt_ms", "prompt_per_second", "predicted_n", "predicted_per_second"],
-            "options": ["ignore_eos", "cache_prompt=false", "chat_template_kwargs.enable_thinking=false", "tools"],
+            "options": ["ignore_eos", "cache_prompt=false", "reasoning_effort=low", "tools"],
         },
         "commands": [
             {"name": "smoke", "env": {}, "argv": [sys.executable, str(speed), "smoke", args.arm, str(args.port), str(out / "smoke.json")]},
-            {"name": "speed", "env": {"OM_OFF": '{"chat_template_kwargs":{"enable_thinking":false}}'},
+            {"name": "speed", "env": {"OM_OFF": '{"reasoning_effort":"low"}'},
              "argv": [sys.executable, str(speed), "speed", args.arm, str(args.port), str(out / "speed.tsv"),
                       "warmup,4K,16K,32K,4K,16K,32K"]},
             {"name": "quality", "env": {"EVAL_TEMP": "1.0", "EVAL_TOPP": "0.95", "EVAL_MAX": "6000",

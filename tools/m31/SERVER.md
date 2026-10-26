@@ -108,3 +108,49 @@ and cancellation during a proposal. A real inference request using this new
 handshake still needs an HTTP gate; tools23/GSM8K100 are not yet measured.
 `--cpu-decode-cache` is forwarded to the opt-in engine flag; its correctness and
 speed are checked separately by the CPU agent.
+
+Live native tool gate, port4: `server-tools-http-v1/http-tool-smoke.json`,
+**38/38** checks, systemd/card session rc0. Auto replies391 without a call;
+nonstream/SSE and the request after a thinking-block disconnect return
+get_weather(city=Казань,unit=celsius). Native sampling reports11grammar checks
+for the plain response and49per tool response. These examples required no
+rejections; full tools23 quality is still pending. This gate used the separate
+build-cpu-decode/m31_serve with both CPU/dense decode caches enabled.
+
+Native timings now expose `sampling_ms`/`sampling_calls`, `grammar_wait_ms` and
+`interactive_wait_ms`/`interactive_waits`. They cover the complete request,
+including the first sample and final token ACK; existing prompt/predicted timing
+boundaries stay unchanged. With adapter `--profile`, one `M31 request timings`
+JSON record is written to stderr after native completion, so om_bench's compact
+TSV can be paired with the full breakdown. The Application profile flag defaults
+false, including in protocol tests.
+Greedy temperature0 uses a single finite-checked scan without a vocabulary-sized
+pair vector. Its tie, exclusion, grammar-support and error semantics match the
+previous max_element path;1416 checks include128real code128logit rows.
+
+The adapter now parses nonstream responses only at completion. Streaming keeps
+per-token stop decisions and sends the native ACK before PEG parsing, overlapping
+parse work with the next forward pass. A PEG error drains/cancels at the next
+boundary; no pending native record remains for the following request. Protocol
+and real vocab comparisons pass21/21 checks, including final stream/nonstream
+message equivalence, stops, parse failures and disconnect cleanup. Live HTTP
+verification of this optimization follows the in-progress tools23 run.
+
+Top-level `reasoning_effort` matches the audited PR server: a nonempty string
+wins over the corresponding template kwarg, and `none` disables thinking.
+Reference speed uses `reasoning_effort:low`; reference tools quality leaves it
+unspecified. These are different settings from `enable_thinking:false`.
+
+Port4 original tools23 fixtures completed **20/23** (reference19/23), with no
+length truncations or marker leaks. Full raw choices and sampling metadata are
+in `/mnt/ai/logs/m31-port/server-tools23-v3/`. This is one stochastic run, not a
+claim of a significant quality improvement. The evaluation never executed a tool.
+It used the loaded server from before the ACK/nonstream optimization; that new
+Python path has22/22 CPU/vocab checks, including every truncated token prefix of
+a reasoning+XML-tool response, and is undergoing a separate live HTTP gate.
+
+The new ACK/nonstream adapter also passed its live native HTTP gate:
+`server-ack-http-v1/http-smoke.json` **109/109** and
+`server-ack-http-v1/http-tool-smoke.json` **38/38**, unitrc0 and full card cleanup.
+A strict4K speed comparison with reference reasoning_effort=low is separate from
+these correctness checks and remains the coordinator's next measurement.

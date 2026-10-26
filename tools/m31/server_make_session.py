@@ -19,10 +19,11 @@ def main():
     p.add_argument('--chunk', type=int, default=128)
     p.add_argument('--threads', type=int, default=64)
     p.add_argument('--port', type=int, default=8180)
-    p.add_argument('--mode', choices=['smoke', 'speed4k', 'full'], default='smoke')
+    p.add_argument('--mode', choices=['smoke', 'toolsmoke', 'tools23', 'speed4k', 'full'], default='smoke')
     p.add_argument('--engine', default=str(ROOT / 'build-m31-cuda/m31_serve'))
     p.add_argument('--tokenizer', default=str(ROOT / 'build-server-eval/m31_tokenizer'))
     p.add_argument('--cpu-decode-cache', action='store_true')
+    p.add_argument('--dense-decode-cache', action='store_true')
     p.add_argument('--arena-gib', type=float, default=0)
     p.add_argument('--gpu-experts-gib', type=float, default=0)
     a = p.parse_args()
@@ -41,8 +42,18 @@ def main():
               '--reuse-allocations', '--persistent-cpu-pool', '--cpu-residual']
     if a.cpu_decode_cache:
         server.append('--cpu-decode-cache')
+    if a.dense_decode_cache:
+        server.append('--dense-decode-cache')
     clients = [{'argv': [sys.executable, str(ROOT / 'tools/m31/server_smoke.py'),
                          '--port', str(a.port), '--out', str(a.directory / 'http-smoke.json')]}]
+    if a.mode in ('toolsmoke', 'tools23'):
+        clients = [{'argv': [sys.executable, str(ROOT / 'tools/m31/server_tool_smoke.py'),
+                             '--port', str(a.port), '--out', str(a.directory / 'http-tool-smoke.json')], 'timeout': 3600}]
+    if a.mode == 'tools23':
+        clients.append({'argv': [sys.executable, str(ROOT / 'tools/m31/server_tools23.py'),
+                                '--port', str(a.port), '--name', a.arm, '--directory', str(a.directory)],
+                        'env': {'EVAL_TEMP': '1.0', 'EVAL_TOPP': '0.95', 'EVAL_MAX': '6000'},
+                        'unset_env': ['EVAL_TOPK', 'EVAL_MINP', 'OM_OFF'], 'timeout': 14400})
     if a.mode in ('speed4k', 'full'):
         speed = plan['commands'][1]
         if a.mode == 'speed4k':
@@ -53,15 +64,15 @@ def main():
     session_path = a.directory / (a.arm + '-http-session.json')
     job_path = a.directory / (a.arm + '-card-job.json')
     session = {'server': server, 'health': f'http://127.0.0.1:{a.port}/health', 'clients': clients}
-    job = {'preset': 'm31-xolotl', 'commands': [[sys.executable, str(ROOT / 'tools/m31/server_session_job.py'), str(session_path)]]}
+    job = {'preset': 'm31-xolotl', 'measurement': a.mode in ('speed4k', 'full'), 'commands': [[sys.executable, str(ROOT / 'tools/m31/server_session_job.py'), str(session_path)]]}
     backup = Path('/etc/aictl') / ('config.json.bak-m31-port-' + job_path.stem)
     manifest = {'plan': plan, 'aictl_preset': 'm31-xolotl',
-                'launch_argv': ['sudo', 'systemd-run', '--unit=' + a.arm, '-p', 'User=nekto',
-                                '/bin/bash', str(ROOT / 'tools/m31/card_session.sh'), str(job_path)],
+                'launch_argv': [sys.executable, str(ROOT / 'tools/m31/card_launch.py'), str(job_path), '--unit', a.arm],
                 'rollback_argv': ['sudo', 'python3', str(ROOT / 'tools/m31/card_preset.py'), 'rollback', str(backup), 'm31-xolotl'],
                 'limits': ['Preparation only; no GPU or config changes.',
-                           'Coordinator must authorize the exclusive measurement window before launch.',
-                           'card_session takes card lock and exclusive .build.lock, installs temporary preset with its own fresh backup, then down+targeted rollback.',
+                           'Coordinator must authorize order of quality/card jobs and the exclusive measurement window for speed.',
+                           'card_launch freezes card_session to a per-job read-only snapshot with SHA256; card and build locks precede preset backup/start/cleanup.',
+                           'Speed/full use exclusive .build.lock; smoke/toolsmoke/tools23 explicitly set measurement=false for shared .build.lock.',
                            'Current KV is F16; full 32K suite requires a separate successful VRAM/context gate.']}
     for name, data in [(session_path, session), (job_path, job), (a.directory / 'manifest.json', manifest)]:
         with name.open('x') as f:

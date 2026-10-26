@@ -18,7 +18,7 @@ card/build locks, systemd-run User=nekto с логом в `/mnt/ai/logs/m31-port
 Прямой запуск helper не разрешает занимать карту; aictl управляет моделью.
 
 Сначала smoke 3 запроса, затем warmup и два круга 4K/16K/32K, затем качество.
-Speed выключает thinking, temperature=0, max_tokens=256, ignore_eos=true,
+Speed передаёт `reasoning_effort:"low"`, temperature=0, max_tokens=256, ignore_eos=true,
 cache_prompt=false. Tokenizer самого сервера режет тот же корпус; случайный
 префикс исключает reuse. prompt_n включает chat template и инструкцию,
 поэтому он больше номинальных 4096/16384/32768. Серверу нужны `/tokenize`,
@@ -72,3 +72,32 @@ python3 tools/m31/server_make_session.py \
 нынешний KV F16 отличается от Q8_0 референса. `--mode smoke` не запускает скорость.
 `--engine` и `--tokenizer` позволяют выбрать проверенную отдельную сборку.
 Полный quality gate пока не выполнен; CPU vocab-тесты grammar не заменяют tools23.
+
+Для самостоятельного tools23 без GSM8K:
+
+```bash
+python3 tools/m31/server_make_session.py \
+  --directory /mnt/ai/logs/m31-port/my-new-tools-run --arm my-new-tools-run \
+  --ctx 8192 --mode tools23 --engine /mnt/ai/Xolotl-m31/build-cpu-decode/m31_serve \
+  --cpu-decode-cache --dense-decode-cache
+```
+
+Режим сначала делает короткий живой HTTP tool smoke, затем вызывает
+`server_tools23.py`. Обвязка AST загружает исходные определения из
+`~/eval_duty_1023.py` до его final `with`, не запускает GSM8K и не меняет исходник.
+Запускаются исходные `tools()` с теми же20+3 запросами и проверками.
+Сохраняются source SHA256, исходные choice/usage/messages и summary отдельно от
+JSONL результатов; файлы открываются с `x`. Temperature1/top_p.95/max6000,
+thinking по умолчанию; реальные инструментальные действия не исполняются.
+`--mode toolsmoke` запускает только HTTP gate (auto plain, вызов, SSE и cancel).
+`--dense-decode-cache` сохраняет opt-in семантику нового CPU пути.
+
+
+Strict speed-reference body использует `OM_OFF={"reasoning_effort":"low"}`:
+это точное значение из `/home/nekto/m31_ref_arm.py`. Оно сохраняет adaptive thinking,
+а не равно `chat_template_kwargs.enable_thinking=false`. Adapter переносит
+верхнеуровневый reasoning_effort в kwargs с приоритетом над одноимённым kwargs;
+`none` выключает thinking, как в PR. Предыдущие CPU speed окна с enable_thinking=false
+остаются диагностическими: сравнение наших оптимизаций между собой допустимо,
+но строгое matching с reference body требует нового прогона.
+Tools23 исходный eval_duty_1023.py не передаёт effort, этот default сохранён.
