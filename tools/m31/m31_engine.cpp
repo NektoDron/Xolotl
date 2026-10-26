@@ -20,6 +20,9 @@
 #include <map>
 #include <stdexcept>
 #include <utility>
+#ifdef M31_SHARED_OVERLAP_NVTX
+#include "nvtx3/nvToolsExt.h"
+#endif
 
 namespace strata::m31 {
 namespace {
@@ -285,9 +288,16 @@ struct Engine::Impl {
     };
     std::vector<std::unique_ptr<DenseGraph>> dense_decode_graphs;
     HeadGraph head_decode_graph;
+    std::vector<std::unique_ptr<HeadGraph>> shared_decode_graphs;
+    bool cpu_shared_overlap = false, shared_inflight = false, shared_trace = false;
+#ifdef M31_SHARED_OVERLAP_TESTING
+    bool shared_failure_fired = false;
+#endif
     struct Timings {
         double dense = 0, routed_setup = 0, routed_compute = 0, routed_read = 0, residual = 0;
         double dense_build = 0, dense_allocate = 0, dense_upload = 0, dense_compute = 0, dense_read = 0, dense_destroy = 0;
+        double shared_enqueue = 0, shared_wait = 0, shared_read = 0;
+        uint64_t shared_batches = 0;
     } timings;
     using Clock = std::chrono::steady_clock;
     static double elapsed(Clock::time_point t) { return std::chrono::duration<double>(Clock::now() - t).count(); }
@@ -325,6 +335,7 @@ struct Engine::Impl {
     }
 
     ~Impl() {
+        drain_shared();
         if (gpu_experts && cfg.profile) {
             const auto & s = gpu_experts->stats();
             std::fprintf(stderr, "M31 expert cache: hits=%llu misses=%llu evictions=%llu upload_bytes=%llu resident=%zu peak=%zu scratch=%zu pinned=%d\n",
@@ -333,6 +344,7 @@ struct Engine::Impl {
         }
         gpu_experts.reset();
         cpu_decode_graphs.clear();
+        shared_decode_graphs.clear();
         dense_decode_graphs.clear();
         head_decode_graph.graph.reset();
         dense_workspace.reset();
@@ -550,15 +562,47 @@ struct Engine::Impl {
         storage.output = result;
     }
 
-    void clear_dense_decode_cache() {
+    void drain_shared() noexcept {
+        if (shared_inflight) {
+            ggml_backend_synchronize(backend);
+            shared_inflight = false;
+        }
+    }
+    bool overlap_shared(int layer, int n) const {
+        return cpu_shared_overlap && n == 1 && g.routed(layer) &&
+            !(gpu_experts && n >= cfg.gpu_experts_min_tokens);
+    }
+    void enqueue_shared(int layer, const std::vector<float> & input) {
+        require(!shared_inflight, "a shared FFN graph is already in flight");
+        auto & storage = shared_decode_graphs[size_t(layer)];
+        if (!storage) storage = std::make_unique<HeadGraph>();
+        if (!storage->graph) {
+            // No views into the attention graph/workspace. These buffers and
+            // tensor addresses remain owned until reset/destruction, after drain.
+            storage->graph = std::make_unique<Graph>(backend, cfg, pos, nullptr, 1024 * 1024, 512);
+            auto & b = *storage->graph;
+            storage->input = b.input(GGML_TYPE_F32, g.embd, 1);
+            storage->output = ffn(b, *dense, storage->input, "blk." + std::to_string(layer) + ".", "_shexp");
+            b.allocate({storage->output});
+        }
+        ggml_backend_tensor_set(storage->input, input.data(), 0, ggml_nbytes(storage->input));
+        // Set before submission: even a failed submission may have queued work.
+        shared_inflight = true;
+        require(ggml_backend_graph_compute_async(backend, storage->graph->graph) == GGML_STATUS_SUCCESS,
+                "async shared FFN submission failed");
+    }
+
+    void clear_dense_decode_cache(bool release_shared = false) {
         // CUDA's captures reference tensor metadata and shared attention inputs.
         // Destroy them before either ownership group can be replaced/freed.
+        drain_shared();
+        if (release_shared) for (auto & graph : shared_decode_graphs) graph.reset();
         for (auto & graph : dense_decode_graphs) graph.reset();
         head_decode_graph.graph.reset();
         head_decode_graph.input = head_decode_graph.output = nullptr;
     }
 
-    void build_dense(int l, int n, DenseGraph & storage, bool stable_decode) {
+    void build_dense(int l, int n, DenseGraph & storage, bool stable_decode, bool split_shared) {
         const auto build_start = cfg.profile ? Clock::now() : Clock::time_point{};
         auto & b = *storage.graph;
         auto c = b.c;
@@ -587,7 +631,8 @@ struct Engine::Impl {
         }
         storage.residual = ffn_inp;
         storage.norm = norm;
-        storage.shared = b.tap(ffn(b, *dense, norm, prefix, "_shexp"), "ffn_shexp", l);
+        if (!split_shared)
+            storage.shared = b.tap(ffn(b, *dense, norm, prefix, "_shexp"), "ffn_shexp", l);
         auto probs = ggml_sigmoid(c, ggml_mul_mat(c, dense->get(prefix + "ffn_gate_inp.weight"), norm));
         storage.ids = b.tap(ggml_top_k(c, ggml_add(c, probs, dense->get(prefix + "exp_probs_b.bias")), int(g.used)), "ffn_moe_topk", l);
         auto weight = ggml_get_rows(c, ggml_reshape_3d(c, probs, 1, g.experts, n), storage.ids);
@@ -604,7 +649,8 @@ struct Engine::Impl {
         // path replans its alias topology after this extra integer-only node.
         if (cfg.reuse_allocations && !ggml_is_contiguous(storage.ids))
             storage.ids = ggml_cont(c, storage.ids);
-        allocate({storage.residual, storage.norm, storage.shared, storage.ids, storage.weights});
+        if (split_shared) allocate({storage.residual, storage.norm, storage.ids, storage.weights});
+        else allocate({storage.residual, storage.norm, storage.shared, storage.ids, storage.weights});
     }
 
     void layer(int l, int n) {
@@ -625,6 +671,7 @@ struct Engine::Impl {
         DenseGraph temporary;
         DenseGraph * storage = &temporary;
         const bool stable_decode = cfg.dense_decode_cache && n == 1 && !cfg.tap;
+        const bool shared_overlap = overlap_shared(l, n);
         if (stable_decode) {
             if (!dense_decode_graphs[size_t(l)]) dense_decode_graphs[size_t(l)] = std::make_unique<DenseGraph>();
             storage = dense_decode_graphs[size_t(l)].get();
@@ -636,7 +683,7 @@ struct Engine::Impl {
                 stable_decode ? 4 * 1024 * 1024 : 32 * 1024 * 1024,
                 stable_decode ? 2048 : 8192);
             if (cfg.profile) timings.dense_build += elapsed(create_start);
-            build_dense(l, n, *storage, stable_decode);
+            build_dense(l, n, *storage, stable_decode, shared_overlap);
         }
         require(storage->nk == kv_length(pos + n, g), "stale dense decode bucket");
         auto & b = *storage->graph;
@@ -656,11 +703,11 @@ struct Engine::Impl {
             if (reuse_host_reads) {
                 read_host(storage->residual, residual);
                 read_host(storage->norm, ffn_input);
-                read_host(storage->shared, shared);
+                if (!shared_overlap) read_host(storage->shared, shared);
             } else {
                 residual = Graph::read(storage->residual);
                 ffn_input = Graph::read(storage->norm);
-                shared = Graph::read(storage->shared);
+                if (!shared_overlap) shared = Graph::read(storage->shared);
             }
             if (ggml_is_contiguous(storage->ids)) {
                 ggml_backend_tensor_get(storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
@@ -684,6 +731,36 @@ struct Engine::Impl {
         }
         if (!g.routed(l)) return;
         if (cfg.route_observer) cfg.route_observer(l, n, ids, route_weights);
+        // The guard outlives submission and CPU work, and drains before any
+        // failure/reset can release graph metadata, scratch, input or weights.
+        struct SharedDrain {
+            Impl * owner;
+            ~SharedDrain() { owner->drain_shared(); }
+        } shared_guard{this};
+        const bool shared_timing = shared_overlap && (cfg.profile || shared_trace);
+        const auto shared_submit = shared_timing ? Clock::now() : Clock::time_point{};
+        if (shared_overlap) {
+            enqueue_shared(l, ffn_input);
+            if (cfg.profile) {
+                timings.shared_enqueue += elapsed(shared_submit);
+                ++timings.shared_batches;
+            }
+#ifdef M31_SHARED_OVERLAP_TESTING
+            const char * inject = std::getenv("M31_CPU_SHARED_OVERLAP_FAIL_AFTER_LAUNCH");
+            if (!shared_failure_fired && inject && std::string(inject) == "1") {
+                shared_failure_fired = true;
+                throw std::runtime_error("M31 injected failure after shared FFN launch");
+            }
+#endif
+        }
+        const auto shared_cpu_begin = shared_timing ? Clock::now() : Clock::time_point{};
+#ifdef M31_SHARED_OVERLAP_NVTX
+        if (shared_overlap) nvtxRangePushA("M31 CPU MoE while shared FFN is queued");
+        struct NvtxPop {
+            bool active;
+            ~NvtxPop() { if (active) nvtxRangePop(); }
+        } nvtx_cpu_range{shared_overlap};
+#endif
         std::vector<float> local_moe;
         const std::vector<float> * moe_result = nullptr;
         if (reuse_host_reads && !(gpu_experts && n >= cfg.gpu_experts_min_tokens)) {
@@ -695,6 +772,26 @@ struct Engine::Impl {
             moe_result = &local_moe;
         }
         const auto & moe = *moe_result;
+        const auto shared_cpu_end = shared_timing ? Clock::now() : Clock::time_point{};
+#ifdef M31_SHARED_OVERLAP_NVTX
+        if (nvtx_cpu_range.active) { nvtxRangePop(); nvtx_cpu_range.active = false; }
+#endif
+        if (shared_overlap) {
+            const auto wait_begin = shared_timing ? Clock::now() : Clock::time_point{};
+            drain_shared();
+            if (cfg.profile) timings.shared_wait += elapsed(wait_begin);
+            const auto read_begin = shared_timing ? Clock::now() : Clock::time_point{};
+            auto tensor = shared_decode_graphs[size_t(l)]->output;
+            if (reuse_host_reads) read_host(tensor, shared);
+            else shared = Graph::read(tensor);
+            if (cfg.profile) timings.shared_read += elapsed(read_begin);
+            if (shared_trace) {
+                auto ns = [](Clock::time_point time) { return std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count(); };
+                std::fprintf(stderr, "M31 shared-overlap pos=%lld layer=%d submit_ns=%lld cpu_begin_ns=%lld cpu_end_ns=%lld joined_ns=%lld\n",
+                    (long long)pos, l, (long long)ns(shared_submit), (long long)ns(shared_cpu_begin),
+                    (long long)ns(shared_cpu_end), (long long)ns(Clock::now()));
+            }
+        }
         const auto residual_start = cfg.profile ? Clock::now() : Clock::time_point{};
         if (cfg.cpu_residual && !cfg.tap) {
             hidden.resize(moe.size());
@@ -772,6 +869,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->g = read_geometry(*p_->model);
         p_->cpu_decode_graphs.resize(size_t(p_->g.layers));
         p_->dense_decode_graphs.resize(size_t(p_->g.layers));
+        p_->shared_decode_graphs.resize(size_t(p_->g.layers));
         require(cfg.context <= p_->g.context && cfg.context <= INT32_MAX, "context exceeds model maximum");
         p_->capacity = kv_length(cfg.context, p_->g);
         p_->cpu = ggml_backend_cpu_init();
@@ -783,6 +881,17 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
             p_->own_backend = true;
         }
         require(p_->backend != nullptr, "cannot create dense backend");
+        const char * shared_mode = std::getenv("M31_CPU_SHARED_OVERLAP");
+        const bool shared_requested = shared_mode && std::string(shared_mode) == "1";
+        const char * shared_trace = std::getenv("M31_CPU_SHARED_OVERLAP_TRACE");
+        p_->shared_trace = shared_trace && std::string(shared_trace) == "1";
+#ifdef M31_ENGINE_CUDA
+        p_->cpu_shared_overlap = shared_requested && ggml_backend_is_cuda(p_->backend) &&
+            cfg.reuse_allocations && cfg.cpu_residual && cfg.dense_decode_cache && !cfg.tap;
+#endif
+        if (cfg.profile && shared_requested) std::fprintf(stderr,
+            "M31 CPU/shared overlap: enabled=%d (CUDA CPU-routed n1; requires reuse/cpu-residual/dense-cache/no-taps)\n",
+            int(p_->cpu_shared_overlap));
         if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_n_threads(p_->backend, cfg.threads);
         if (cfg.persistent_cpu_pool) {
             auto params = ggml_threadpool_params_default(cfg.threads);
@@ -824,7 +933,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
 void Engine::reset() {
-    p_->clear_dense_decode_cache();
+    p_->clear_dense_decode_cache(true);
     p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false;
 }
 
@@ -881,6 +990,10 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
                 (unsigned long long)(p_->host_reads.reuses-previous_host_reuses),
                 (unsigned long long)(p_->host_reads.growths-previous_host_growths),
                 (unsigned long long)(p_->host_reads.bytes-previous_host_bytes), p_->host_retained_bytes());
+            if (p_->timings.shared_batches) std::fprintf(stderr,
+                "M31 shared-stages pos=%lld n=%d batches=%llu enqueue_ms=%.3f wait_ms=%.3f read_ms=%.3f\n",
+                (long long)p_->pos, n, (unsigned long long)p_->timings.shared_batches,
+                1000*p_->timings.shared_enqueue, 1000*p_->timings.shared_wait, 1000*p_->timings.shared_read);
         }
         p_->pos += n;
         p_->last_n = n;
