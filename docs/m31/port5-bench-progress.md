@@ -24,10 +24,14 @@ request profiles, actual chunks, память, flags/ELF, ограничения
 Combined kernel_D2H wait не выдаётся за чистое время PCIe или kernels.
 Unit/client/server rc0, normal EOF, aictl down/rollback/возврат майнера выполнены.
 
-Координатор после окна запустил единственный финальный full20 на том же ELF
-против существующего strict CPU oracle c2048/decode32/allrows. Его результат
-фиксирует общий итог root. Новых speed/quality/GPU экспериментов после окна
-направление bench не запускало. Ниже сохранена история решений и отбраковки.
+Координатор после окна запустил единственный финальный full20 на том же ELF:
+20/20,28723позиции, top1=100%, mean/maxKL0/maxabs0 против существующего
+strict CPU oracle c2048/decode32/allrows. Дополнительный GNUcmp подтвердил
+побайтовое равенство20 файлов,22985753088байт/сторону,5746438272F32/сторону;
+он выполнял только чтение артефактов без GPU/моделей. Proof
+`port5-full20-bytecmp-v1.json`; final20 manifest audit
+`port5-final-native-manifest-audit-v1.json` прошёл. Новых speed/quality/GPU
+экспериментов после окна направление bench не запускало. Ниже история.
 
 Референс прежний: TG4K/16K/32K
 23.33/22.63/21.92, PP4K/32K425/433, Q8_0/64K/ubatch2048/3GPUexpert layers.

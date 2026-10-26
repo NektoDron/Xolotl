@@ -1,3 +1,87 @@
+# MiniMax-M3.1 → Xolotl: итог port5
+
+Ветка `aiserver/m31-port`, source commit `84ebf16d`. Пуша/PR нет.
+Полный итог: `/mnt/ai/logs/m31-port/REPORT-port5.final.md`.
+Machine summary: `port5-final-summary.json`. STATUS содержит хронологию.
+
+## M2 частичный: генерация быстрее, префилл не достиг цели
+
+Одна GPU0, неизменённый om_bench, effortlow, по два запроса на глубину.
+Медианы ток/с:
+
+| Контекст | TG native / llama.cpp | PP native / llama.cpp |
+|---|---:|---:|
+|4K|27.510 /23.33|215.05 /425|
+|16K|26.385 /22.63|231.30 /—|
+|32K|25.440 /21.92|237.90 /433|
+
+TG быстрее на17.9/16.6/16.1%; PP составляет50.6/54.9%ref на4K/32K.
+Кратного PP выигрыша нет. По исходному условию после M2 остановились;
+M3/DSpark не запускался, новый GSM100 не выполнялся. Tools23 20/23 — port4.
+
+Final full20:20/20,28 723 позиции, top1=100%, KL/maxabs0. GNUcmp20/20
+подтвердил побайтовое равенство22 985 753 088байт/сторону strict CPU oracle.
+`port5-gpu-v4-final-gate20-v1/compare.json`, `port5-full20-bytecmp-v1.json`.
+Scope ctx4096/chunk2048/d32/allrows/head0/op_offload=false. Не GPU-placement oracle.
+
+## Финальная конфигурация и что готово
+
+Frozen candidate: `/mnt/ai/Xolotl-m31/build-port5-cache/candidate-v4/`.
+Serve SHA825ed0d7f6c6fc8ac8718aee971668c07e266aca28fde08dad90667fcca12b8d,
+generate SHA и все source hashes в build-receipt.json. Frozen ELF не пересобирать.
+Canonical CPU/CUDA builds и quick relink rc0,22 protocol/vocab checks пройдены.
+Canonical отличается от frozen только query guard/комментариями; численная query0 ветка та же.
+
+F16 main/index KV,ctx40000,maxchunk8192,CPU80/HOST32/PACK8,arena170GiB,
+cache7GiB=290slots,rank seed20/prefetch128. Private CUDA stream+pinned scratch<=1GiB,
+IMMA/CPU-compatible Q8_K/Q8_0 arithmetic, reused buffers и final forward_into.
+CPU fusedFFN на persistent ggmlpool, GPU shared/residual/hidden decodechain,
+concatQKV/indexQK/GU без дополнительных весовVRAM, nativeF16gather.
+MSA: fullquery, TOP_K_MASK1/inplace score/adaptive stage-peak planner.
+CACHED_DECODE0,CPU_DIRECT0,QUERY_TILE0. Полный environment и CLI:
+`port5-gpu-v4-full-summary-v1.json`, manifest внутри `port5-gpu-v4-full-v1/`.
+
+Actual32K:8192/8192/8192/7680/762 и.../763. Без OOM, peak30653MiB;
+суммаRSS320.36GiB включает mmap. PCIe5.0×16 подтверждён telemetry.
+CUPTI accepted3K:627H2D пересечений/339kernels,176.816ms/3620.753ms=4.883%.
+Это ограниченное реальное overlap, не полное скрытие DMA/не isolated speedup.
+
+## Ошибки, которые нельзя переоткрыть случайно
+
+- SafeFusionMUL+FFN gate/up fences приняты numeric gates; точная vendor причина
+  fusion regressions ещё не доказана. Ранний23.40/182.6 diagnostic INVALIDATED.
+- Querytiling512 давал numericFAIL даже nofusion; canonical запрещает любой >0.
+  Его L0 diagnostic/PreparedPair/GPU-OAI источники экспериментальные, не mainpath.
+- Bounded oracle обязан считать ВЕСЬ FFN59 перед crop. Новые refs:
+  `port5-oracle-full-last-tail64-v2/oracle-c128` и `oracle-c8192`.
+  Legacy bounded refs без full_last_layer_before_crop=true отвергаются comparer.
+- Env только M31_GPU_HOST_THREADS (32); ранний wrong-name gate был serial1.
+- Job basename обязан быть уникальным: backup именной, смены unit недостаточно.
+  card_launch блокирует коллизии backup и INVALIDATED каталоги до systemd.
+
+## Следующий M2 этап
+
+1. На этом же ELF отдельный A/B CUDA_DEVICE_MAX_CONNECTIONS/MAX_COPY_CONNECTIONS32
+   с device trace (пока непроверенная гипотеза).
+2. GPU-resident полный FFN: убрать gate/up/down промежуточные D2H и CPU OAI/quant,
+   сохраняя contract/исходные веса. Combined kernel_D2H_wall не равен чистому PCIe.
+3. Измерить serial pinned-readback→caller memcpy; parallel disjointcopy пока только идея.
+4. Дальнейшие dense изменения — по device trace, не по async dense_read как «GPU kernel».
+
+Все шесть направлений отработали параллельно, их отчёты docs/m31/port5-* и
+`dense-decode-port5.md`. Код и документацию коммитит только root.
+Долгое только systemd Usernekto, GPU0 через aictl/card flock, GPU1 не брать,
+builds-j24/max3, speed без тяжёлых CPU задач. Не пушить/не удалять модели.
+
+## Ресурсы восстановлены
+
+Оба майнера и дежурная8084 работают, aictl active=null. Temporary presets сняты.
+Весь aictl config семантически равен первому port5backup:
+`port5-final-config-audit.json`. Prod/up*/hxq3k/m31 не менялись.
+Все наши GPU/build/measure/byteproof units закончены. Новых инференсов после итогов нет.
+
+---
+
 # MiniMax-M3.1 → Xolotl: итог port4
 
 Рабочее дерево `/mnt/ai/Xolotl-m31`, ветка `aiserver/m31-port`.
