@@ -1,0 +1,48 @@
+#!/usr/bin/env python3
+"""Install/rollback exactly one owned temporary preset, preserving every other key."""
+import fcntl
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+config = Path('/etc/aictl/config.json')
+backup = Path(sys.argv[2])
+name = 'm31-xolotl-check'
+unit = 'codex-m31-port-card-worker'
+with open('/run/aictl.lock', 'a') as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    current = json.loads(config.read_text())
+    if sys.argv[1] == 'put':
+        if name in current['models']:
+            raise RuntimeError('owned preset already present; resolve previous session first')
+        if backup.exists():
+            raise RuntimeError('use a fresh backup path')
+        shutil.copy2(config, backup)
+        job = str(Path(sys.argv[3]).resolve())
+        current['models'][name] = {
+            'desc': 'временный M31 correctness batch, только GPU0', 'gpu': '0', 'port': 8179,
+            'start': ['systemd-run', '--collect', '--unit=' + unit, '-p', 'User=nekto',
+                      '-p', 'LimitCORE=0',
+                      '-p', 'StandardOutput=append:/mnt/ai/logs/m31-port/card-worker.log',
+                      '-p', 'StandardError=append:/mnt/ai/logs/m31-port/card-worker.log',
+                      '/usr/bin/python3', '/mnt/ai/Xolotl-m31/tools/m31/card_worker.py', job],
+            'stop': ['systemctl', 'stop', unit],
+            'check': ['systemctl', 'is-active', '--quiet', unit],
+            'ready_url': 'http://127.0.0.1:8179/health',
+        }
+    elif sys.argv[1] == 'rollback':
+        previous = json.loads(backup.read_text())['models']
+        if name in previous:
+            current['models'][name] = previous[name]
+        else:
+            current['models'].pop(name, None)
+    else:
+        raise ValueError(sys.argv[1])
+    temporary = config.with_suffix('.json.tmp-m31-port')
+    temporary.write_text(json.dumps(current, ensure_ascii=False, indent=2) + '\n')
+    os.chmod(temporary, config.stat().st_mode & 0o777)
+    os.replace(temporary, config)
+print('Бэкап:', backup)
+print('Откат: sudo python3 /mnt/ai/Xolotl-m31/tools/m31/card_preset.py rollback ' + str(backup))

@@ -16,7 +16,7 @@ def oai(gate, up):
     return gate / (1 + np.exp(-1.702 * gate)) * (np.clip(up, -7, 7) + 1)
 
 
-def forward(path: Path, ids):
+def forward(path: Path, ids, trace=None):
     file = GGUFFile(path)
     m = file.metadata
     w = {t.name: np.memmap(path, mode="r", dtype="<f4", offset=file.data_start + t.offset,
@@ -44,14 +44,15 @@ def forward(path: Path, ids):
         p = f"blk.{l}."
         wt = lambda name: w[p + name]
         xn = norm(x, wt("attn_norm.weight"))
+        if trace: trace(f"attn_norm-{l}", xn)
         q = rope(norm((xn @ wt("attn_q.weight").T).reshape(n, h, hd), wt("attn_q_norm.weight")))
         k = rope(norm((xn @ wt("attn_k.weight").T).reshape(n, kv, hd), wt("attn_k_norm.weight")))
         v = (xn @ wt("attn_v.weight").T).reshape(n, kv, hd)
         iq = rope(norm((xn @ wt("indexer.q_proj.weight").T).reshape(n, kv, hd), wt("indexer.q_norm.weight")))
         ik = rope(norm(xn @ wt("indexer.k_proj.weight").T, wt("indexer.k_norm.weight")))
         k, v, ik = (a.astype(np.float16).astype(np.float64) for a in (k, v, ik))
-        # ggml-cpu F16 matrix/dot inputs round query activations to F16 as well.
-        q, iq = (a.astype(np.float16).astype(np.float64) for a in (q, iq))
+        # FA rounds Q to F16; the indexer uses an F32 gather of its F16 cache.
+        q = q.astype(np.float16).astype(np.float64)
         attn = np.empty((n, h, hd))
         for t in range(n):
             nblocks = (t + block) // block
@@ -72,6 +73,8 @@ def forward(path: Path, ids):
                     pr /= pr.sum()
                     attn[t, head] = pr @ v[rows, group]
         residual = x + attn.reshape(n, h * hd) @ wt("attn_output.weight").T
+        if trace: trace(f"kqv_out-{l}", attn.reshape(n, h * hd))
+        if trace: trace(f"ffn_inp-{l}", residual)
         xn = norm(residual, wt("ffn_norm.weight"))
         if l < key("leading_dense_block_count"):
             ff = oai(xn @ wt("ffn_gate.weight").T, xn @ wt("ffn_up.weight").T) @ wt("ffn_down.weight").T
@@ -90,4 +93,5 @@ def forward(path: Path, ids):
                     ff[t] += scale * (wt("ffn_down_exps.weight")[e] @ expert)
             ff += shared
         x = residual + ff
+        if trace: trace(f"l_out-{l}", x)
     return norm(x, w["output_norm.weight"]) @ w["output.weight"].T

@@ -16,6 +16,7 @@ struct Config {
     int threads = 32;
     int64_t context = 4096;
     int max_chunk = 128;
+    double arena_gib = 0; // opt-in exact per-expert RAM repack; 0 retains GGUF mappings
     // Called after compute, before the graph is freed. Tensor data may live on the GPU:
     // read with ggml_backend_tensor_get(). Names follow minimax-m3.cpp's cb names.
     std::function<void(const std::string &, int64_t pos0, const ggml_tensor *)> tap;

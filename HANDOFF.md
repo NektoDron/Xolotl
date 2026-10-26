@@ -1,86 +1,114 @@
 # MiniMax-M3.1 → Xolotl: передача работы
 
-Работать ТОЛЬКО в `/mnt/ai/Xolotl-m31`, ветка `aiserver/m31-port`.
-Base: origin/main `961d390fea6d848431822f7c6e94a6e5c0775133`.
-Ниже сохранён унаследованный upstream HANDOFF; исходный также доступен
-через `git show 961d390f:HANDOFF.md`.
+Рабочее дерево `/mnt/ai/Xolotl-m31`, ветка `aiserver/m31-port`.
+Base origin/main `961d390fea6d848431822f7c6e94a6e5c0775133`.
+HEAD `cd4cc85c726448a6a90d9cb85475fd95e777aeea` (коммиты предыдущей сессии).
+В текущей сессии commits/push/PR НЕ делались. Изменения сейчас незакоммичены.
 
-## Состояние
+## Текущее состояние (26.10.2026, финальная контрольная точка)
 
-M0 завершён: [docs/m31/M0.md](docs/m31/M0.md). M1 в разработке, НЕ принят.
-Написан отдельный opt-in модуль `tools/m31`, без правок продовых движков.
-Статус/внешние исходники: `/mnt/ai/logs/m31-port/STATUS.md`, `refs/manifest.json`.
+M0 завершён. **M1 ПРИНЯТ:20/20 prompts/28723 позиций, все logits ПОБИТНО**
+(top1=1, mean/maxKL=0, maxabs0). Decode-tail32 на3000 тоже побитно.
+Отчёт `docs/m31/M1.md`; настройки nofusion/CPU routed/F16 KV обязательны.
+M2 НАЧАТ: opt-in exact RAM arena собрана и проверена на настоящем GGUF,
+code128 все logits побитно,7296 экспертов/152.51GiB, pack73.160с.
+Отчёт `docs/m31/M2.md`. GPU cache/layer batch/server/скоростей пока НЕТ,
+M2 НЕ завершён. M3/M4 не начаты. Критерий слабого выигрыша M2 пока не применялся.
 
-Написано (ещё НЕ собранно и НЕ протестировано):
+## Активной работы сейчас нет
 
-- `m31_geometry.hpp` / `m31_inspect`: полная shape/type/bounds карта, NVFP4 scales,
-  обязательный indexer на первых dense FFN слоях, расчёт байтов.
-- `m31_engine.{hpp,cpp}` / `m31_generate`: свои ggml MSA mask/gather, partial NeoX,
-  per-head QK RMS, dense/shared OAI, unbiased router weights и CPU ggml experts.
-  Загружает оригинальные типы, без requant. Transient CUDA graph cache очищается
-  перед освобождением графа (иначе риск stale pointers, как был у GLM).
-- `oracle/`: отдельный процесс, линкуется с готовыми STATIC библиотеками ref-агента
-  или shared build PR; SHA source проверяется. Vocab-only tokenize режим.
-- `make_prompts.py`, `compare_logits.py`, `compare_taps.py`: 20 prompts 64..3000,
-  raw-logits gate, проверка ID/модели/позиций, first-layer localization.
-- `tests/`: маленький F32 GGUF, независимый NumPy reference, missing-index/extra
-  tensor rejection, chunk1/7/29, тесты KL/неполных и испорченных dump.
+suite20, M2 CPU/CUDA build и real arena128 завершены rc0. Карты возвращены майнерам
+(Keryx0, SRBMiner/Pearl1), CPU llm-chat active. Temporary preset снят.
+Аудит `/mnt/ai/logs/m31-port/final-config-audit.json`: config.json семантически
+полностью равен состоянию до первого GPU job, ref m31 и prod hxq3k сохранены.
+НЕ нужно выполнять down или rollback повторно.
 
-## Ближайшие действия M1
+Все jobs/результаты/логи: `/mnt/ai/logs/m31-port/`.
 
-1. Проверить ref unit; пока active НЕ запускать даже compiler/py_compile/tests.
-2. После его окончания прочитать REPORT.md. Через systemd-run выполнить
-   `bash /mnt/ai/Xolotl-m31/tools/m31/build.sh cpu`, исправить compile/fixture ошибки.
-   Логи build-*.log; см. [tools/m31/README.md](tools/m31/README.md).
-3. Аналогично `build.sh cuda`. Он строит также oracle, используя библиотеки
-   `/mnt/ai/llama.cpp-m31pr-1026/build` (BUILD_SHARED_LIBS=OFF; не пересобирать ref).
-4. `make_prompts.py` → oracle vocab-only tokenize → общие .i32. Сначала короткий
-   и один 3000-token кейс, затем весь набор. Скоростной benchmark ещё не запускать.
-5. До GPU-прохода сделать собственный временный aictl launcher/preset с backup,
-   rollback-командой и trap down после возврата up под card lock; **preset пока нет**.
-   Из preset запускать сам GPU process, не резервировать чужой сервер и не запускать
-   модель отдельной командой мимо aictl. Только GPU0, CUDA_VISIBLE_DEVICES=0.
-6. Native и oracle выводят новые каталоги per-case. `compare_logits.py --require-suite`
-   принимает только двадцать полных prompt (не stride), top1>=99%, meanKL<1e-5,
-   maxKL<1e-3 на каждом кейсе. Не выдавать synthetic test или smoke за M1.
-7. При ошибке одинаковый chunk и --taps layers, найти первый l_out, затем --taps all
-   на одном кейсе. Сверить ещё chunk1/decode с chunk128/mask после включения MSA.
+- M1 `suite20-compare-v1.json`, raw `suite20-{oracle,native}-v1`, inputs ids-v1.
+- Decode `decode-compare-v1.json` (prefix2968/128 + tail32/1), все3000 побитно.
+- Arena `arena-compare-v1.json`, raw arena-native-v1, oracle code128-oracle-v1,
+  job-arena-v1*. native --arena-gib170, ctx4096/chunk128/threads64, все128 побитно.
+- Golden M1 binaries: logs/m31-port/m31_generate-m1, m31_oracle-m1.
+- M1 source hashes/patch: suite20-v1-source.{json,patch}. Эти hashes ДО M2 изменений.
+- Последние CPU/CUDA builds: build-cpu-20261026T180120Z.log,
+  build-cuda-20261026T180128Z.log; включают packed/mmap bit gate и budget rejection.
 
-Настоящих logits, top1, KL и t/s пока НЕТ. M1 не завершён. M2/M3/M4 не начаты.
-Перед M2 потребуются OAI+scratch+NVFP4 изменения общего тиринга (см. M0), GPU cache,
-layer batch и сервер. Не добавлять route bias/skip/prune/requant для прохождения gate.
+Дальше продолжать M2 по docs/m31/M2.md: pinned DMA+GPU expert cache, grouped
+layer-batched prefill, persistent graphs/pool, OpenAI server, затем speed и quality.
+`m31_arena.hpp` — готовые Layer/Slice descriptors и packed source bytes; CPU ggml
+уже читает их через custom nb[2]. Общий Ds4MoeTier пока НЕ подключён: для него
+по-прежнему нужны OAI/scratch/NVFP4 fixes. Продовые движки/скрипты не менялись.
 
-**Сборок и inference пока не было:** `codex-m31-ref` активен. Сначала проверить
-`systemctl is-active -q codex-m31-ref`. Пока active — только чтение/запись/проектирование.
-Не запускать даже CPU oracle или компиляцию. После завершения читать
-`/mnt/ai/logs/m31-ref/REPORT.md` и сравнивать с лучшим GPU-0 плечом.
+## Проверенные результаты и настройки
 
-## Важные находки
+- CPU baseline M1: gcc/g++14; `build-cpu-20261026T172422Z.log`.
+  Compare tests4/4, invalid loader fixtures; NumPy math chunk1/7/29 maxabs.00011285.
+- CUDA/oracle baseline M1: `codex-m31-port-build-cuda-r7`, rc0,
+  `build-cuda-*.log` (конец17:41:52 UTC). CUDA13.1 sm120a gcc/g++14.
+  CUDA binary повторно прошёл CPU fixtures. Oracle STATIC libs неизменённого
+  PR SHA `6b95a9908d2c7b242817a447708aec38e937e2c0`, source проверен CMake.
+- `short-compare-nofuse-v1.json`:64RU всё побитно.
+- `long-compare-pad256-v2.json`:3000code всё побитно.
+- `decode-compare-v1.json`: prefix2968 chunk128 + tail32 chunk1, все3000 побитно.
+- Текущий M1: dense CUDA0, routed CPU ggml оригинальных IQ3_XXS/IQ4_XS/NVFP4,
+  threads64, ctx4096, chunk128, F16 main/index KV, без requant/skip/route bias.
+  Oracle op_offload=false: CPU placement сам по себе не запрещает GPU offload.
+- ОБЯЗАТЕЛЬНО `GGML_CUDA_DISABLE_FUSION=1` в ОБОИХ процессах (worker ставит).
+  Fusion даёт неверные logits в этой M1-конфигурации и у native, и у oracle.
+  Точная fusion ещё НЕ локализована. Попытка bare gallocr→scheduler НЕ помогла
+  и ОТМЕНЕНА. Нельзя выдавать её за исправление или включать fusion без gate.
 
-- MSA — не V4.1 lightning-indexer: F32 dot, causal mask до max-pool по блокам128,
-  top16 на каждую GQA-группу, local force. На ВСЕХ слоях, включая 0–2.
-- OAI FFN: alpha1.702, limit7, `up+1`. Общий Ds4MoeTier пока не умеет эту активацию.
-- CPU scratch пределы 5840/2628/2304 меньше M31 7008/3504/3072.
-- NVFP4 down только52/58/59, обязательные `.scale`. Ds4GgufBlobs их не читает,
-  и расчёт down stride с tail нужно исправлять до подключения арены.
-- Не копировать GLM BF16→Q8_0 requant в M1. Gemma +1 уже в GGUF.
-- M31 DSpark — dflash, не Ds41DSpark. Tap layers брать из metadata draft.
-  Уже прочитан реальный draft: GGUF target_layers=[4,18,32,46,60], HF IDs=
-  [3,17,31,45,59]; проверить input/output semantics, не ошибиться на один слой.
-  5 dense draft blocks, block7/window4096, noise200058, payload1.94GiB.
-- Свежий root CMake pin ggml `6050b467...`; helper fetch-llama.sh ещё содержит
-  `3cf03257...`. Не запускать helper вслепую; собственный vendor, ни одной правки up*.
 
-## Неизменные правила
+## Исправления и важные контракты
 
-Карты только aictl под `flock -w 86400 /mnt/ai/logs/.xolotl-card.lock`.
-Только карта0; карта1 остаётся майнеру. Trap с down после завершившегося up.
-Долгое — `sudo systemd-run --unit=codex-m31-port-... -p User=nekto`, лог в
-`/mnt/ai/logs/m31-port`. Не мерить поверх сборок/конвертаций. Test preset:
-backup `/etc/aictl/config.json`, явная rollback-команда, убрать после этапа.
-Прод hxq3k, `/home/nekto/xolotl_up_engine.sh`, `/mnt/ai/Xolotl-up*` не менять.
-Ничего чужого не удалять; коммиты только локально в своей ветке, без attribution,
-никакого push/PR. Отчёты по-русски. После M2 при слабом/нулевом выигрыше остановиться.
+- PR MSA get_n_pos/get_n_kv pad>=256. Native теперь тоже pad256. При pad128
+  FA выбирала другое ядро/tiling; ~1e-4 relative attention усиливалось по60 слоям.
+- Index cache хранится F16, но ПЕРЕД dot переводится в F32, как PR get_rows;
+  иначе запрос дополнительно округлялся к F16 и мог менять top16.
+- CPU FA получает F32 V с исходными F16-значениями (stock CPU FA иначе округляет
+  накопитель на каждом key даже при GGML_PREC_F32). GPU F16 caches сохранены.
+- Head одним chunk, как PR: MMV vs MMQ — другое округление активаций.
+- Oracle capture фильтрует повторные Qcur/Kcur (только post-RoPE), Vcur view,
+  служебные copy names; capture error НЕ прерывает scheduler split (иначе SIGSEGV).
+- `--decode-tail N`: батчевый prefix и последниеN по одному, одинаково в обоих CLI.
+  Manifest записывает decode_tail, threads, cuda_fusion_disabled.
+- MSA на всех60 слоях, включая первые3 dense; top16 blocks128, local force,
+  per-GQA group, causal mask ДО pooling. OAI alpha1.702/limit7/(up+1), route scale2.
+- GGUF нормам Gemma +1 уже добавлен конвертером. NVFP4 down52/58/59, scale128F32.
+- DSpark — dflash, не V4.1 drafter. target_layers GGUF=[4,18,32,46,60],
+  HF IDs=[3,17,31,45,59]; block7/window4096, noise200058,5 dense blocks.
+
+## Дальше
+
+1. M1 принят, отчёт готов. Продолжать M2 (docs/m31/M2.md). Нужны OAI activation в CPU/CUDA/grouped/MMQ путях,
+   CPU scratch минимум7008/3504/3072 (сейчас5840/2628/2304), NVFP4 external scales
+   и исправление down stride (tail16 не часть GGUF expert stride) в blob source.
+   RAM arena уже есть; дальше pinned DMA/VRAM cache, persistent graphs/pool, layer batch, OpenAI server.
+   Нельзя включать tier с обычным SwiGLU или без масштаба NVFP4.
+2. M2 цель из REPORT: лучший1GPU TG4K/16K/32K23.33/22.63/21.92, PP4K/32K425/433,
+   GSM8K96/100/tools19/23. Референс speed с обычным op_offload и q8_0, не M1 oracle.
+   om_bench.py/GSM8K100/tools23. При слабом/нулевом выигрыше после M2 остановиться.
+
+## Запуск/восстановление
+
+Долгое: sudo systemd-run --unit=codex-m31-port-НОВОЕ -p User=nekto ...;
+логи `/mnt/ai/logs/m31-port/`. `tools/m31/build.sh cpu|cuda` берёт .build.lock,
+CUDA переиспользует НАШ CPU vendor fetch, up*/PR не меняет. Явный nvcc path.
+Не редактировать работающий bash-скрипт: bash читает его постепенно.
+GPU batch: `card_session.sh /mnt/ai/logs/m31-port/НОВЫЙ-job.json`, JSON commands
+array argv. Controller держит card+build locks, отказывается трогать активную
+чужую модель, ставит ТОЛЬКО temporary `m31-xolotl-check`, запускает сам worker и
+модели из aictl, ждёт up/result, EXIT trap down/rollback. Worker health8179 живёт
+до down. Backup `/etc/aictl/config.json.bak-m31-port-<jobstem>`; точная команда
+отката только своего ключа в session log. Чужие настройки сохраняются.
+
+Правила: только карта0; карта1 майнеру. Карты ТОЛЬКО aictl под
+flock -w86400 /mnt/ai/logs/.xolotl-card.lock. Прод hxq3k,
+/home/nekto/xolotl_up_engine.sh и /mnt/ai/Xolotl-up* не трогать. Ничего не удалять.
+Не коммитить/пушить без просьбы Андрея. Не мерить поверх сборок/конвертаций.
+Старые неудачные dumps/логи сохранены; прошлый текст M31 handoff сохранён
+в `/mnt/ai/logs/m31-port/HANDOFF-before-suite20.md`.
 
 ---
 

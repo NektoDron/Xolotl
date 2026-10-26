@@ -17,6 +17,8 @@ struct Capture {
 };
 bool capture_name(const std::string & name) {
     const auto dash = name.rfind('-');
+    if (dash != std::string::npos && (dash + 1 == name.size() ||
+        name.find_first_not_of("0123456789", dash + 1) != std::string::npos)) return false;
     const std::string base = dash == std::string::npos ? name : name.substr(0, dash);
     static const std::set<std::string> names = {
         "attn_norm", "Qcur_normed", "Kcur_normed", "Qcur", "Kcur", "Vcur",
@@ -28,11 +30,19 @@ bool capture_name(const std::string & name) {
 }
 bool callback(ggml_tensor * t, bool ask, void * data) {
     auto & c = *static_cast<Capture *>(data);
-    const bool wanted = c.dump && capture_name(t->name) && c.dump->wants_tap(t->name);
+    const std::string name = t->name;
+    // build_qkv names the projection and reshape Qcur/Kcur before the model
+    // reuses that name for post-norm RoPE. Capture the final semantic tensor.
+    const bool final_qk = !(name.starts_with("Qcur-") || name.starts_with("Kcur-")) || t->op == GGML_OP_ROPE;
+    const bool final_v = !name.starts_with("Vcur-") || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW;
+    const bool wanted = c.error.empty() && c.dump && final_qk && final_v &&
+                        capture_name(name) && c.dump->wants_tap(name);
     if (ask) return wanted;
     if (!wanted) return true;
     try { c.dump->tensor(t->name, c.pos0, t); return true; }
-    catch (const std::exception & e) { c.error = e.what(); return false; }
+    // Returning false aborts only a scheduler subgraph; later CPU splits then
+    // consume unfinished inputs. Finish the decode safely, report error afterward.
+    catch (const std::exception & e) { c.error = e.what(); return true; }
 }
 
 struct ModelDeleter { void operator()(llama_model * m) const { llama_model_free(m); } };
@@ -97,6 +107,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "tokenize") return tokenize(argc, argv);
         const auto args = run::parse(argc, argv);
+        if (args.arena_gib) throw std::runtime_error("--arena-gib is native-only; oracle retains original GGUF layout");
         const auto cases = run::cases(args);
         if (args.backend == "cpu") setenv("CUDA_VISIBLE_DEVICES", "", 1);
         if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
@@ -125,7 +136,11 @@ int main(int argc, char ** argv) {
         cp.type_k = GGML_TYPE_F16;
         cp.type_v = GGML_TYPE_F16;
         cp.offload_kqv = args.backend == "cuda";
-        cp.op_offload = args.backend == "cuda";
+        // M1's native routed path is CPU ggml, including activation quantization.
+        // Keep that backend identical in the oracle; otherwise CPU-placed expert
+        // tensors may still be copied to CUDA for mul_mat_id by op_offload.
+        // M2 benchmarks use the reference server's normal op_offload=true.
+        cp.op_offload = false;
         cp.kv_unified = false;
         cp.no_perf = true;
         if (args.taps != "none") { cp.cb_eval = callback; cp.cb_eval_user_data = &capture; }
@@ -139,8 +154,8 @@ int main(int argc, char ** argv) {
             llama_memory_clear(llama_get_memory(ctx.get()), true);
             run::Dump dump(run::fs::path(args.out) / path.stem(), args, ids, vocab);
             capture.dump = &dump;
-            for (int pos = 0; pos < int(ids.size()); pos += args.chunk) {
-                const int n = std::min(args.chunk, int(ids.size()) - pos);
+            for (int pos = 0; pos < int(ids.size()); ) {
+                const int n = run::chunk_size(args, int(ids.size()), pos);
                 batch.b.n_tokens = n;
                 for (int r = 0; r < n; ++r) {
                     batch.b.token[r] = ids[size_t(pos + r)];
@@ -158,6 +173,7 @@ int main(int argc, char ** argv) {
                     if (!logits) throw std::runtime_error("missing oracle logits");
                     dump.row(pos + r, logits);
                 }
+                pos += n;
             }
             dump.finish("llama.cpp-PR31192", int(ids.size()));
             capture.dump = nullptr;

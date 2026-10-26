@@ -61,6 +61,18 @@ def main():
             got.append(values)
         for values in got[1:]:
             np.testing.assert_allclose(values, got[0], rtol=.005, atol=.005)
+        packed = root / "packed"
+        subprocess.run([str(a.engine), "-m", str(model), "--ids-file", str(tokens), "--out", str(packed),
+                        "--backend", "cpu", "--ctx", "32", "--chunk", "7", "--threads", "2",
+                        "--arena-gib", ".01"], check=True, env=env)
+        values = np.fromfile(packed / "tiny/logits.f32", dtype="<f4").reshape(len(ids), 64)
+        np.testing.assert_array_equal(values, got[1])
+        print("packed arena: logits bit-identical to mapped weights", flush=True)
+        insufficient = subprocess.run([str(a.engine), "-m", str(model), "--ids-file", str(tokens),
+            "--out", str(root / "insufficient"), "--backend", "cpu", "--ctx", "32", "--arena-gib", ".000001"],
+            env=env, capture_output=True, text=True)
+        if insufficient.returncode == 0 or "budget is smaller" not in insufficient.stderr:
+            raise AssertionError("undersized arena was not rejected before allocation")
     return 0
 
 

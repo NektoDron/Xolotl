@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -19,7 +20,8 @@ namespace fs = std::filesystem;
 
 struct Args {
     std::string model, ids, cases, out, backend = "cpu", rows = "all", taps = "none";
-    int chunk = 128, context = 4096, threads = 32;
+    int chunk = 128, context = 4096, threads = 32, decode_tail = 0;
+    double arena_gib = 0;
 };
 inline Args parse(int argc, char ** argv) {
     Args a;
@@ -43,6 +45,13 @@ inline Args parse(int argc, char ** argv) {
         else if (k == "--chunk") a.chunk = integer();
         else if (k == "--ctx") a.context = integer();
         else if (k == "--threads") a.threads = integer();
+        else if (k == "--decode-tail") a.decode_tail = integer();
+        else if (k == "--arena-gib") {
+            size_t end = 0;
+            a.arena_gib = std::stod(v, &end);
+            if (end != v.size() || !std::isfinite(a.arena_gib) || a.arena_gib <= 0 || a.arena_gib > 512)
+                throw std::runtime_error("invalid arena budget");
+        }
         else throw std::runtime_error("unknown option " + k);
     }
     if (a.model.empty() || a.out.empty() || (a.ids.empty() == a.cases.empty()))
@@ -58,6 +67,11 @@ inline Args parse(int argc, char ** argv) {
             throw std::runtime_error("CUDA requires the aictl/flock runner (M31_CARD_SESSION=1)");
     }
     return a;
+}
+inline int chunk_size(const Args & a, int total, int pos) {
+    const int prefix = std::max(0, total - a.decode_tail);
+    if (a.decode_tail && pos >= prefix) return 1;
+    return std::min(a.chunk, (a.decode_tail ? prefix : total) - pos);
 }
 inline std::string quote(const std::string & s) {
     std::string out = "\"";
@@ -171,6 +185,7 @@ struct Dump {
         taps << "{\"name\":" << quote(name) << ",\"pos0\":" << pos0 << ",\"type\":" << int(t->type)
              << ",\"shape\":[" << t->ne[0] << ',' << t->ne[1] << ',' << t->ne[2] << ',' << t->ne[3]
              << "],\"file\":" << quote(file) << "}\n";
+        taps.flush();
         if (!taps) throw std::runtime_error("cannot write tap index");
     }
     void finish(const std::string & engine, int token_count) {
@@ -182,6 +197,10 @@ struct Dump {
           << ",\"model\":" << quote(fs::canonical(args.model).string())
           << ",\"tokens\":" << token_count << ",\"vocab\":" << vocab
           << ",\"chunk\":" << args.chunk << ",\"context\":" << args.context
+          << ",\"decode_tail\":" << args.decode_tail << ",\"threads\":" << args.threads
+          << ",\"arena_gib\":" << args.arena_gib
+          << ",\"cuda_fusion_disabled\":" <<
+             ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")
           << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"positions\":[";
         for (size_t i = 0; i < positions.size(); ++i) f << (i ? "," : "") << positions[i];
         f << "]}\n";

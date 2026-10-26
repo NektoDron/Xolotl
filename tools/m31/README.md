@@ -1,14 +1,16 @@
-# MiniMax-M3.1: экспериментальный M1
+# MiniMax-M3.1: M1 принят, M2 в работе
 
-**Код написан, но ещё не собран и не проверен.** На 2026-10-26 референсный
-`codex-m31-ref` работает; до его завершения запрещены сборка и inference.
+На 2026-10-26 **M1 принят**:20/20 промптов,28723 позиций, top1=100%, KL0,
+maxabs0, все logits побитно; decode-tail32 на3000 тоже побитно. **M2 в работе.**
+Фактические результаты и следующий шаг: `/mnt/ai/logs/m31-port/STATUS.md`, `HANDOFF.md`.
 Проект M0: [../../docs/m31/M0.md](../../docs/m31/M0.md).
 
 Модуль включается `-DSTRATA_M31=ON` и не меняет пути других моделей.
 Это собственный граф M3.1: GQA с per-head RMS/partial NeoX RoPE, MSA на каждом
 слое, sigmoid router и `swigluoai`. CPU ggml вычисляет исходные routed tensors;
 GPU держит исходные dense/shared weights, F16 main/index KV. BF16/Q6_K автоматически
-не переквантываются. RAM-арена, VRAM-кеш, сервер, драфт и vision ещё не подключены.
+не переквантываются. Opt-in RAM-арена подключена и проверена; VRAM-кеш, сервер,
+драфт и vision ещё не подключены.
 Transient graphs и копирование промежуточных активаций оставлены для M1, не для M2.
 
 ## После завершения референса
@@ -44,6 +46,8 @@ configure/build/tests, GPU не занимает; synthetic fixture checks ид�
 - `m31_oracle tokenize MODEL TEXT-DIR NEW-ID-DIR`: vocab-only, CUDA скрыта;
   полученные `.i32` подавать ОБОИМ движкам. Для каждого `.txt` опциональный
   `.length` задаёт длину префикса. Тексты не являются benchmark-ответами.
+- `--decode-tail 32` у обоих движков: префикс chunk128, последние32 токена
+  chunk1. Проверяет gather/decode после включения выбора MSA, сохраняя все logits.
 - `make_prompts.py NEW-DIR`: 20 фиксированных RU/EN/code/math промптов,
   64..3000 токенов; NFC/decomposed Unicode и границы MSA.
 - `compare_logits.py REF-DIR NATIVE-DIR --require-suite --out NEW.json`:
@@ -69,16 +73,54 @@ NFC BPE, chat template, stop/think/tool markers и потоковый parser.
 ## Допуски и следующий шаг
 
 NumPy fixture — независимая проверка маленькой F32 архитектуры и split-prefill,
-с F16 cache/query rounding. Она не заменяет PR на настоящем IQ3 GGUF. Текущие
-тесты не являются доказательством правильности, пока их не запустили.
+с F16 cache/FA-query rounding и F32 indexer score. Она не заменяет PR на настоящем
+IQ3 GGUF. CPU gate пройден: chunk1/7/29, maxabs logits=0.00011285; 4/4 проверки
+dump/comparator, loader negative cases. Реальный M1 принят: [../../docs/m31/M1.md](../../docs/m31/M1.md).
 
 Реальная модель на GPU запускается только **из aictl preset**, под
 `flock -w 86400 /mnt/ai/logs/.xolotl-card.lock`, с trap down ПОСЛЕ возврата up.
 `M31_CARD_SESSION=1` — защита от случайного запуска, не разрешение обходить aictl.
-Preset пока не создан: сначала сборка/CPU fixtures, затем собственный launcher,
+Preset пока не установлен: сначала сборка/CPU fixtures, затем собственный launcher,
 backup config.json, rollback-команда и снятие тестового preset в конце M1.
 Не использовать занятый чужой preset для резервирования карты.
 
-После M1 адаптировать Ds4MoeTier (OAI во всех kernels, больший CPU scratch,
-NVFP4 scales и корректный blob stride), затем подключать RAM arena/cache/MMQ.
+Собственный batch launcher: `card_session.sh JOB.json`, запускать через
+`sudo systemd-run --unit=codex-m31-port-... -p User=nekto /bin/bash ...`.
+JSON содержит `{"commands": [["/absolute/executable", "arg", ...], ...]}`.
+Сам worker и модели стартуют из временного `m31-xolotl-check` через aictl.
+Контроллер держит card/build locks, пишет session log и backup/rollback-команду,
+ждёт возврата up, result-файла, затем down и откат только своего ключа.
+JOB должен быть новым, лежать в `/mnt/ai/logs/m31-port/`; команды выполняются
+последовательно до первой ошибки, их логи и `.result.json` сохраняются рядом.
+
+Oracle M1: dense CUDA, routed CPU, `op_offload=false` (CPU placement сам по себе
+не запрещает ggml копировать экспертные операции на CUDA). Native M1 использует
+те же CPU kernels/activation quantization. Output head вычисляется целым chunk,
+как в oracle; однострочный MMV и батчевый MMQ дают разное округление активаций.
+CPU-only FA перед накоплением переводит V из F16-кеша в F32: stock ggml CPU FA
+иначе округляет накопитель после каждого key даже с `GGML_PREC_F32`.
+
+**Обязательная конфигурация текущего M1:** `GGML_CUDA_DISABLE_FUSION=1` для
+native И oracle (worker выставляет её сам). Включённая fusion в этой конфигурации
+даёт неверные logits в обоих процессах; точный fused kernel ещё не локализован.
+Замена gallocr на scheduler не помогла и отменена. На nofusion исправлены F32
+indexer scores и pad256 для main/index KV, как в PR: 64RU и 3000code (все строки)
+совпали побитно, top1=1/KL0/maxabs0. Полный gate20 и decode-tail пройдены побитно.
+Padding128 математически маскирует те же строки, но меняет FA kernel/tiling:
+на chunk128 разница attention ~1e-4 относительных усиливалась по60 слоям.
+Не подменять этот oracle speed-референсом: M2 сравнивается с REPORT.md
+(23.33/22.63/21.92 TG, 425/433 PP), с обычным op_offload и KV q8_0.
+
+При подключении общего Ds4MoeTier нужны OAI во всех kernels, больший CPU scratch,
+NVFP4 scales и корректный blob stride. Затем cache/MMQ; RAM arena уже проверена.
 Все approximations, route penalties, expert dropping и requant выключены.
+
+## M2 RAM arena (подготовка тиринга)
+
+`m31_generate ... --arena-gib170` — opt-in точная перепаковка7296 экспертов
+в pageable RAM. `[gate|up|down|NVFP4-scale-tail]`, aligned stride; CPU ggml
+использует custom nb[2]. Бюджет должен вмещать полную арену, MemAvailable
+reserve16GiB. Default0 — mmap; oracle этот флаг не принимает.
+CPU/CUDA tiny packed/mmap побитно. Реальный code128:152.51GiB, pack73.160с,
+все logits побитно совпали с PR. GPU cache/streaming/server пока не подключены.
+Подробнее и дальнейшие действия: [../../docs/m31/M2.md](../../docs/m31/M2.md).

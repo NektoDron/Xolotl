@@ -2,6 +2,7 @@
 // src/models/minimax-m3.cpp at 6b95a9908d2c7b242817a447708aec38e937e2c0 (MIT).
 // Append-only, one sequence, F16 caches. This deliberately starts with stock ggml ops.
 #include "m31_engine.hpp"
+#include "m31_arena.hpp"
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -24,11 +25,15 @@ void require(bool ok, const std::string & reason) {
     if (!ok) throw std::runtime_error("M31: " + reason);
 }
 int64_t padded(int64_t n, int64_t align) { return (n + align - 1) / align * align; }
+// PR's MSA position axis and main KV window both have a minimum 256-cell pad.
+// Matching it also keeps FA's kernel/tiling choice identical for numerical parity.
+int64_t kv_length(int64_t n, const Geometry & g) { return padded(n, std::max<int64_t>(256, g.block)); }
 
 struct Weights {
     ggml_context * ctx = nullptr;
     std::vector<ggml_backend_buffer_t> buffers;
     std::map<std::string, ggml_tensor *> tensors;
+    std::unique_ptr<ExpertArena> arena;
     ~Weights() {
         for (auto b : buffers) ggml_backend_buffer_free(b);
         if (ctx) ggml_free(ctx);
@@ -42,7 +47,13 @@ struct Weights {
         auto it = tensors.find(name);
         return it == tensors.end() ? nullptr : it->second;
     }
-    void load(const GgufModel & model, ggml_backend_t backend, bool dense_gpu) {
+    void load(const GgufModel & model, ggml_backend_t backend, bool dense_gpu,
+              const Geometry * geometry = nullptr, double arena_gib = 0) {
+        if (!dense_gpu && arena_gib > 0) {
+            require(geometry != nullptr, "arena needs validated geometry");
+            arena = std::make_unique<ExpertArena>();
+            arena->init(model, *geometry, arena_gib);
+        }
         ctx = ggml_init({16 * 1024 * 1024, nullptr, true});
         require(ctx != nullptr, "weight metadata allocation failed");
         for (size_t sh = 0; sh < model.size(); ++sh) {
@@ -66,9 +77,16 @@ struct Weights {
                 auto t = ggml_new_tensor(ctx, ggml_type(ti.type), int(ti.shape.size()), ne);
                 ggml_set_name(t, ti.name.c_str());
                 tensors.emplace(ti.name, t);
-                if (!dense_gpu)
-                    require(ggml_backend_tensor_alloc(buffer, t, const_cast<uint8_t *>(file.tensor_data(ti))) == GGML_STATUS_SUCCESS,
+                if (!dense_gpu) {
+                    const auto * packed = arena ? arena->find(ti.name) : nullptr;
+                    if (packed) {
+                        t->nb[2] = packed->expert_stride;
+                        t->nb[3] = packed->expert_stride * size_t(t->ne[2]);
+                    }
+                    require(ggml_backend_tensor_alloc(packed ? arena->buffer() : buffer, t,
+                                packed ? packed->data : const_cast<uint8_t *>(file.tensor_data(ti))) == GGML_STATUS_SUCCESS,
                             "cannot bind " + ti.name);
+                }
             }
         }
         if (dense_gpu) {
@@ -159,6 +177,10 @@ ggml_tensor * grouped_fa(Graph & b, ggml_tensor * q, ggml_tensor * k, ggml_tenso
     const int64_t group = g.heads / g.kv_heads;
     auto q4 = ggml_reshape_4d(b.c, q, g.head_dim, group, g.kv_heads, n);
     q4 = ggml_permute(b.c, q4, 0, 2, 3, 1);
+    // This ggml CPU FA ignores F32 accumulation for F16 V and rounds its running
+    // sum after every key. Preserve the F16 cache values but accumulate them in F32,
+    // as requested below (CUDA already respects the accumulator precision).
+    if (ggml_backend_is_cpu(b.backend)) v = ggml_cast(b.c, v, GGML_TYPE_F32);
     auto out = ggml_flash_attn_ext(b.c, q4, k, v, mask, 1.0f / std::sqrt(float(g.head_dim)), 0, 0);
     ggml_prec_set_acc(out, GGML_PREC_F32);
     out = ggml_cont(b.c, ggml_permute(b.c, out, 0, 1, 3, 2));
@@ -198,6 +220,7 @@ struct Engine::Impl {
             w->buffers.clear();
             if (w->ctx) { ggml_free(w->ctx); w->ctx = nullptr; }
             w->tensors.clear();
+            w->arena.reset();
         }
     }
 
@@ -232,10 +255,14 @@ struct Engine::Impl {
         ggml_build_forward_expand(b.graph, ggml_cpy(c, v, vdst));
         ggml_build_forward_expand(b.graph, ggml_cpy(c, ggml_reshape_2d(c, ik, g.index_dim, n), idst));
 
-        const int64_t nk = padded(start + n, g.block), blocks = nk / g.block;
+        const int64_t nk = kv_length(start + n, g), blocks = nk / g.block;
         const int64_t top = std::min(g.top_blocks, blocks);
         require(nk * g.index_heads * n < INT32_MAX, "MSA intermediate exceeds int32 kernel indexing; reduce chunk");
         auto ikv = ggml_view_2d(c, kv.index, g.index_dim, nk, kv.index->nb[1], 0);
+        // PR's get_rows(pos->cell) converts the F16 cache to F32 before the dot.
+        // An identity map still needs that conversion: a direct F16 mul_mat rounds IQ,
+        // changing block selection near ties once more than top_blocks exist.
+        ikv = ggml_cast(c, ikv, GGML_TYPE_F32);
         auto score = ggml_mul_mat(c, ikv, ggml_reshape_2d(c, iq, g.index_dim, g.index_heads * n));
         ggml_prec_set_acc(score, GGML_PREC_F32);
         score = ggml_reshape_3d(c, score, nk, g.index_heads, n);
@@ -343,7 +370,7 @@ struct Engine::Impl {
             auto c = b.c;
             auto x = b.input(GGML_TYPE_F32, g.embd, n);
             auto positions = b.input(GGML_TYPE_I32, n);
-            const int64_t nk = padded(pos + n, g.block), nb = nk / g.block;
+            const int64_t nk = kv_length(pos + n, g), nb = nk / g.block;
             auto mask = b.input(GGML_TYPE_F32, nk, 1, n);
             auto bias = b.input(GGML_TYPE_F32, nb, 1, n);
             cell_blocks_input = nullptr;
@@ -425,11 +452,12 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
     try {
         require(!p_->model, "init may only be called once");
         require(cfg.threads > 0 && cfg.context > 0 && cfg.max_chunk > 0, "invalid configuration");
+        require(std::isfinite(cfg.arena_gib) && cfg.arena_gib >= 0, "invalid arena budget");
         p_->cfg = cfg;
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
         require(cfg.context <= p_->g.context && cfg.context <= INT32_MAX, "context exceeds model maximum");
-        p_->capacity = padded(cfg.context, p_->g.block);
+        p_->capacity = kv_length(cfg.context, p_->g);
         p_->cpu = ggml_backend_cpu_init();
         require(p_->cpu != nullptr, "cannot create CPU expert backend");
         ggml_backend_cpu_set_n_threads(p_->cpu, cfg.threads);
@@ -440,7 +468,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         }
         require(p_->backend != nullptr, "cannot create dense backend");
         if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_n_threads(p_->backend, cfg.threads);
-        p_->host.load(*p_->model, p_->cpu, false);
+        p_->host.load(*p_->model, p_->cpu, false, &p_->g, cfg.arena_gib);
         if (ggml_backend_is_cpu(p_->backend)) p_->dense = &p_->host;
         else { p_->device.load(*p_->model, p_->backend, true); p_->dense = &p_->device; }
         p_->state = ggml_init({16 * 1024 * 1024, nullptr, true});
