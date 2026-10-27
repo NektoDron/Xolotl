@@ -1,38 +1,57 @@
-# MiniMax-M3.1: M1 принят, M2 выигрыш не получен
+# MiniMax-M3.1: M2 принят, port6
 
-26.10.2026, port4. Exact GPU + async прошёл20/20/28 723 к CPU strict
-oracle побайтово, KL0. Stock CUDA отдельно прошёл full20 к GPU-offload
-oracle; контракты квантизации активаций не смешивать.
+Финальная canonical CMake сборка V8 прошла все критерии. Медианы двух
+кругов om_bench на 4K / 16K / 32K: PP **1391 / 1535 / 1247 ток/с**,
+TG **27,45 / 27,02 / 25,31 ток/с**. Сырые TG32K: 24,61 и 26,00;
+один запрос ниже 25, медиана выше 25. GSM8K100: **97/100**, tools23: **19/23**.
 
-Последний best native CPU median: TG22.155, PP183.3; ref23.33/425,
-ref PP32K433. Exact GPU46.2PP/21.375TG, stockGPU95.35PP/20.75TG.
-M2 не принят, M3 не запускался; full16K/32K иGSM100 ещё не измерялись.
-Tools20/23vsref19/23; M4 CPU embeddings PNG/12frames приняты, native
-vision ещё нет. Все результаты в [M2](../../docs/m31/M2.md),
-`HANDOFF.md`, `/mnt/ai/logs/m31-port/REPORT-port4.final.md`.
+Полный gate20 (28 723 позиции) и ещё 768 выбранных long/direct позиций
+совпали с GPU-offload llama.cpp PR #31192: top-1 100%, KL/maxabs 0.
+В длинном oracle физическая ёмкость KV была уменьшена при сохранении
+фактических chunks, позиций и RoPE; отличие явно записано в receipts.
+Strict CPU — отдельный режим проверки, включаемый через `M31_GPU_EXACT=1`.
 
-Последние source CPU/CUDA builds обновлены и прошли checks. Все изменения
-opt-in; production пути не менялись. Reproducible frozen ELF/source/env
-и TSV/JSON находятся в `/mnt/ai/logs/m31-port/`.
+Подробности: [MINIMAX_M31](../../docs/MINIMAX_M31.md), `HANDOFF.md`,
+`/mnt/ai/logs/m31-port/REPORT-port6.final.md`. Полное машинное доказательство:
+`port6r4-final-v8-acceptance-v1/acceptance.final-v1.json`, все 16 проверок PASS.
 
-GPU jobs только через immutable launcher с НОВЫМИ job/output именами:
+Принятый профиль находится в [profiles/native-gpu.json](profiles/native-gpu.json).
+Он хранит 48 ENV и CLI параметры без локальных путей модели/executable.
+[profile_plan.py](profile_plan.py) печатает готовые argv/ENV для просмотра,
+ничего не запускает; применение описано в [profiles/README.md](profiles/README.md).
+
+Основной GPU FFN — stock grouped ggml MMQ, с native activation quantization.
+GPU prefill chain и зарегистрированная арена включены в принятом профиле,
+fusion выключен; BANKS/GU/MASK остаются отдельными экспериментальными опциями.
+Exact-debug использует `EXACT1/CHAIN0`, возвращает промежуточные значения в RAM
+и требует compiled CPU-compatible kernels. `CPU_QUANTS=1` сам режим не выбирает.
+
+Проверенная конфигурация: GPU0 RTX5090, CPU80/HOST32/PACK8, context40000/F16 KV,
+maxchunk32768, arena170GiB/cache7GiB/seed0. Это не тот же KV/placement профиль,
+что у speed reference llama.cpp Q8_0. HIP/SYCL и контексты больше 32K не проверены.
+
+Все GPU jobs запускаются только через immutable aictl launcher с новым именем:
 
 ```bash
 python3 tools/m31/card_launch.py /mnt/ai/logs/m31-port/NEW.json --unit codex-m31-NEW
 ```
 
-Runner0444+SHA, systemd User=nekto, card flock/aictl/backup/down/rollback.
-measurement:true(default) — exclusive build lock для скорости; false —
-shared для correctness. GPU0 only, nofusion. GPU1/prod/up*/hxq3k/m31
-не трогать. Не редактировать живые shell.
+Замораживаются runner/worker/preset helpers. Controller использует mixed stop,
+worker — control-group; up завершается до named down/rollback. Для скорости
+нужен `measurement:true`, который берёт исключительный build lock.
+На aiserver установлены opt-in aictl guards `up --no-switch` и
+`down NAME --if-owned` под `/run/aictl.lock`. Патч: `card_aictl_guard.patch`.
+Системный бэкап: `/usr/local/bin/aictl.bak-m31-port6-guarded`. Откат:
 
-Exact GPU: STRATA_M31_CPU_QUANTS_CUDA=ON и M31_GPU_CPU_QUANTS=1.
-Stock GPU: M31_GPU_CPU_QUANTS=0, другой placement oracle. Async uploader
-M31_GPU_PREFILL_ASYNC=1, явные arena/cache budgets. Env HOST_THREADS,
-EXPERT_SORT_ROUTES, REUSE_HOST_READS, CPU_SHARED_OVERLAP и seed receipt
-описаны в direction docs. CPU decode остаётся CPU при min_tokens32;
-shared overlap только CUDA+n1+CPU-routed, без taps и с graph caches.
-Большую THP арену не форсировать;64K memory budget ещё не замерен.
+```bash
+sudo cp -a /usr/local/bin/aictl.bak-m31-port6-guarded /usr/local/bin/aictl
+```
+
+Новый opt-in общий HTTP bridge — [serve/serve_m31.py](serve/serve_m31.py).
+Он прошёл CPU и native GPU smoke OpenAI/Anthropic, отмену с новым запросом и nested tools.
+Полный GSM/скорость относятся к standalone adapter; bridge отдельно их не проходил.
+Prefix reuse и engine vision пока не подключены. DSpark не запускался.
+GPU1, production, up*/hxq3k и постоянный preset m31 не менялись.
 
 Ниже исходная последовательность M1 для справки.
 

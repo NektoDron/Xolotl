@@ -57,3 +57,13 @@ HelperTemplate поддерживает generation-prompt render; history-only/a
 Все **19/19 CPU тестов PASS**, без пропусков, 0.934 с; `py_compile` PASS. Финальный лог и source receipt: `/mnt/ai/logs/m31-port/port6r2-common-shim-check-v4.log` и `.receipt.json`. Ни модель на GPU, ни GPU performance в этой волне не запускались.
 
 Независимый аудит integration: EOS считается один раз, последовательные запросы не переносят last/timings, все penalty aliases отклоняются до RPC. Receipt: `/mnt/ai/logs/m31-port/port6-profile-common-audit-v2.json`.
+
+## Подготовленный native smoke
+
+Новая изолированная сессия: `/mnt/ai/logs/m31-port/port6-common-native-smoke-v2/`. Её `manifest.json` фиксирует отдельные read-only копии common Python modules, shim, transport, session runner, PR vocab helper и принятого V8 engine SHA256 `39a86da6bd1a601adbfe02ee8556278be5c7c6f87a2ca3b0cc3ea5d47a778472`. Основной standalone adapter e87e70… не меняется.
+
+CPU CLI preflight вызывает настоящий parser/main с подменёнными process/server constructors: GPU не запускается. Подтверждены все числовые boolean flags 1/0, ctx 40000/cache 7 и точные 48 ENV из принятого recipe. Отдельно проверены три частичных JSONL-tail случая, включая UTF-8 и вложенную закрывающую скобку. Numeric reviewer подтвердил отсутствие известных blockers. Версия v1 с потенциальной гонкой чтения неполной JSONL-строки снята с очереди до захвата карты и помечена INVALIDATED.
+
+Клиент v2 после запуска проверит OpenAI/Anthropic greedy short, закрытие стрима и следующий чистый запрос, auto-call двух функций с вложенными object/array/Unicode аргументами. Native controller audit сохраняет фактические engine input IDs; клиент сравнивает их с отдельным pinned PR helper для каждого запроса. Проверяется участие sample/grammar callback и terminal drain после cancel. Это integration smoke; GSM/tools quality и скорость другого adapter им не доказываются.
+
+Validation выполнил job после quality и CUPTI v3. Native smoke v2 прошёл все пять проверок; session и server завершились rc0. Результаты находятся в `smoke-result.json`, `engine-audit.jsonl` и `common-native-smoke-http-session.result.json` внутри указанной сессии. Это smoke bridge, полные GSM/скорость относятся к принятому standalone adapter.

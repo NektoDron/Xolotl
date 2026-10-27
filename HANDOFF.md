@@ -1,3 +1,60 @@
+# MiniMax-M3.1: port6, M2 принят
+
+Отчёт: /mnt/ai/logs/m31-port/REPORT-port6.final.md. Машинная приёмка:
+/mnt/ai/logs/m31-port/port6r4-final-v8-acceptance-v1/acceptance.final-v1.json
+(все 16 проверок PASS). Ветка aiserver/m31-port, база 04971727.
+Ключевой core commit fda446fb; standalone safety d3f4b75d. Push/PR нет.
+
+Canonical V8, медианы двух кругов: PP4/16/32K =1390.85/1535/1246.65,
+TG =27.445/27.015/25.305. Сырые TG32K:24.61/26.00, один запрос ниже 25;
+критерий медианы выполнен. GSM8K100:97/100, tools23:19/23.
+Full20 GPU oracle:28 723 позиции, top1=100%, KL/maxabs0. Long16/32K и
+прямой batch10240 добавляют ещё 768 позиций с нулевыми расхождениями.
+Long oracle имеет меньшую физическую ёмкость KV; native context40000
+не менялся, фактические chunks/KV/RoPE совпадают, отличие записано явно.
+
+Frozen canonical build: build-port6-canonical/v8/ (generate/serve/receipt).
+Generate SHA2ab8b3c466becb4a8535b886e131d16a70ec5e07c995ac278599ff5de217859a.
+Serve SHA39a86da6bd1a601adbfe02ee8556278be5c7c6f87a2ca3b0cc3ea5d47a778472.
+Adapter SHAe87e70e1700cc6a1caf7e6355228ffdc3787b13b0640253967d6e9807666f4bf.
+Canonical CMake CPU/CUDA и NumPy/tiny fixtures PASS, source SHA stable.
+
+Профиль tools/m31/profiles/native-gpu.json содержит 48 ENV и CLI без
+путей модели/executable: native MMQ, CHAIN1/REGISTER1, cache7/seed0,
+CPU80, context40000/F16KV, maxchunk32768, fusionOFF. EXACT1/CHAIN0
+проверен отдельно против strict CPU128. BANKS/GU/MASK выключены;
+опциональные component proofs не подменяют итоговый профиль.
+
+Полная арена152.508GiB H2D57.57GB/s. Actual prefetch56.776GB/s;
+CUDA overlap868.921ms из935.071ms grouped compute =92.926% compute
+и30.715% DMA. Trace4096:114 routing reads +1 logits =8.27MB;
+промежуточных FFN F32 readback0. Артефакты port6-native-overlap-4k-v3/.
+На32K действительно пять проходов и ~818.7GB экспертных весов.
+
+Общий opt-in bridge tools/m31/serve/serve_m31.py прошёл19 CPU tests
+и5 native GPU smoke: OpenAI/Anthropic, отмена, новый запрос, nested tools.
+Полные quality/speed относятся к standalone adapter. Prefix reuse и vision
+не подключены: неприменённые rewind/mixed-embedding proposals и CPU
+fixtures/protocol validator сохранены. DSpark не запускался. Fused MSA,
+ctx>32K, HIP/SYCL и upstream cleanup — следующий этап. Исследовательские
+пробы/журналы оставлены локально, модели/чужие файлы не удалялись.
+
+GPU очередь пуста; все собственные model jobs завершены. GPU0 Keryx,
+GPU1 SRB майнеры, duty8084 healthy, aictl active=null, config initial-equal,
+temporary keys отсутствуют, locks свободны. Audit:port6-final-config-audit.json.
+Aictl opt-in guards сохранены с бэкапом:
+/usr/local/bin/aictl.bak-m31-port6-guarded. Откат: sudo cp -a этого файла
+в /usr/local/bin/aictl. Controller mixed/stop600, worker control-group,
+bounded timeouts/frozen helpers; cgroup canary подтвердил завершение6PID.
+
+Дальше: prefix cache с actual chunk recipe/fed IDs/kv position; native
+forward_embeddings с линейными M31 positions (не Qwen GENI/mRoPE);
+bridge quality и M3 DSpark по отдельному этапу. Не перезаписывать frozen
+ELF/receipts; GPU только через card_launch/aictl/cardlock, GPU1/prod не брать,
+не больше3 сборок -j24, speed windows без тяжёлого CPU.
+
+---
+
 # MiniMax-M3.1 → Xolotl: итог port5
 
 Ветка `aiserver/m31-port`, source commit `84ebf16d`. Пуша/PR нет.
