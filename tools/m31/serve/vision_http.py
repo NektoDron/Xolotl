@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import subprocess
 import threading
+import time
 from urllib.parse import unquote, urlparse
 from urllib.request import urlopen
 import uuid
@@ -89,6 +90,7 @@ class MediaInput:
         self.video_fps = video_fps
         self.allow_http, self.allow_local = allow_http, allow_local
         self.lock = threading.Lock()
+        self.last_timings = {}
         if min(self.max_media_bytes, self.max_total_bytes, self.max_media, self.max_image_pixels,
                self.max_video_seconds, self.max_video_frames, self.max_video_fps) <= 0:
             raise ValueError('vision limits must be positive')
@@ -109,7 +111,9 @@ class MediaInput:
                     raise ValueError('media data URL needs image/video MIME and base64 encoding')
                 if len(payload) > 4*((self.max_media_bytes+2)//3):
                     raise ValueError('media exceeds max_media_bytes')
+                started = time.perf_counter_ns()
                 data = base64.b64decode(payload, validate=True)
+                self.last_timings['base64_decode_ms'] = self.last_timings.get('base64_decode_ms', 0) + (time.perf_counter_ns()-started)/1e6
             except (binascii.Error, ValueError) as exc:
                 raise ValueError(f'invalid media data URL: {exc}') from exc
         elif scheme in ('http', 'https'):
@@ -134,6 +138,7 @@ class MediaInput:
         return data
 
     def _store(self, data, kind, fps):
+        stored_started = time.perf_counter_ns()
         path = self.dir / (hashlib.sha256(data).hexdigest() + ('.video' if kind == 'video' else '.image'))
         with self.lock:
             if not path.exists():
@@ -144,6 +149,8 @@ class MediaInput:
                 finally:
                     if temp.exists():
                         temp.unlink()
+        self.last_timings['source_hash_store_ms'] = self.last_timings.get('source_hash_store_ms', 0) + (time.perf_counter_ns()-stored_started)/1e6
+        validated_started = time.perf_counter_ns()
         if kind == 'image':
             from PIL import Image
             try:
@@ -169,10 +176,13 @@ class MediaInput:
                     raise ValueError('video dimensions exceed max_image_pixels')
             except (subprocess.SubprocessError, KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
                 raise ValueError(f'invalid video: {exc}') from exc
+        key = 'pil_verify_ms' if kind == 'image' else 'ffprobe_ms'
+        self.last_timings[key] = self.last_timings.get(key, 0) + (time.perf_counter_ns()-validated_started)/1e6
         return path
 
     def prepare(self, messages, requested_fps=None):
         """Return text-only helper messages, ordered immutable media files and marker substitutions."""
+        self.last_timings = {}
         copied = copy.deepcopy(messages)
         media, markers, total, selected_fps = [], [], 0, None
         default_fps = self._fps(self.video_fps if requested_fps is None else requested_fps)
@@ -199,7 +209,9 @@ class MediaInput:
                     if selected_fps is not None and fps != selected_fps:
                         raise ValueError('all videos in one request must use the same fps')
                     selected_fps = fps
+                read_started = time.perf_counter_ns()
                 data = self._read(source)
+                self.last_timings['source_read_including_base64_ms'] = self.last_timings.get('source_read_including_base64_ms', 0) + (time.perf_counter_ns()-read_started)/1e6
                 total += len(data)
                 if total > self.max_total_bytes:
                     raise ValueError('request exceeds max_total_bytes')

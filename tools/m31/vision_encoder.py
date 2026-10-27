@@ -122,9 +122,26 @@ class VisionEncoder:
                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         stderr=self.log, text=True, bufsize=1, env=env)
         reply = self._read()
+        self.startup_stats = reply.get('startup_stages_ms', {})
         if not reply.get('ready'):
             self.close()
             raise RuntimeError('vision encoder failed to initialize')
+
+    def start(self):
+        """Load the persistent encoder after the caller's LLM is ready.
+
+        Auto selection observes the memory already occupied by that LLM. Starting
+        an existing worker is idempotent; no weights/context are reloaded.
+        """
+        with self.lock:
+            worker_started = self.process is None or self.process.poll() is not None
+            started = time.perf_counter_ns()
+            self._start()
+            self.last_start_stats = dict(worker_started=worker_started,
+                                         milliseconds=(time.perf_counter_ns()-started)/1e6,
+                                         backend=self.selected_backend,
+                                         startup_stages_ms=dict(getattr(self, 'startup_stats', {})) if worker_started else {})
+            return dict(self.last_start_stats)
 
     def prepare(self, prompt, media, **kwargs):
         return self.encode(prompt, media, **kwargs)
@@ -135,11 +152,16 @@ class VisionEncoder:
                                 timestamp_interval_ms=timestamp_interval_ms)
 
     def _encode(self, prompt, media, *, video_fps, timestamp_interval_ms):
+        total_started = time.perf_counter_ns()
+        stage_ms = {}
         if not isinstance(prompt, str) or not media:
             raise ValueError('vision requires a prompt and media')
         if not math.isfinite(video_fps) or not 0 < video_fps <= 30:
             raise ValueError('video_fps must be in (0, 30]')
+        resolve_started = time.perf_counter_ns()
         self._resolve_backend()
+        stage_ms['backend_resolve_ms'] = (time.perf_counter_ns()-resolve_started)/1e6
+        hash_started = time.perf_counter_ns()
         paths = [Path(p).resolve(strict=True) for p in media]
         # Hash bytes rather than paths/mtime: the same upload can be re-used across
         # requests, and an overwritten local file must never hit an old entry.
@@ -150,6 +172,7 @@ class VisionEncoder:
                 for block in iter(lambda: source.read(1024*1024), b''):
                     h.update(block)
             media_hashes.append(h.hexdigest())
+        stage_ms['media_hash_ms'] = (time.perf_counter_ns()-hash_started)/1e6
         identity = dict(format='m31-vision-cache-v3', source_pr=PR_SHA,
                         encoder_environment=self._compute_env,
                         config=self.config, prompt=prompt, media=media_hashes,
@@ -161,8 +184,11 @@ class VisionEncoder:
         entry = self.cache_dir / key
         manifest = entry / 'batch' / 'manifest.json'
         started = time.monotonic()
+        lock_started = time.perf_counter_ns()
         with (self.cache_dir/(key+'.lock')).open('a+b') as cache_lock:
             fcntl.flock(cache_lock.fileno(), fcntl.LOCK_EX)
+            stage_ms['cache_lock_wait_ms'] = (time.perf_counter_ns()-lock_started)/1e6
+            cache_started = time.perf_counter_ns()
             if manifest.is_file():
                 m = json.loads(manifest.read_text())
                 if m.get('format') != 'm31-vision-batch-v1' or m.get('source_pr') != PR_SHA or m.get('backend') != self.selected_backend or m.get('encoder_environment', {}) != self._compute_env or not m.get('encoded'):
@@ -170,10 +196,16 @@ class VisionEncoder:
                 for filename, size in [('text_ids.i32', m['rows']*4), ('visual_rows.i32', m['rows']*4), ('positions.i32', m['rows']*4), ('visual.f32', m['visual_rows']*6144*4)]:
                     if (manifest.parent/filename).stat().st_size != size:
                         raise RuntimeError('invalid vision cache array size')
-                self.last_stats = dict(cache_hit=True, backend=self.selected_backend, encoder_environment=dict(self._compute_env), seconds=time.monotonic()-started,
+                stage_ms['artifact_cache_validate_ms'] = (time.perf_counter_ns()-cache_started)/1e6
+                stage_ms['total_ms'] = (time.perf_counter_ns()-total_started)/1e6
+                self.last_stats = dict(stage_ms=stage_ms, worker_started=False, cache_hit=True, backend=self.selected_backend, encoder_environment=dict(self._compute_env), seconds=time.monotonic()-started,
                                        rows=m['rows'], visual_rows=m['visual_rows'])
                 return manifest
+            stage_ms['artifact_cache_lookup_ms'] = (time.perf_counter_ns()-cache_started)/1e6
+            worker_started = self.process is None or self.process.poll() is not None
+            startup_started = time.perf_counter_ns()
             self._start()
+            stage_ms['worker_startup_rpc_ms'] = (time.perf_counter_ns()-startup_started)/1e6
             # Failed/interrupted attempts stay available for diagnosis. A fresh
             # unique directory avoids exposing a partly written cache entry.
             attempt = self.cache_dir / ('attempt-' + key + '-' + uuid.uuid4().hex)
@@ -181,13 +213,20 @@ class VisionEncoder:
             request = dict(prompt=prompt, media=[str(p) for p in paths], encode=True,
                            out=str(attempt/'ipc'), video_fps=video_fps,
                            timestamp_interval_ms=int(timestamp_interval_ms))
+            if os.environ.get('M31_TTFT_TRACE'):
+                request['ttft_trace'] = True
+            rpc_started = time.perf_counter_ns()
             self.process.stdin.write(json.dumps(request) + '\n')
             self.process.stdin.flush()
             reply = self._read()
+            stage_ms['worker_request_ipc_and_compute_ms'] = (time.perf_counter_ns()-rpc_started)/1e6
             if not reply.get('ok'):
                 raise ValueError(reply.get('error', 'vision encoding failed'))
             ipc = Path(reply['manifest'])
+            assemble_started = time.perf_counter_ns()
             assemble(ipc, attempt/'batch')
+            stage_ms['batch_assemble_files_ms'] = (time.perf_counter_ns()-assemble_started)/1e6
+            publish_started = time.perf_counter_ns()
             m = load(ipc)
             # Artifact manifest retains source metadata filenames and source
             # manifest path. Relocation keeps both source and batch together.
@@ -196,7 +235,9 @@ class VisionEncoder:
             source_manifest['source_manifest'] = str(entry/'ipc'/'manifest.json')
             (attempt/'batch'/'manifest.json').write_text(json.dumps(source_manifest) + '\n')
             attempt.rename(entry)
-            self.last_stats = dict(cache_hit=False, backend=self.selected_backend, encoder_environment=dict(self._compute_env), seconds=time.monotonic()-started,
+            stage_ms['metadata_publish_ms'] = (time.perf_counter_ns()-publish_started)/1e6
+            stage_ms['total_ms'] = (time.perf_counter_ns()-total_started)/1e6
+            self.last_stats = dict(stage_ms=stage_ms, worker_started=worker_started, startup_stages_ms=dict(getattr(self, 'startup_stats', {})) if worker_started else {}, adapter_timings_ms=reply.get('timings_ms', m.get('timings_ms', {})), cache_hit=False, backend=self.selected_backend, encoder_environment=dict(self._compute_env), seconds=time.monotonic()-started,
                                    rows=m['rows'], visual_rows=m['visual_rows'],
                                    encode_seconds=m['encode_seconds'],
                                    cached_image_chunks=m.get('cached_image_chunks', 0))

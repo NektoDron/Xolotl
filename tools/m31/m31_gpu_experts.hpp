@@ -18,6 +18,12 @@ public:
     struct Stats {
         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
         uint64_t graph_batches = 0, forwards = 0;
+        // Demand across valid routed forwards, and next-layer predictions classified
+        // when that layer's actual routes arrive (not bandwidth/device timings).
+        uint64_t required_experts = 0, required_bytes = 0;
+        uint64_t prefetch_used_experts = 0, prefetch_unused_experts = 0;
+        uint64_t prefetch_used_bytes = 0, prefetch_unused_bytes = 0;
+        uint64_t prefetch_history_batches = 0, prefetch_history_skipped_experts = 0;
         uint64_t cached_forwards = 0;
         uint64_t fast_forwards = 0;
         // Wall time on the calling thread. Async upload_submit can overlap prior

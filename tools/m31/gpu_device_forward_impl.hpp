@@ -68,6 +68,7 @@ void GpuExperts::forward_device(int layer,int n,ggml_tensor *normalized,
         // remaining producer operations before the private fast stream borrows
         // normalized/shared/residual. No FFN F32 tensor is read to the host.
         ggml_backend_synchronize(p_->backend);
+        p_->observe_routes(layer, n, mask);
         p_->finish_prefetch();
         if(p_->uploads)p_->uploads->begin_batch();
         std::vector<int32_t> remap(size_t(g.experts),-1),mapped(ids.size());

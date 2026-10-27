@@ -24,6 +24,11 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+# This file is also loaded by path from the common bridge.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+from ttft_trace import TTFTTrace
+
 
 class RPC:
     """Line RPC with bounded waits; a timed-out channel is never reused."""
@@ -200,6 +205,10 @@ def request_parameters(body, context, prompt_tokens):
     params = {"max_tokens": maximum, "ignore_eos": bool(body.get("ignore_eos", False)),
               "temperature": body.get("temperature", 1.0), "top_p": body.get("top_p", 0.95),
               "top_k": body.get("top_k", 40), "min_p": body.get("min_p", 0.05), "interactive": True}
+    if "cache_prompt" in body and int(os.environ.get("M31_PROMPT_CACHE_MIB", "0") or "0") > 0:
+        if not isinstance(body["cache_prompt"], bool):
+            raise ValueError("cache_prompt must be boolean")
+        params["cache_prompt"] = body["cache_prompt"]
     for key in ("temperature", "top_p", "min_p"):
         value = params[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not float("-inf") < value < float("inf"):
@@ -267,7 +276,8 @@ class Application:
     def tokenize(self, text, **kwargs):
         return self.tokenizer.call({"op": "tokenize", "content": text, **kwargs})["tokens"]
 
-    def prepare(self, body, chat=True):
+    def prepare(self, body, chat=True, trace=None):
+        prepare_started = time.perf_counter_ns()
         manifest = None
         prompt_rows = None
         if chat:
@@ -277,7 +287,11 @@ class Application:
                 # Validate outer structure before the media reader visits content.
                 if not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
                     raise ValueError("messages must be a nonempty array of objects")
+                media_started = time.perf_counter_ns()
                 messages, media, markers, fps = self.media_input.prepare(messages, body.get("video_fps"))
+                if trace:
+                    trace.add("media_prepare_ms", (time.perf_counter_ns()-media_started)/1e6)
+                    trace.details["media"] = dict(getattr(self.media_input, "last_timings", {}))
             messages = validate_messages(messages)
             choice = body.get("tool_choice", "auto")
             if not isinstance(choice, str) or choice not in ("auto", "none"):
@@ -309,10 +323,13 @@ class Application:
                     kwargs.pop("reasoning_effort", None)
                 elif effort:
                     kwargs["reasoning_effort"] = effort
+            template_started = time.perf_counter_ns()
             rendered = self.tokenizer.call({"op": "chat", "messages": messages, "tools": tools,
                                            "tool_choice": choice, "parallel_tool_calls": body.get("parallel_tool_calls", True),
                                            "enable_thinking": enable_thinking, "chat_template_kwargs": kwargs})
             ids = rendered["tokens"]
+            if trace:
+                trace.add("chat_template_rpc_ms", (time.perf_counter_ns()-template_started)/1e6)
             if media:
                 if self.vision is None:
                     raise ValueError("vision encoder is not configured")
@@ -324,7 +341,11 @@ class Application:
                     if prompt.count(marker) != 1:
                         raise ValueError("chat template did not preserve media order/markers")
                     prompt = prompt.replace(marker, media_marker)
+                encoder_started = time.perf_counter_ns()
                 manifest = self.vision.encode(prompt, media, video_fps=fps)
+                if trace:
+                    trace.add("encoder_python_total_ms", (time.perf_counter_ns()-encoder_started)/1e6)
+                    trace.details["encoder"] = dict(getattr(self.vision, "last_stats", {}))
                 metadata = json.loads(Path(manifest).read_text())
                 if metadata.get("format") != "m31-vision-batch-v1" or not metadata.get("encoded"):
                     raise ValueError("encoder returned an invalid mixed manifest")
@@ -349,6 +370,11 @@ class Application:
         params.update(grammar_check=grammar_active, tokens=ids, stop_ids=self.tokenizer.ready["eog"], suppress_ids=self.tokenizer.ready.get("suppress", []))
         if manifest is not None:
             params["mixed_manifest"] = str(Path(manifest).resolve())
+        if trace:
+            params["ttft_trace"] = True
+            trace.details["prompt_rows"] = prompt_rows if prompt_rows is not None else len(ids)
+            trace.add("prepare_total_ms", (time.perf_counter_ns()-prepare_started)/1e6)
+            trace.point("prepared")
         return params, stops + extra_stops
 
     def piece(self, token):
@@ -356,7 +382,7 @@ class Application:
             self.pieces[token] = bytes(self.tokenizer.call({"op": "piece", "token": token})["bytes"])
         return self.pieces[token]
 
-    def events(self, params, stops, chat=True, stream_parse=True, cancelled=lambda: False):
+    def events(self, params, stops, chat=True, stream_parse=True, cancelled=lambda: False, trace=None):
         """Caller holds self.lock. Consume fully, or close generator to cancel/drain."""
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         text = ""
@@ -369,6 +395,8 @@ class Application:
         try:
             if cancelled():
                 raise ClientDisconnected("client disconnected")
+            if trace:
+                trace.point("native_rpc_start")
             self.engine.write(params)
             started = True
             while True:
@@ -383,10 +411,15 @@ class Application:
                     self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
                     waiting_grammar = False
                 elif event["event"] == "prefill":
+                    if trace:
+                        trace.point("native_prefill_received")
+                        trace.details["native_prefill"] = dict(event)
                     if cancelled():
                         raise ClientDisconnected("client disconnected")
                     yield event
                 elif event["event"] == "token":
+                    if trace:
+                        trace.point("first_native_token")
                     waiting_ack = True
                     text += decoder.decode(self.piece(event["token"]))
                     safe_text, stop = clipped_text(text, stops)
@@ -414,6 +447,9 @@ class Application:
                     if delta:
                         yield {"event": "delta", "delta": delta}
                 elif event["event"] == "done":
+                    if trace:
+                        trace.point("native_done")
+                        trace.details["native_timings"] = dict(event.get("timings", {}))
                     if self.profile:
                         print("M31 request timings " + json.dumps(event.get("timings", {}), separators=(",", ":")), file=sys.stderr, flush=True)
                     completed = True
@@ -516,11 +552,21 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         streaming = False
+        trace = TTFTTrace(self.headers.get("X-M31-TTFT-ID")) if os.environ.get("M31_TTFT_TRACE") else None
+        trace_error = None
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if length < 1 or length > 64 * 1024 * 1024:
                 raise ValueError("invalid request size")
-            body = json.loads(self.rfile.read(length))
+            body_started = time.perf_counter_ns()
+            raw_body = self.rfile.read(length)
+            body_read = time.perf_counter_ns()
+            body = json.loads(raw_body)
+            if trace:
+                trace.add("http_body_read_ms", (body_read-body_started)/1e6)
+                trace.add("http_json_parse_ms", (time.perf_counter_ns()-body_read)/1e6)
+                trace.details["http_body_bytes"] = length
+                trace.point("http_body_parsed")
             if not isinstance(body, dict):
                 raise ValueError("request body must be an object")
             if self.path == "/tokenize":
@@ -537,8 +583,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
             chat = self.path == "/v1/chat/completions"
             native = self.path == "/completion"
+            queue_started = time.perf_counter_ns()
             with self.app.inference_slot():
-                params, stops = self.app.prepare(body, chat)
+                if trace:
+                    trace.add("inference_queue_wait_ms", (time.perf_counter_ns()-queue_started)/1e6)
+                params, stops = self.app.prepare(body, chat, trace=trace)
                 request_id, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
                 if body.get("stream", False):
                     self.send_response(200)
@@ -550,6 +599,14 @@ class Handler(BaseHTTPRequestHandler):
                     streaming = True
 
                     def emit(value):
+                        if trace and isinstance(value, dict):
+                            delta = value.get("choices", [{}])[0].get("delta", {})
+                            if not chat:
+                                delta = {"content": value.get("choices", [{}])[0].get("text", "")}
+                            if delta.get("content") or delta.get("reasoning_content"):
+                                trace.point("first_generated_delta")
+                            if delta.get("content"):
+                                trace.point("first_content_delta")
                         self.wfile.write(("data: " + (value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)) + "\n\n").encode())
                         self.wfile.flush()
 
@@ -565,7 +622,7 @@ class Handler(BaseHTTPRequestHandler):
                         return value
 
                     emit(chunk({"role": "assistant"} if chat else {}))
-                    with contextlib.closing(self.app.events(params, stops, chat, cancelled=self.disconnected)) as events:
+                    with contextlib.closing(self.app.events(params, stops, chat, cancelled=self.disconnected, trace=trace)) as events:
                         for event in events:
                             if event["event"] == "delta":
                                 emit(chunk(event["delta"]))
@@ -577,7 +634,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit("[DONE]")
                 else:
                     done = None
-                    with contextlib.closing(self.app.events(params, stops, chat, stream_parse=False, cancelled=self.disconnected)) as events:
+                    with contextlib.closing(self.app.events(params, stops, chat, stream_parse=False, cancelled=self.disconnected, trace=trace)) as events:
                         for event in events:
                             if event["event"] == "done":
                                 done = event
@@ -594,9 +651,11 @@ class Handler(BaseHTTPRequestHandler):
                         value = {"id": request_id, "object": "chat.completion" if chat else "text_completion",
                                  "created": created, "model": self.app.model, "choices": [choice], "usage": usage, "timings": timings}
                     self.json(200, value)
-        except (BrokenPipeError, ConnectionResetError, ClientDisconnected, TimeoutError):
+        except (BrokenPipeError, ConnectionResetError, ClientDisconnected, TimeoutError) as exc:
+            trace_error = exc
             self.close_connection = True
         except Exception as exc:
+            trace_error = exc
             if streaming:
                 try:
                     self.wfile.write(("data: " + json.dumps({"error": {"message": str(exc)}}) + "\n\ndata: [DONE]\n\n").encode())
@@ -607,6 +666,12 @@ class Handler(BaseHTTPRequestHandler):
                 status = 503 if isinstance(exc, ServerBusy) else 400 if isinstance(exc, (ValueError, KeyError, TypeError)) else 500
                 with contextlib.suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
                     self.json(status, {"error": {"message": str(exc), "type": "invalid_request_error" if status == 400 else "server_error"}})
+        finally:
+            if trace:
+                try:
+                    trace.finish(trace_error)
+                except OSError as exc:
+                    print("M31 TTFT trace write failed: " + str(exc), file=sys.stderr, flush=True)
 
 
 def main():
@@ -636,11 +701,15 @@ def main():
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
     vision = media_input = None
+    prewarm_vision = False
     if args.vision_config:
         sys.path.insert(0, str(Path(__file__).resolve().with_name("serve")))
         from vision_http import MediaInput
         from vision_encoder import VisionEncoder
         options = json.loads(Path(args.vision_config).read_text())
+        prewarm_vision = options.pop("prewarm", False)
+        if not isinstance(prewarm_vision, bool):
+            raise ValueError("vision prewarm must be boolean")
         limits = options.pop("limits", {})
         options.setdefault("model", args.model)
         media_input = MediaInput(options["cache_dir"], **limits)
@@ -650,6 +719,9 @@ def main():
     server = None
     try:
         engine = RPC(argv)
+        if vision is not None and prewarm_vision:
+            prewarm = vision.start()
+            print("M31 vision prewarm " + json.dumps(prewarm), file=sys.stderr, flush=True)
         app = Application(engine, tokenizer, args.alias, profile=args.profile, vision=vision, media_input=media_input)
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.daemon_threads = True

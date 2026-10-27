@@ -212,7 +212,12 @@ class M31Service(S.Service):
             rows = mixed_rows(manifest)
             if cancel is not None and cancel.is_set():
                 raise S.ClientGone()
-        ids = PreparedIds(rows, request, rendered, mixed_manifest=manifest)
+        cache_prompt = None
+        if "cache_prompt" in req and int(os.environ.get("M31_PROMPT_CACHE_MIB", "0") or "0") > 0:
+            if not isinstance(req["cache_prompt"], bool):
+                raise ValueError("cache_prompt must be boolean")
+            cache_prompt = req["cache_prompt"]
+        ids = PreparedIds(rows, request, rendered, mixed_manifest=manifest, cache_prompt=cache_prompt)
         if not ids:
             raise ValueError("empty M31 prompt")
         # Common server's convention: omitted/0/-1 output limit means remaining
@@ -293,11 +298,15 @@ def main():
     os.environ.update(environment)
     render = grammar = engine_rpc = http = vision = None
     media_input = None
+    prewarm_vision = False
     vision_config = config.get("vision")
     if vision_config:
         sys.path.insert(0, str(HERE.parent))
         from vision_encoder import VisionEncoder
         options = dict(vision_config)
+        prewarm_vision = options.pop("prewarm", False)
+        if not isinstance(prewarm_vision, bool):
+            raise ValueError("vision prewarm must be boolean")
         limits = options.pop("limits", {})
         media_input = MediaInput(options["cache_dir"], **limits)
         vision = VisionEncoder(**options)
@@ -306,6 +315,9 @@ def main():
         render = PollingRPC(tokenizer_argv, read_timeout=30)
         grammar = PollingRPC(tokenizer_argv, read_timeout=30)
         engine_rpc = PollingRPC(argv)
+        if vision is not None and prewarm_vision:
+            prewarm = vision.start()
+            print("M31 vision prewarm " + json.dumps(prewarm), file=sys.stderr, flush=True)
         service = make_service(engine_rpc, render, grammar, config.get("model_name", "m31-xolotl-common"),
                                vision=vision, media_input=media_input)
         service.api_key = S.api_key_of(config.get("api_key", ""))

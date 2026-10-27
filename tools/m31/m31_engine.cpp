@@ -421,6 +421,9 @@ struct Engine::Impl {
     struct Cache { ggml_tensor * k = nullptr, * v = nullptr, * index = nullptr; };
     std::vector<Cache> cache;
     int64_t capacity = 0, pos = 0;
+    // A checkpoint keeps the token alive, so Engine destruction/address reuse
+    // can never make a checkpoint valid in a different model instance.
+    std::shared_ptr<const void> checkpoint_owner = std::make_shared<uint8_t>(0);
     int last_n = 0;
     bool poisoned = false, ready = false;
     std::vector<float> hidden;
@@ -1409,6 +1412,80 @@ void Engine::reset() {
     p_->clear_dense_decode_cache(true);
     p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false; p_->decode_chain_active = false;
     p_->prefill_chain_active = false;
+}
+
+size_t Engine::prefix_checkpoint_bytes() const {
+    if (!p_->ready || p_->poisoned || p_->pos <= 0) return 0;
+    return size_t(p_->g.kv_bytes(p_->pos));
+}
+
+bool Engine::checkpoint_prefix(size_t maximum_bytes, PrefixCheckpointPtr & out, std::string & error) {
+    try {
+        require(p_->ready && !p_->poisoned && p_->pos > 0 && p_->last_n > 0,
+                "prefix checkpoint requires a completed nonempty forward");
+        const size_t total = prefix_checkpoint_bytes();
+        require(total > 0 && total <= maximum_bytes, "prefix checkpoint exceeds host cache budget");
+        auto checkpoint = std::shared_ptr<PrefixCheckpoint>(new PrefixCheckpoint);
+        checkpoint->owner_ = p_->checkpoint_owner;
+        checkpoint->position_ = p_->pos;
+        checkpoint->bytes_.resize(total);
+        ggml_backend_synchronize(p_->backend);
+        size_t offset = 0;
+        for (const auto & kv : p_->cache) {
+            for (auto * tensor : {kv.k, kv.v, kv.index}) {
+                require(tensor && tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor),
+                        "prefix checkpoint requires contiguous F16 cache tensors");
+                const size_t row_bytes = tensor == kv.index ? tensor->nb[1] : tensor->nb[2];
+                const size_t bytes = row_bytes * size_t(p_->pos);
+                require(bytes <= total - offset, "prefix checkpoint cache layout mismatch");
+                ggml_backend_tensor_get(tensor, checkpoint->bytes_.data() + offset, 0, bytes);
+                offset += bytes;
+            }
+        }
+        require(offset == total, "prefix checkpoint cache byte count mismatch");
+        out = std::move(checkpoint);
+        return true;
+    } catch (const std::exception & exception) { error = exception.what(); return false; }
+}
+
+bool Engine::restore_prefix(const PrefixCheckpointPtr & checkpoint, std::string & error) {
+    bool started = false;
+    try {
+        require(p_->ready && checkpoint && checkpoint->owner_ == p_->checkpoint_owner,
+                "prefix checkpoint belongs to another Engine");
+        const int64_t position = checkpoint->position_;
+        require(position > 0 && position <= p_->cfg.context &&
+                checkpoint->bytes_.size() == size_t(p_->g.kv_bytes(position)),
+                "invalid prefix checkpoint size/context");
+        // Complete all validation before touching current KV or graph state.
+        for (const auto & kv : p_->cache)
+            for (auto * tensor : {kv.k, kv.v, kv.index})
+                require(tensor && tensor->type == GGML_TYPE_F16 && ggml_is_contiguous(tensor),
+                        "prefix restore requires contiguous F16 cache tensors");
+        started = true;
+        reset();
+        p_->poisoned = true;
+        ggml_backend_synchronize(p_->backend);
+        size_t offset = 0;
+        for (const auto & kv : p_->cache) {
+            for (auto * tensor : {kv.k, kv.v, kv.index}) {
+                const size_t bytes = (tensor == kv.index ? tensor->nb[1] : tensor->nb[2]) * size_t(position);
+                ggml_backend_tensor_set(tensor, checkpoint->bytes_.data() + offset, 0, bytes);
+                offset += bytes;
+            }
+        }
+        ggml_backend_synchronize(p_->backend);
+        p_->pos = position;
+        p_->last_n = 0;
+        p_->hidden.clear();
+        p_->poisoned = false;
+        return true;
+    } catch (const std::exception & exception) {
+        // A failed copy may have changed KV. A fresh prefill must start at zero.
+        if (started) reset();
+        error = exception.what();
+        return false;
+    }
 }
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {

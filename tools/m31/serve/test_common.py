@@ -10,6 +10,7 @@ import sys
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
@@ -192,6 +193,19 @@ class BridgeTests(unittest.TestCase):
         self.assertIsInstance(ids, PreparedIds)
         self.assertEqual(grammar.calls, [])
         self.assertEqual(ids.chat_request["messages"][0]["content"], "hi")
+
+    def test_explicit_prompt_cache_optout_survives_common_prepare_and_generate(self):
+        rpc = FakeRPC([done()])
+        service = shim.make_service(rpc, Helper(), Helper())
+        with patch.dict(os.environ, {"M31_PROMPT_CACHE_MIB": "1024"}):
+            ids, _, _ = service.prepare([{"role": "user", "content": "hi"}], None, {}, 1,
+                                        req={"cache_prompt": False})
+            self.assertIs(ids.cache_prompt, False)
+            list(service.engine.generate(ids, 1, {"temperature": 0}, threading.Event()))
+            self.assertIs(rpc.writes[0]["cache_prompt"], False)
+            with self.assertRaisesRegex(ValueError, "cache_prompt"):
+                service.prepare([{"role": "user", "content": "hi"}], None, {}, 1,
+                                req={"cache_prompt": "false"})
 
     def test_common_service_run_finalizes_peg_before_releasing_fifo(self):
         render, grammar = Helper(), Helper()

@@ -1,0 +1,15 @@
+{
+  "adapter": "/mnt/ai/Xolotl-m31-vision/build-vision/m31_vision_adapter",
+  "model": "/mnt/ai/models/MiniMax-M3.1-Flash-GGUF/UD-IQ3_S/MiniMax-M3.1-Flash-UD-IQ3_S-00001-of-00005.gguf",
+  "mmproj": "/mnt/ai/models/MiniMax-M3.1-Flash-GGUF/mmproj-BF16.gguf",
+  "cache_dir": "/mnt/ai/logs/m31-vision/vision-ttft-cache",
+  "backend": "auto",
+  "threads": 16,
+  "cpu_workers": 6,
+  "prewarm": true,
+  "limits": {
+    "video_fps": 1,
+    "allow_http": false,
+    "allow_local": true
+  }
+}

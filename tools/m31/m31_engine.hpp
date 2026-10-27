@@ -55,6 +55,30 @@ public:
     bool forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
                        const float * visual_embeddings, int visual_count,
                        int n, std::string & error);
+    // Exact whole-prefix checkpoint: owned host copies of valid F16 K/V/index
+    // rows only. Checkpoints belong to this initialized Engine; no model math,
+    // weights, live graph pointers or expert-cache entries are serialized.
+    class PrefixCheckpoint {
+    public:
+        ~PrefixCheckpoint() = default;
+        PrefixCheckpoint(const PrefixCheckpoint &) = delete;
+        PrefixCheckpoint & operator=(const PrefixCheckpoint &) = delete;
+        size_t bytes() const { return bytes_.size(); }
+        int64_t position() const { return position_; }
+    private:
+        friend class Engine;
+        PrefixCheckpoint() = default;
+        std::shared_ptr<const void> owner_;
+        int64_t position_ = 0;
+        std::vector<uint8_t> bytes_;
+    };
+    using PrefixCheckpointPtr = std::shared_ptr<const PrefixCheckpoint>;
+    size_t prefix_checkpoint_bytes() const;
+    bool checkpoint_prefix(size_t maximum_bytes, PrefixCheckpointPtr & out, std::string & error);
+    // On success only forward() may consume the restored prefix; logits() has
+    // no last chunk. The caller retains the exact last-prefix logits separately.
+    // Rejected foreign/invalid checkpoints leave the current valid state alone.
+    bool restore_prefix(const PrefixCheckpointPtr & checkpoint, std::string & error);
     // Logits for a consecutive set of rows in the last chunk. Small row slices avoid vocab*n scratch.
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();

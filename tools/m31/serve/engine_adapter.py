@@ -22,12 +22,13 @@ _spec.loader.exec_module(standalone)
 
 class PreparedIds(list):
     """Prompt IDs plus the immutable helper request to replay under the FIFO."""
-    def __init__(self, ids, request, rendered, mixed_manifest=None):
+    def __init__(self, ids, request, rendered, mixed_manifest=None, cache_prompt=None):
         super().__init__(ids)
         # Caller dictionaries may be reused or mutated after prepare().
         self.chat_request = json.loads(json.dumps(request))
         self.rendered = json.loads(json.dumps(rendered))
         self.mixed_manifest = str(Path(mixed_manifest).resolve()) if mixed_manifest else None
+        self.cache_prompt = cache_prompt
 
 
 class PollingRPC(standalone.RPC):
@@ -166,8 +167,10 @@ class M31Engine:
             expected_tokens = ids.rendered.get("tokens", list(ids)) if ids.mixed_manifest else list(ids)
             if rendered["tokens"] != expected_tokens:
                 raise RuntimeError("M31 template/token IDs changed between prepare and generation")
-            params, _ = standalone.request_parameters(
-                {**(sampling or {}), "n_predict": int(max_new)}, self.max_context, len(ids))
+            request_sampling = {**(sampling or {}), "n_predict": int(max_new)}
+            if ids.cache_prompt is not None:
+                request_sampling["cache_prompt"] = ids.cache_prompt
+            params, _ = standalone.request_parameters(request_sampling, self.max_context, len(ids))
             params.update(tokens=expected_tokens, interactive=True,
                           grammar_check=bool(rendered.get("grammar_active")),
                           stop_ids=self.grammar.ready.get("eog", []),

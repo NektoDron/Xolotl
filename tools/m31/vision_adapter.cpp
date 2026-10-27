@@ -38,6 +38,7 @@ int main(int argc, char ** argv) {
     if (argc != 3) { std::cerr << "usage: vision_adapter SPEC.json NEW_OUTPUT_DIR | --worker CONFIG.json\n"; return 2; }
     const bool worker = std::string(argv[1]) == "--worker";
     try {
+        const auto startup_start = std::chrono::steady_clock::now();
         std::ifstream input(worker ? argv[2] : argv[1]);
         json config; input >> config;
         const std::string backend = config.value("backend", std::string("cpu"));
@@ -57,6 +58,8 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(spec.at("model").get<std::string>().c_str(), mp), llama_model_free);
         if (!model) throw std::runtime_error("vocabulary loading failed");
+        const double vocab_load_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-startup_start).count();
+        const auto context_init_start = std::chrono::steady_clock::now();
         auto params = mtmd_context_params_default();
         params.use_gpu = backend == "cuda"; params.device = nullptr; params.warmup = false;
         std::string backend_device = "CPU";
@@ -75,6 +78,7 @@ int main(int argc, char ** argv) {
             mtmd_init_from_file(spec.at("mmproj").get<std::string>().c_str(), model.get(), params), mtmd_free);
         if (!ctx || !mtmd_support_vision(ctx.get()) || mtmd_decode_use_mrope(ctx.get()))
             throw std::runtime_error("requires ordinary-position MiniMax vision encoder");
+        const double context_init_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-context_init_start).count();
         const int cpu_workers = backend == "cpu" ? config.value("cpu_workers", 1) : 1;
         if (cpu_workers < 1 || cpu_workers > 16) throw std::runtime_error("cpu_workers must be 1..16");
         std::vector<std::unique_ptr<mtmd_context, decltype(&mtmd_free)>> contexts;
@@ -83,6 +87,22 @@ int main(int argc, char ** argv) {
         std::unordered_map<std::string, std::vector<float>> embedding_cache;
         std::deque<std::string> cache_order;
         auto process = [&](const json & spec, const fs::path & out) {
+        const bool trace = spec.value("ttft_trace", false);
+        const auto process_start = std::chrono::steady_clock::now();
+        auto elapsed = [](auto started) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-started).count(); };
+        json timings = json::object();
+        std::atomic<int64_t> compute_ns{0}, write_ns{0}, validate_copy_ns{0};
+        auto save_f32 = [&](const fs::path & path, const float * data, size_t count) {
+            const auto begin = std::chrono::steady_clock::now();
+            save(path, data, count);
+            if (trace) write_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count());
+        };
+        auto encode_single = [&](mtmd_context * local, const mtmd_input_chunk * chunk) {
+            const auto begin = std::chrono::steady_clock::now();
+            const int result = mtmd_encode_chunk(local, chunk);
+            if (trace) compute_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count());
+            return result;
+        };
         if (!fs::create_directory(out)) throw std::runtime_error("output exists; use a new path");
         std::string prompt;
         if (spec.contains("prompt")) prompt = spec.at("prompt").get<std::string>();
@@ -105,6 +125,7 @@ int main(int argc, char ** argv) {
         std::vector<std::unique_ptr<Media>> owners;
         std::vector<const mtmd_bitmap *> bitmaps;
         json media_meta = json::array();
+        const auto media_start = std::chrono::steady_clock::now();
         for (const auto & path : spec.at("media")) {
             auto media = std::make_unique<Media>();
             const auto name = path.get<std::string>();
@@ -119,10 +140,13 @@ int main(int argc, char ** argv) {
             bitmaps.push_back(media->value.bitmap);
             owners.push_back(std::move(media));
         }
+        if (trace) timings["media_file_read_decode_ms"] = elapsed(media_start);
+        const auto tokenize_start = std::chrono::steady_clock::now();
         std::unique_ptr<mtmd_input_chunks, decltype(&mtmd_input_chunks_free)> chunks(mtmd_input_chunks_init(), mtmd_input_chunks_free);
         mtmd_input_text text{prompt.data(), prompt.size(), spec.value("add_special", false), true};
         if (mtmd_tokenize(ctx.get(), chunks.get(), &text, bitmaps.data(), bitmaps.size()))
             throw std::runtime_error("mtmd_tokenize failed");
+        if (trace) timings["mtmd_tokenize_preprocess_and_video_frames_ms"] = elapsed(tokenize_start);
         // vocab_only deliberately skips model hyperparameters; n_embd_inp() is
         // zero in that mode. Read the audited GGUF scalar without loading weights.
         char embd_meta[64]{};
@@ -141,6 +165,7 @@ int main(int argc, char ** argv) {
         size_t row = 0, visual_row = 0;
         std::vector<const mtmd_input_chunk *> images;
         std::vector<size_t> image_indices;
+        const auto chunks_start = std::chrono::steady_clock::now();
         for (size_t i=0; i<mtmd_input_chunks_size(chunks.get()); ++i) {
             const auto * chunk = mtmd_input_chunks_get(chunks.get(), i);
             const auto n = mtmd_input_chunk_get_n_tokens(chunk);
@@ -178,6 +203,8 @@ int main(int argc, char ** argv) {
             manifest["chunks"].push_back(part);
             row += n;
         }
+        if (trace) timings["chunk_metadata_serialize_files_ms"] = elapsed(chunks_start);
+        const auto cache_start = std::chrono::steady_clock::now();
         size_t cached_images = 0;
         if (encode && cache_limit) {
             std::vector<const mtmd_input_chunk *> pending;
@@ -187,12 +214,13 @@ int main(int argc, char ** argv) {
                 const auto key = part["id"].get<std::string>() + ":" + std::to_string(part["rows"].get<size_t>()) + ":" + std::to_string(opt.video_params.fps_target);
                 auto found = embedding_cache.find(key);
                 if (found != embedding_cache.end()) {
-                    save(out/part["embeddings"].get<std::string>(), found->second.data(), found->second.size());
+                    save_f32(out/part["embeddings"].get<std::string>(), found->second.data(), found->second.size());
                     ++cached_images;
                 } else { pending.push_back(images[j]); pending_indices.push_back(image_indices[j]); }
             }
             images.swap(pending); image_indices.swap(pending_indices);
         }
+        if (trace) timings["embedding_cache_lookup_copy_ms"] = elapsed(cache_start);
         std::vector<std::vector<float>> cache_updates(images.size());
         const auto init_start = std::chrono::steady_clock::now();
         const int active_workers = encode ? std::min(cpu_workers, int(images.size())) : 0;
@@ -206,12 +234,17 @@ int main(int argc, char ** argv) {
         manifest["active_workers"] = active_workers;
         const auto encode_start = std::chrono::steady_clock::now();
         auto save_embedding = [&](size_t j, const float * values) {
+            const auto begin = std::chrono::steady_clock::now();
+            int64_t local_write_ns = 0;
             const auto count = mtmd_input_chunk_get_n_tokens(images[j]) * size_t(embd);
             if (!values) throw std::runtime_error("missing encoder output");
             for (size_t k=0; k<count; ++k) if (!std::isfinite(values[k])) throw std::runtime_error("nonfinite embedding");
             const auto name = static_cast<const json &>(manifest)["chunks"][image_indices[j]]["embeddings"].get<std::string>();
-            save(out/name, values, count);
+            const auto write_begin = std::chrono::steady_clock::now();
+            save_f32(out/name, values, count);
+            local_write_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-write_begin).count();
             if (count*sizeof(float) <= cache_limit) cache_updates[j].assign(values, values+count);
+            if (trace) validate_copy_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-begin).count() - local_write_ns);
         };
         if (encode && cpu_workers > 1 && images.size() > 1) {
             // Each worker owns an independent mtmd context/scheduler. The source
@@ -227,7 +260,7 @@ int main(int argc, char ** argv) {
                     for (;;) {
                         const size_t j = next.fetch_add(1);
                         if (j >= images.size()) break;
-                        if (mtmd_encode_chunk(local, images[j])) throw std::runtime_error("parallel encoder computation failed");
+                        if (encode_single(local, images[j])) throw std::runtime_error("parallel encoder computation failed");
                         save_embedding(j, mtmd_get_output_embd(local));
                     }
                 } catch (...) {
@@ -241,7 +274,7 @@ int main(int argc, char ** argv) {
             for (auto i : image_indices) manifest["encoder_batches"].push_back(json::array({i}));
         } else if (encode && encoder_mode == "single") {
             for (size_t j=0; j<images.size(); ++j) {
-                if (mtmd_encode_chunk(ctx.get(), images[j])) throw std::runtime_error("single-chunk encoder computation failed");
+                if (encode_single(ctx.get(), images[j])) throw std::runtime_error("single-chunk encoder computation failed");
                 save_embedding(j, mtmd_get_output_embd(ctx.get()));
                 manifest["encoder_batches"].push_back(json::array({image_indices[j]}));
             }
@@ -255,7 +288,9 @@ int main(int argc, char ** argv) {
                     if (end == first || rc == 1) throw std::runtime_error("cannot batch image");
                     break;
                 }
+                const auto compute_begin = std::chrono::steady_clock::now();
                 if (mtmd_batch_encode(batch.get())) throw std::runtime_error("encoder computation failed");
+                if (trace) compute_ns.fetch_add(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compute_begin).count());
                 json group = json::array();
                 for (size_t j=first; j<end; ++j) {
                     save_embedding(j, mtmd_batch_get_output_embd(batch.get(), images[j]));
@@ -280,21 +315,40 @@ int main(int argc, char ** argv) {
         manifest["cached_image_chunks"] = cached_images;
         manifest["encode_seconds"] = encode ? std::chrono::duration<double>(std::chrono::steady_clock::now()-encode_start).count() : 0;
         manifest["rows"] = row; manifest["visual_rows"] = visual_row;
+        if (trace) {
+            timings["parallel_worker_init_ms"] = manifest["worker_init_seconds"].get<double>()*1000;
+            timings["encode_including_files_cache_wall_ms"] = manifest["encode_seconds"].get<double>()*1000;
+            timings["encode_compute_thread_sum_ms"] = double(compute_ns.load())/1e6;
+            timings["f32_write_thread_sum_ms"] = double(write_ns.load())/1e6;
+            timings["f32_validate_cache_copy_thread_sum_ms"] = double(validate_copy_ns.load())/1e6;
+            timings["process_before_manifest_ms"] = elapsed(process_start);
+            manifest["timings_ms"] = timings;
+        }
+        const auto manifest_start = std::chrono::steady_clock::now();
         std::ofstream result(out/"manifest.json"); result << manifest.dump(2) << '\n';
+        result.close();
         if (!result) throw std::runtime_error("cannot save manifest");
-        return json({{"ok", true}, {"manifest", (out/"manifest.json").string()}, {"rows", row}, {"visual_rows", visual_row}, {"image_chunks", images.size()+cached_images}, {"encoded", encode}});
+        json reply = {{"ok", true}, {"manifest", (out/"manifest.json").string()}, {"rows", row}, {"visual_rows", visual_row}, {"image_chunks", images.size()+cached_images}, {"encoded", encode}};
+        if (trace) {
+            timings["manifest_json_write_ms"] = elapsed(manifest_start);
+            timings["process_total_ms"] = elapsed(process_start);
+            reply["timings_ms"] = timings;
+        }
+        return reply;
         };
         if (!worker) {
             std::cout << process(config, fs::absolute(argv[2])).dump() << '\n';
         } else {
-            std::cout << json({{"ready", true}, {"backend", backend}, {"cpu_workers", cpu_workers}}).dump() << std::endl;
+            json ready = {{"ready", true}, {"backend", backend}, {"cpu_workers", cpu_workers}};
+            if (std::getenv("M31_TTFT_TRACE")) ready["startup_stages_ms"] = {{"vocab_and_backend_init_ms", vocab_load_ms}, {"encoder_context_init_ms", context_init_ms}};
+            std::cout << ready.dump() << std::endl;
             std::string line;
             while (std::getline(std::cin, line)) {
                 try {
                     const auto request = json::parse(line);
                     json merged = config;
                     // Model/backend/context settings are fixed for the worker lifetime.
-                    for (const char * key : {"prompt", "messages", "media", "video_fps", "timestamp_interval_ms", "encode", "add_special", "enable_thinking", "chat_template_kwargs", "encoder_mode"})
+                    for (const char * key : {"prompt", "messages", "media", "video_fps", "timestamp_interval_ms", "encode", "add_special", "enable_thinking", "chat_template_kwargs", "encoder_mode", "ttft_trace"})
                         if (request.contains(key)) merged[key] = request[key];
                     std::cout << process(merged, fs::absolute(request.at("out").get<std::string>())).dump() << std::endl;
                 } catch (const std::exception & e) {

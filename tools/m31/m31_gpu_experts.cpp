@@ -3,6 +3,7 @@
 #include "cache_seed_receipt.hpp"
 #include "prefill_pipeline.hpp"
 #include "prefill_background.hpp"
+#include "prefill_route_history.hpp"
 #include "prefill_layer_banks.hpp"
 #include "gpu_native_gu.hpp"
 #include "cpu_pack_spans.hpp"
@@ -116,6 +117,7 @@ struct GpuExperts::Impl {
     struct PendingPrefetch { uint64_t key; size_t slot; };
     std::vector<PendingPrefetch> pending_prefetch;
     std::vector<std::vector<int>> prefetch_order;
+    std::unique_ptr<PrefillRouteHistory> prefetch_history;
     std::unique_ptr<Context> slot_metadata;
     ggml_tensor * pool_proxy = nullptr;
     std::vector<ggml_tensor *> slot_proxies;
@@ -215,6 +217,31 @@ struct GpuExperts::Impl {
         ++stat.evictions;
         return slot;
     }
+    void observe_routes(int layer, int n, const std::vector<uint8_t> & selected) {
+        // Prediction affects only a speculative future upload. Actual routes
+        // below still enter load() unconditionally, including history misses.
+        if (prefetch_history) prefetch_history->remember(size_t(layer), n, selected);
+        if (!profile) return;
+        size_t required = 0, used = 0, unused = 0;
+        const auto & raw = layers[size_t(layer)].raw_bytes;
+        const uint64_t expert_bytes = uint64_t(raw[0]) + raw[1] + raw[2];
+        for (auto value : selected) required += value != 0;
+        for (const auto & pending : pending_prefetch) {
+            if (pending.key / uint64_t(g.experts) != uint64_t(layer)) continue;
+            const size_t expert = size_t(pending.key % uint64_t(g.experts));
+            if (selected[expert]) ++used; else ++unused;
+        }
+        stat.required_experts += required;
+        stat.required_bytes += required * expert_bytes;
+        stat.prefetch_used_experts += used;
+        stat.prefetch_unused_experts += unused;
+        stat.prefetch_used_bytes += used * expert_bytes;
+        stat.prefetch_unused_bytes += unused * expert_bytes;
+        if (n > 1) std::fprintf(stderr,
+            "M31 GPU route demand layer=%d n=%d required=%zu required_bytes=%llu predicted_used=%zu predicted_unused=%zu predicted_bytes=%llu history=%d\n",
+            layer,n,required,(unsigned long long)(required*expert_bytes),used,unused,
+            (unsigned long long)((used+unused)*expert_bytes),int(bool(prefetch_history)));
+    }
     void begin_prefetch(int layer, int n, const std::set<uint64_t> & current_keys) {
 #ifdef M31_REGISTERED_ARENA_CUDA
         if(layer_banks){
@@ -234,7 +261,13 @@ struct GpuExperts::Impl {
             if (entries.count(key(next,expert))) protected_keys.insert(key(next,expert));
         std::vector<BackgroundPrefillUploads::Job> jobs;
         jobs.reserve(size_t(g.experts));
+        const bool history_known = prefetch_history && prefetch_history->has(size_t(next));
+        if (profile && history_known) ++stat.prefetch_history_batches;
         for (const int expert:prefetch_order[size_t(next)]) {
+            if (prefetch_history && !prefetch_history->predicts(size_t(next), size_t(expert))) {
+                if (profile) ++stat.prefetch_history_skipped_experts;
+                continue;
+            }
             if (prefetch_limit && jobs.size()>=prefetch_limit) break;
             const auto id=key(next,expert);
             if (entries.count(id)) continue;
@@ -648,6 +681,8 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
         check(count<=uint64_t(g.experts),"prefetch limit exceeds experts per layer");
         p_->prefetch_limit=size_t(count);
     }
+    if (const char * history = std::getenv("M31_GPU_PREFETCH_HISTORY"); history && std::string(history) == "1")
+        p_->prefetch_history = std::make_unique<PrefillRouteHistory>(size_t(g.layers), size_t(g.experts));
     p_->prefetch_order.resize(size_t(g.layers));
     for (auto & order:p_->prefetch_order) {
         order.resize(size_t(g.experts));
@@ -903,6 +938,7 @@ void GpuExperts::forward_into(int layer, int n, const std::vector<float> & x,
         // Keep N+1 DMA in flight through its dense attention graph. Publish its
         // entries before any load/reservation can reuse a reserved destination.
         // A failed wait is handled by the same drain-and-discard recovery below.
+        p_->observe_routes(layer, n, selected_mask);
         p_->finish_prefetch();
         if (p_->uploads) p_->uploads->begin_batch();
         std::vector<int32_t> expert_to_slot(size_t(g.experts), -1);
@@ -1042,6 +1078,12 @@ void GpuExperts::print_profile(const char * label) const {
         1000*s.prepare_seconds, 1000*s.pack_seconds, 1000*s.upload_submit_seconds,
         1000*s.upload_wait_seconds, 1000*s.execute_seconds, 1000*s.gate_seconds,
         1000*s.up_seconds, 1000*s.oai_seconds, 1000*s.down_seconds, 1000*s.reduce_seconds);
+    if (p_->profile) std::fprintf(stderr,
+        "M31 GPU route demand profile label=%s required_experts=%llu required_bytes=%llu predicted_used=%llu predicted_unused=%llu predicted_used_bytes=%llu predicted_unused_bytes=%llu history_batches=%llu history_skipped=%llu\n",
+        label?label:"live",(unsigned long long)s.required_experts,(unsigned long long)s.required_bytes,
+        (unsigned long long)s.prefetch_used_experts,(unsigned long long)s.prefetch_unused_experts,
+        (unsigned long long)s.prefetch_used_bytes,(unsigned long long)s.prefetch_unused_bytes,
+        (unsigned long long)s.prefetch_history_batches,(unsigned long long)s.prefetch_history_skipped_experts);
     std::fprintf(stderr, "M31 GPU prefetch profile label=%s batches=%llu experts=%llu bytes=%llu join_host_ms=%.3f pack_host_ms=%.3f staging_wait_host_ms=%.3f submit_host_ms=%.3f\n",
         label?label:"live",(unsigned long long)s.prefetch_batches,(unsigned long long)s.prefetched_experts,
         (unsigned long long)s.prefetch_bytes,1000*s.prefetch_wait_seconds,1000*s.prefetch_pack_seconds,
