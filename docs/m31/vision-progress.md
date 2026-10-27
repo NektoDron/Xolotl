@@ -1,3 +1,20 @@
+# MiniMax-M3.1: TTFT разобран, оптимизации opt-in
+
+27.10.2026. Функциональный commit342bcc74, отчёт
+`/mnt/ai/logs/m31-vision/REPORT-ttft.final.md`.
+Текст515 TTFT3.072с, PNGwarm3.139с: примерно2.97с занимает самprefill,
+143GB обязательных экспертных весов идутпоPCIe. Общийunseen<1сне достигнут.
+Historyprefetch убрал20.33GB лишнегоDMA: PNGwarm2.727с/newquestion2.734с,
+безKVreuse. Prewarm перенёс1.47сworkerinitвstartup:firstPNG4.765→3.067с.
+ExactwholepromptKVcache отдельно: PNG0.096–0.103с/video0.270–0.275с;
+новыйpromptmiss,cache_promptfalseбypass, памятьhostLRU<=1GiB.
+Gate9012allrowlogitsпобитно+3GPUcheckpointcontinuationPASS, HTTPvision6/tools3PASS.
+CPU/CUDApost-mergebuildPASS, ELFunchanged; своиunitsзакончены,presetснят,
+GPU0/GPU1майнят,duty8084healthy,prod/port7неизменены,localcommitsбезpush.
+Профили `tools/m31/profiles/vision-ttft*.json`, encoderexample prewarmtrue.
+
+---
+
 # MiniMax-M3.1: vision принят
 
 27.10.2026. Ветка `aiserver/m31-vision`, функциональный код `23ccb294`.
