@@ -1,0 +1,19 @@
+{
+  "format": "m31-runtime-profile-v1",
+  "name": "exact-debug",
+  "inherits": "native-gpu.json",
+  "description": "Явная CPU-exact проверка FFN с возвратами промежуточных F32 в RAM; диагностический режим.",
+  "environment": {
+    "M31_GPU_EXACT": "1",
+    "M31_GPU_PREFILL_CHAIN": "0",
+    "M31_GPU_FAST_FFN": "0",
+    "M31_GPU_CPU_QUANTS": "1"
+  },
+  "requires": {
+    "STRATA_M31_CPU_QUANTS_CUDA": true
+  },
+  "numeric_contract": {
+    "oracle": "CPU-strict llama.cpp PR31192",
+    "purpose": "Opt-in numerical debugging; no native performance or full-quality claim."
+  }
+}
