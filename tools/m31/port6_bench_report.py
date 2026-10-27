@@ -13,10 +13,19 @@ LATEST_TG_MIN = 25.0
 LATEST_GOALS_PROVENANCE = 'Explicit human coordinator steering for resumed port6: generation >=25 t/s at every context. This reporting override does not edit frozen manifest goals or measured timings.'
 
 
+class DiagnosticLog:
+    """Native stderr can interleave raw UTF8 token pieces; preserve raw file."""
+    def __init__(self, path):
+        self.path = path
+
+    def open(self):
+        return self.path.open(encoding='utf-8', errors='replace')
+
+
 
 def fast_profiles(path):
     latest, previous, requests = {}, {}, []
-    for number, line in enumerate(path.read_text().splitlines(), 1):
+    for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
         if line.startswith('M31 fast FFN profile '):
             latest = {key: float(value) for key, value in re.findall(r'(\w+)=(-?\d+(?:\.\d+)?)', line)}
         elif line.startswith('M31 request timings '):
@@ -60,7 +69,7 @@ def main():
     prefix = sessions[0].with_suffix('')
     session = json.loads(Path(str(prefix) + '.result.json').read_text())
     result = {'format': 'm31-port6-bench-report-v1', 'manifest': manifest, 'session_result': session,
-              'profile': stages(Path(str(prefix) + '.server.log')),
+              'profile': stages(DiagnosticLog(Path(str(prefix) + '.server.log'))),
               'fast_ffn_profile': fast_profiles(Path(str(prefix) + '.server.log')),
               'telemetry': telemetry(Path(str(prefix) + '.telemetry.jsonl')),
               'applied_goals': {'pp32k_min': 1000.0, 'tg_each_depth_min': LATEST_TG_MIN,
@@ -106,7 +115,8 @@ def main():
                                       'matching_environment': long['environment'] == manifest['environment'],
                                       'matching_unset_environment': long['unset_inherited_environment'] == manifest['unset_inherited_environment'],
                                       'matching_build_receipt': long.get('build_receipt', {}).get('sha256') == manifest.get('build_receipt', {}).get('sha256') if long.get('build_receipt') and manifest.get('build_receipt') else None}
-    result['limits'] = ['Two repetitions do not establish statistical significance.',
+    result['limits'] = ['Raw stderr logs are preserved; diagnostic text decoding replaces invalid UTF8 token fragments. Numeric and quality JSON remain strictly parsed.',
+                        'Two repetitions do not establish statistical significance.',
                         'F16 native KV differs from llama.cpp reference Q8_0.',
                         'Generation acceptance floor is >=25 t/s at every depth under latest explicit steering; port5 ratios remain diagnostic comparison.',
                         'No overall acceptance is inferred from missing numeric, speed, quality or source evidence.']
