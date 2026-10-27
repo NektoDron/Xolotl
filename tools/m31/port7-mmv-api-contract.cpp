@@ -35,7 +35,7 @@ int main() {
             return weight;
         };
         rejected(nullptr); check(!ggml_cuda_mul_mat_is_exact_mmv(nullptr),"null getter");
-        for (auto type : {GGML_TYPE_F32,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0}) for (int k : {1,2,3,4}) {
+        for (auto type : {GGML_TYPE_F32,GGML_TYPE_Q4_K,GGML_TYPE_Q5_K,GGML_TYPE_Q6_K,GGML_TYPE_Q8_0}) for (int k : {1,2,3,4}) {
             auto * w = bind(ggml_new_tensor_2d(context,type,6144,128));
             auto * x = ggml_new_tensor_2d(context,GGML_TYPE_F32,6144,k);
             auto * node = ggml_mul_mat(context,w,x); ggml_prec_set_acc(node,GGML_PREC_F32);
@@ -51,7 +51,7 @@ int main() {
         }
         auto * w = bind(ggml_new_tensor_2d(context,GGML_TYPE_F32,6144,128));
         for (int k : {5,8}) rejected(ggml_mul_mat(context,w,ggml_new_tensor_2d(context,GGML_TYPE_F32,6144,k)));
-        for (auto type : {GGML_TYPE_F16,GGML_TYPE_Q4_K})
+        for (auto type : {GGML_TYPE_F16,GGML_TYPE_Q2_K})
             rejected(ggml_mul_mat(context,bind(ggml_new_tensor_2d(context,type,6144,128)),ggml_new_tensor_2d(context,GGML_TYPE_F32,6144,4)));
         // Actual engine score geometry: CAST(index KV F16→F32)[128,nk] x
         // flattened index heads[128,4], all ne2=1. This is a computed operand,
