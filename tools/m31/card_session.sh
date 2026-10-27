@@ -3,6 +3,7 @@
 set -euo pipefail
 M31_ROOT=/mnt/ai/Xolotl-m31
 M31_JOB=$(realpath "$1")
+M31_PRESET_HELPER="${M31_JOB%.json}.preset.py"
 M31_STEM=$(basename "$M31_JOB" .json)
 M31_PRESET=$(python3 - "$M31_JOB" <<'PY'
 import json, sys
@@ -34,10 +35,14 @@ M31_UP_STARTED=0
 trap 'M31_STOP=1' INT TERM
 cleanup() {
     # up's wait has completed before reaching EXIT, including a received TERM/INT.
-    if [ "$M31_UP_STARTED" = 1 ]; then sudo aictl down; fi
-    if [ "$M31_INSTALLED" = 1 ]; then
-        sudo python3 "$M31_ROOT/tools/m31/card_preset.py" rollback "$M31_BACKUP" "$M31_PRESET"
+    local cleanup_rc=0
+    if [ "$M31_UP_STARTED" = 1 ]; then
+        sudo aictl down "$M31_PRESET" --if-owned || cleanup_rc=$?
     fi
+    if [ "$M31_INSTALLED" = 1 ]; then
+        sudo python3 "$M31_PRESET_HELPER" rollback "$M31_BACKUP" "$M31_PRESET" || cleanup_rc=$?
+    fi
+    return "$cleanup_rc"
 }
 trap cleanup EXIT
 python3 - <<'PY'
@@ -47,10 +52,10 @@ state = json.loads(Path('/var/lib/aictl/state.json').read_text())
 if state.get('active'):
     raise RuntimeError('another model is active; refusing to touch it: ' + state['active'])
 PY
-sudo python3 "$M31_ROOT/tools/m31/card_preset.py" put "$M31_BACKUP" "$M31_JOB"
+sudo python3 "$M31_PRESET_HELPER" put "$M31_BACKUP" "$M31_JOB"
 M31_INSTALLED=1
 M31_UP_STARTED=1
-sudo aictl up "$M31_PRESET" &
+sudo aictl up "$M31_PRESET" --no-switch &
 M31_UP_PID=$!
 M31_UP_RC=0
 # Interrupted wait is retried until the actual up process has returned.

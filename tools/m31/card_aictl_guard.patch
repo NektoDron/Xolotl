@@ -1,0 +1,31 @@
+--- a/aictl
++++ b/aictl
+@@ -865,9 +865,11 @@
+         "--json", action="store_true", dest="as_json")
+     p_up = sub.add_parser("up", help="поднять модель на картах (гасит майнер)")
+     p_up.add_argument("name")
++    p_up.add_argument("--no-switch", action="store_true", help="refuse to replace an active model")
+     p_up.add_argument("--force", action="store_true", help="не смотреть на бюджет простоя")
+     p_dn = sub.add_parser("down", help="убрать модель и вернуть майнер")
+     p_dn.add_argument("name", nargs="?")
++    p_dn.add_argument("--if-owned", action="store_true", help="stop only if active is this preset or empty")
+     sub.add_parser("gc", help="отдать карты, если модель простаивает (по таймеру)")
+     p_mn = sub.add_parser("miner", help="прямое управление майнером")
+     p_mn.add_argument("action", choices=["start", "stop"])
+@@ -899,8 +901,16 @@
+     if args.cmd == "status":
+         return status(cfg, st, args.as_json)
+     if args.cmd == "up":
++        if args.no_switch and st.get("active") not in (None, args.name):
++            die("refusing to replace active model: " + str(st["active"]))
+         return model_up(cfg, st, args.name, args.force)
+     if args.cmd == "down":
++        if args.if_owned:
++            if not args.name:
++                die("--if-owned requires a preset name")
++            if st.get("active") not in (None, args.name):
++                print("aictl: foreign active model retained: " + str(st["active"]))
++                return 0
+         return model_down(cfg, st, args.name)
+     if args.cmd == "gc":
+         return gc(cfg, st)

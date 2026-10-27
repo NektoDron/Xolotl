@@ -15,6 +15,12 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,180}", args.unit):
         parser.error("invalid systemd unit name")
+    for command, flag in (("up", "--no-switch"), ("down", "--if-owned")):
+        help_text = subprocess.run(["aictl", command, "--help"], check=True,
+                                   capture_output=True, text=True).stdout
+        if flag not in help_text:
+            parser.error("aictl lacks atomic ownership guard " + flag +
+                         "; install card_aictl_guard.patch before launching jobs")
     job = args.job.resolve(strict=True)
     invalidated = job.parent / 'INVALIDATED.json'
     if invalidated.exists():
@@ -28,6 +34,16 @@ def main():
     if job.with_suffix(".result.json").exists():
         parser.error("job already has a result; prepare a fresh job")
     source = Path(__file__).with_name("card_session.sh")
+    helpers = {}
+    for name in ("card_worker.py", "card_preset.py"):
+        helper_source = source.with_name(name)
+        helper_target = job.with_suffix("." + name.removeprefix("card_"))
+        helper_data = helper_source.read_bytes()
+        with helper_target.open("xb") as stream:
+            stream.write(helper_data)
+        helper_target.chmod(0o444)
+        helpers[name] = {"snapshot": str(helper_target),
+                         "sha256": hashlib.sha256(helper_data).hexdigest()}
     frozen = job.with_suffix(".runner.sh")
     data = source.read_bytes()
     with frozen.open("xb") as stream:
@@ -36,9 +52,11 @@ def main():
     with job.with_suffix(".launcher.json").open("x") as stream:
         json.dump({"source": str(source), "snapshot": str(frozen), "job": str(job),
                    "sha256": hashlib.sha256(data).hexdigest(),
+                   "helpers": helpers,
                    "measurement": spec.get("measurement", True)}, stream, indent=2)
         stream.write("\n")
     subprocess.run(["sudo", "systemd-run", "--unit=" + args.unit, "-p", "User=nekto",
+                    "-p", "KillMode=mixed", "-p", "TimeoutStopSec=600",
                     "/bin/bash", str(frozen), str(job)], check=True)
 
 

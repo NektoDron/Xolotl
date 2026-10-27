@@ -24,13 +24,16 @@ with open('/run/aictl.lock', 'a') as lock:
             raise RuntimeError('use a fresh backup path')
         shutil.copy2(config, backup)
         job = str(Path(sys.argv[3]).resolve())
+        worker = Path(job).with_suffix('.worker.py')
+        if not worker.is_file():
+            raise RuntimeError('missing frozen worker: ' + str(worker))
         current['models'][name] = {
             'desc': 'временный M31 experimental batch/server, только GPU0', 'gpu': '0', 'port': 8179,
             'start': ['systemd-run', '--collect', '--unit=' + unit, '-p', 'User=nekto',
-                      '-p', 'LimitCORE=0',
+                      '-p', 'LimitCORE=0', '-p', 'KillMode=mixed', '-p', 'TimeoutStopSec=600',
                       '-p', 'StandardOutput=append:/mnt/ai/logs/m31-port/card-worker.log',
                       '-p', 'StandardError=append:/mnt/ai/logs/m31-port/card-worker.log',
-                      '/usr/bin/python3', '/mnt/ai/Xolotl-m31/tools/m31/card_worker.py', job],
+                      '/usr/bin/python3', str(worker), job],
             'stop': ['systemctl', 'stop', unit],
             'check': ['systemctl', 'is-active', '--quiet', unit],
             'ready_url': 'http://127.0.0.1:8179/health',
@@ -48,4 +51,4 @@ with open('/run/aictl.lock', 'a') as lock:
     os.chmod(temporary, config.stat().st_mode & 0o777)
     os.replace(temporary, config)
 print('Бэкап:', backup)
-print('Откат: sudo python3 /mnt/ai/Xolotl-m31/tools/m31/card_preset.py rollback ' + str(backup) + ' ' + name)
+print('Откат: sudo python3 ' + str(Path(__file__).resolve()) + ' rollback ' + str(backup) + ' ' + name)
