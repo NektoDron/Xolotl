@@ -30,7 +30,10 @@ with open('/run/aictl.lock', 'a') as lock:
         current['models'][name] = {
             'desc': 'временный M31 experimental batch/server, только GPU0', 'gpu': '0', 'port': 8179,
             'start': ['systemd-run', '--collect', '--unit=' + unit, '-p', 'User=nekto',
-                      '-p', 'LimitCORE=0', '-p', 'KillMode=mixed', '-p', 'TimeoutStopSec=600',
+                      # This unit owns every model subprocess, including nested
+                      # process groups. The controller uses mixed to protect its
+                      # aictl up child; the worker must terminate all readers.
+                      '-p', 'LimitCORE=0', '-p', 'KillMode=control-group', '-p', 'TimeoutStopSec=600',
                       '-p', 'StandardOutput=append:/mnt/ai/logs/m31-port/card-worker.log',
                       '-p', 'StandardError=append:/mnt/ai/logs/m31-port/card-worker.log',
                       '/usr/bin/python3', str(worker), job],
