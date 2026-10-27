@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Opt-in M31 shim for the repository's common OpenAI/Anthropic server.
 
-Text prototype; the accepted standalone tools/m31/serve_m31.py stays intact.
+Optional vision bridge; both HTTP adapters use the same native mixed-row protocol.
 The tokenizer, template, and PEG parser remain the pinned PR vocab helper.
 """
 from __future__ import annotations
@@ -21,7 +21,8 @@ sys.path.insert(0, str(HERE))
 
 from engine_adapter import M31Engine, PollingRPC, PreparedIds, standalone  # noqa: E402
 from serve import server as S  # noqa: E402
-from serve.frontend import Event, ToolCall, images_of  # noqa: E402
+from serve.frontend import Event, ToolCall  # noqa: E402
+from vision_http import MediaInput, MARKER, install_video_reader, mixed_rows  # noqa: E402
 
 
 def helper_call(rpc, request):
@@ -41,8 +42,6 @@ def openai_tools(tools):
 def chat_request(messages, tools, kwargs, req=None):
     req = req or {}
     standalone.validate_messages(messages)
-    if images_of(messages):
-        raise ValueError("M31 common text prototype does not support images/video yet")
     raw_choice = req.get("tool_choice", "auto")
     choice = S.tool_choice_of(raw_choice)[0]
     if choice not in ("auto", "none"):
@@ -153,17 +152,25 @@ class HelperOutputParser:
 
 
 class M31Service(S.Service):
-    def __init__(self, engine, render_rpc, grammar_rpc, model_name="m31-xolotl-common"):
+    def __init__(self, engine, render_rpc, grammar_rpc, model_name="m31-xolotl-common", vision=None, media_input=None):
         self.render_rpc = render_rpc
         tokenizer = HelperTokenizer(render_rpc)
         super().__init__(engine, tokenizer, HelperTemplate(render_rpc), model_name=model_name,
                          fit_max_tokens=True)
         self.stop_ids = set(grammar_rpc.ready.get("eog", []))
         self.render_lock = threading.Lock()
+        self.vision = vision
+        self.media_input = media_input
+        self.engine.info["vision"] = vision is not None
 
     def encode_prompt(self, messages, tools, kwargs):
         # Token-count endpoints must use the same PR chat token IDs, including
         # its own special-token escaping, rather than Qwen's literal-tag shim.
+        if any(isinstance(m.get("content"), list) and any(isinstance(p, dict) and
+               p.get("type") in ("image", "image_url", "input_image", "video_url", "video_file")
+               for p in m["content"]) for m in messages):
+            ids, _, _ = self.prepare(messages, tools, kwargs, max_new=1)
+            return ids
         with self.render_lock:
             return helper_call(self.render_rpc, chat_request(messages, tools, kwargs))["tokens"]
 
@@ -179,12 +186,33 @@ class M31Service(S.Service):
             raise ValueError("thinking.budget_tokens continuation is not connected for M31")
         if cancel is not None and cancel.is_set():
             raise S.ClientGone()
+        media, markers, fps = [], [], 1.0
+        if self.media_input is not None:
+            messages, media, markers, fps = self.media_input.prepare(messages, req.get("video_fps"))
         request = chat_request(messages, tools, kwargs, req)
         # This helper is separate from the active generation helper. Queueing a
         # new HTTP request cannot reset the active request's PEG/grammar state.
         with self.render_lock:
             rendered = helper_call(self.render_rpc, request)
-        ids = PreparedIds(rendered["tokens"], request, rendered)
+        manifest = None
+        rows = rendered["tokens"]
+        if media:
+            if self.vision is None:
+                raise ValueError("vision encoder is not configured")
+            prompt = rendered["prompt"]
+            if MARKER in prompt:
+                raise ValueError("literal mtmd media marker is reserved in multimodal requests")
+            for marker in markers:
+                if prompt.count(marker) != 1:
+                    raise ValueError("chat template did not preserve media order/markers")
+                prompt = prompt.replace(marker, MARKER)
+            if cancel is not None and cancel.is_set():
+                raise S.ClientGone()
+            manifest = self.vision.encode(prompt, media, video_fps=fps)
+            rows = mixed_rows(manifest)
+            if cancel is not None and cancel.is_set():
+                raise S.ClientGone()
+        ids = PreparedIds(rows, request, rendered, mixed_manifest=manifest)
         if not ids:
             raise ValueError("empty M31 prompt")
         # Common server's convention: omitted/0/-1 output limit means remaining
@@ -205,7 +233,7 @@ class M31Service(S.Service):
         raise ValueError("M31 prefix caching is not connected in this prototype")
 
 
-def make_service(engine_rpc, render_rpc, grammar_rpc, model_name="m31-xolotl-common"):
+def make_service(engine_rpc, render_rpc, grammar_rpc, model_name="m31-xolotl-common", vision=None, media_input=None):
     parser_context = threading.local()
 
     def parser_factory(**kwargs):
@@ -222,7 +250,8 @@ def make_service(engine_rpc, render_rpc, grammar_rpc, model_name="m31-xolotl-com
     # Like the model-specific GLM shim, this is process-local registration. No
     # common source or other model's server process is modified.
     S.OutputParser = parser_factory
-    return M31Service(engine, render_rpc, grammar_rpc, model_name)
+    install_video_reader()
+    return M31Service(engine, render_rpc, grammar_rpc, model_name, vision, media_input)
 
 
 def runtime_plan(config, config_directory):
@@ -262,13 +291,23 @@ def main():
     for key in unset_environment:
         os.environ.pop(key, None)
     os.environ.update(environment)
-    render = grammar = engine_rpc = http = None
+    render = grammar = engine_rpc = http = vision = None
+    media_input = None
+    vision_config = config.get("vision")
+    if vision_config:
+        sys.path.insert(0, str(HERE.parent))
+        from vision_encoder import VisionEncoder
+        options = dict(vision_config)
+        limits = options.pop("limits", {})
+        media_input = MediaInput(options["cache_dir"], **limits)
+        vision = VisionEncoder(**options)
     stopped = threading.Event()
     try:
         render = PollingRPC(tokenizer_argv, read_timeout=30)
         grammar = PollingRPC(tokenizer_argv, read_timeout=30)
         engine_rpc = PollingRPC(argv)
-        service = make_service(engine_rpc, render, grammar, config.get("model_name", "m31-xolotl-common"))
+        service = make_service(engine_rpc, render, grammar, config.get("model_name", "m31-xolotl-common"),
+                               vision=vision, media_input=media_input)
         service.api_key = S.api_key_of(config.get("api_key", ""))
         http = S.serve(service, args.host, args.port)
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -279,6 +318,8 @@ def main():
         if http:
             http.shutdown()
             http.server_close()
+        if vision is not None:
+            vision.close()
         for rpc in (engine_rpc, grammar, render):
             if rpc:
                 rpc.close()

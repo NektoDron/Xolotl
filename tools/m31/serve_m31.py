@@ -2,7 +2,8 @@
 """Opt-in M31 adapter: isolated Xolotl engine + audited PR vocab/chat helper.
 
 Only bind loopback. GPU engine must be started from an aictl-owned card session.
-No external Python packages are required. One inference request runs at a time.
+Text needs no external Python packages. Optional vision uses NumPy/Pillow.
+One inference request runs at a time.
 """
 from __future__ import annotations
 
@@ -235,9 +236,10 @@ def clipped_text(text, stops):
 
 
 class Application:
-    def __init__(self, engine, tokenizer, model="m31-xolotl", profile=False):
+    def __init__(self, engine, tokenizer, model="m31-xolotl", profile=False, vision=None, media_input=None):
         self.engine, self.tokenizer, self.model = engine, tokenizer, model
         self.profile = profile
+        self.vision, self.media_input = vision, media_input
         self.lock = threading.Lock()
         self.inference_queue = threading.BoundedSemaphore(2)
         self.queue_timeout = 1.0
@@ -266,8 +268,17 @@ class Application:
         return self.tokenizer.call({"op": "tokenize", "content": text, **kwargs})["tokens"]
 
     def prepare(self, body, chat=True):
+        manifest = None
+        prompt_rows = None
         if chat:
-            messages = validate_messages(body.get("messages"))
+            messages = body.get("messages")
+            media, markers, fps = [], [], 1.0
+            if self.media_input is not None:
+                # Validate outer structure before the media reader visits content.
+                if not isinstance(messages, list) or not messages or any(not isinstance(m, dict) for m in messages):
+                    raise ValueError("messages must be a nonempty array of objects")
+                messages, media, markers, fps = self.media_input.prepare(messages, body.get("video_fps"))
+            messages = validate_messages(messages)
             choice = body.get("tool_choice", "auto")
             if not isinstance(choice, str) or choice not in ("auto", "none"):
                 raise ValueError("supported tool_choice values: auto, none; forced tool grammar is not connected")
@@ -302,6 +313,24 @@ class Application:
                                            "tool_choice": choice, "parallel_tool_calls": body.get("parallel_tool_calls", True),
                                            "enable_thinking": enable_thinking, "chat_template_kwargs": kwargs})
             ids = rendered["tokens"]
+            if media:
+                if self.vision is None:
+                    raise ValueError("vision encoder is not configured")
+                media_marker = self.media_input.marker
+                prompt = rendered["prompt"]
+                if media_marker in prompt:
+                    raise ValueError("literal mtmd media marker is reserved in multimodal requests")
+                for marker in markers:
+                    if prompt.count(marker) != 1:
+                        raise ValueError("chat template did not preserve media order/markers")
+                    prompt = prompt.replace(marker, media_marker)
+                manifest = self.vision.encode(prompt, media, video_fps=fps)
+                metadata = json.loads(Path(manifest).read_text())
+                if metadata.get("format") != "m31-vision-batch-v1" or not metadata.get("encoded"):
+                    raise ValueError("encoder returned an invalid mixed manifest")
+                prompt_rows = metadata["rows"]
+                if type(prompt_rows) is not int or prompt_rows < 1:
+                    raise ValueError("encoder returned invalid mixed row count")
             extra_stops = rendered.get("additional_stops", [])
             grammar_active = rendered.get("grammar_active", False)
         else:
@@ -316,8 +345,10 @@ class Application:
             grammar_active = False
         if not ids:
             raise ValueError("empty prompt")
-        params, stops = request_parameters(body, self.context, len(ids))
+        params, stops = request_parameters(body, self.context, prompt_rows if prompt_rows is not None else len(ids))
         params.update(grammar_check=grammar_active, tokens=ids, stop_ids=self.tokenizer.ready["eog"], suppress_ids=self.tokenizer.ready.get("suppress", []))
+        if manifest is not None:
+            params["mixed_manifest"] = str(Path(manifest).resolve())
         return params, stops + extra_stops
 
     def piece(self, token):
@@ -595,6 +626,7 @@ def main():
     parser.add_argument("--gpu-experts-min-tokens", type=int, default=32)
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         parser.add_argument("--" + flag, action="store_true")
+    parser.add_argument("--vision-config", help="JSON: adapter/model/mmproj/cache_dir/backend/threads and optional limits")
     args = parser.parse_args()
     if args.backend == "cuda" and os.environ.get("M31_CARD_SESSION") != "1":
         parser.error("CUDA requires an aictl-owned card session")
@@ -603,12 +635,22 @@ def main():
             "--gpu-experts-gib", str(args.gpu_experts_gib), "--gpu-experts-min-tokens", str(args.gpu_experts_min_tokens)]
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
+    vision = media_input = None
+    if args.vision_config:
+        sys.path.insert(0, str(Path(__file__).resolve().with_name("serve")))
+        from vision_http import MediaInput
+        from vision_encoder import VisionEncoder
+        options = json.loads(Path(args.vision_config).read_text())
+        limits = options.pop("limits", {})
+        options.setdefault("model", args.model)
+        media_input = MediaInput(options["cache_dir"], **limits)
+        vision = VisionEncoder(**options)
     tokenizer = RPC([args.tokenizer, args.model], read_timeout=30.0)
     engine = None
     server = None
     try:
         engine = RPC(argv)
-        app = Application(engine, tokenizer, args.alias, profile=args.profile)
+        app = Application(engine, tokenizer, args.alias, profile=args.profile, vision=vision, media_input=media_input)
         server = ThreadingHTTPServer((args.host, args.port), Handler)
         server.daemon_threads = True
         server.app = app
@@ -623,6 +665,8 @@ def main():
         if engine:
             engine.close()
         tokenizer.close()
+        if vision is not None:
+            vision.close()
 
 
 if __name__ == "__main__":
