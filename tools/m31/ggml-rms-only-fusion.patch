@@ -1,0 +1,85 @@
+diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
+--- a/ggml/include/ggml-cuda.h
++++ b/ggml/include/ggml-cuda.h
+@@ -62,13 +62,15 @@
+ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
+ 
+ // xolotl M31: serialized, per-backend fusion selection. -1 inherits the process
+-// environment, 0 disables fusion, 1 enables it. A changed mode drains pending
++// environment, 0 disables fusion, 1 enables it, 2 enables RMS_NORM+MUL only.
++// A changed mode drains pending
+ // work and drops this backend's cached CUDA graphs before changing their policy.
+ // Invalid modes/non-CUDA backends return false without changing state. The
+ // caller externally serializes setters with backend compute/submission/free.
+ #define GGML_CUDA_HAS_FUSION_OVERRIDE 1
++#define GGML_CUDA_HAS_RMS_ONLY_FUSION 1
+ GGML_BACKEND_API bool ggml_backend_cuda_set_fusion_override(ggml_backend_t backend, int mode);
+-// -2 for non-CUDA; otherwise -1/0/1. Does not initialize or synchronize a device.
++// -2 for non-CUDA; otherwise -1/0/1/2. Does not initialize or synchronize a device.
+ GGML_BACKEND_API int ggml_backend_cuda_get_fusion_override(ggml_backend_t backend);
+ 
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -198,8 +198,11 @@
+ // the map; steady CUDA graph replay does not run the node fusion matcher.
+ static std::mutex ggml_cuda_fusion_override_mutex;
+ static std::unordered_map<const ggml_backend_cuda_context *, int> ggml_cuda_fusion_overrides;
++// Empty default follows the environment without acquiring a mutex.
++static std::atomic<size_t> ggml_cuda_fusion_override_count{0};
+ 
+ static int ggml_cuda_fusion_override(const ggml_backend_cuda_context * ctx) {
++    if (ggml_cuda_fusion_override_count.load(std::memory_order_acquire) == 0) return -1;
+     std::lock_guard<std::mutex> lock(ggml_cuda_fusion_override_mutex);
+     const auto found = ggml_cuda_fusion_overrides.find(ctx);
+     return found == ggml_cuda_fusion_overrides.end() ? -1 : found->second;
+@@ -2712,6 +2715,7 @@
+     {
+         std::lock_guard<std::mutex> lock(ggml_cuda_fusion_override_mutex);
+         ggml_cuda_fusion_overrides.erase(cuda_ctx);
++        ggml_cuda_fusion_override_count.store(ggml_cuda_fusion_overrides.size(), std::memory_order_release);
+     }
+ 
+     delete cuda_ctx;
+@@ -3935,6 +3939,15 @@
+     // The setter also output-fences the marked node. This explicit guard keeps
+     // a matcher starting at it from selecting an alternative implementation.
+     if (ggml_cuda_exact_mmv_marked(node)) return 0;
++
++    // Mode2 never enters any other fusion matcher. MUL output fencing stays.
++    if (ggml_cuda_fusion_override(cuda_ctx) == 2) {
++        if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
++            ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
++            return 1;
++        }
++        return 0;
++    }
+ 
+     if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+             ggml_cuda_match_shared_expert(cgraph, i, i + 3) &&
+@@ -5075,7 +5088,7 @@
+ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+ 
+-    const bool disable_fusion = ggml_cuda_fusion_disabled(cuda_ctx);
++    const bool disable_fusion = ggml_cuda_fusion_disabled(cuda_ctx) || ggml_cuda_fusion_override(cuda_ctx) == 2;
+ 
+     auto add_alloc_deps = [&](size_t start, size_t last_node) {
+ 
+@@ -6511,7 +6524,7 @@
+ }
+ 
+ bool ggml_backend_cuda_set_fusion_override(ggml_backend_t backend, int mode) {
+-    if (!ggml_backend_is_cuda(backend) || mode < -1 || mode > 1) return false;
++    if (!ggml_backend_is_cuda(backend) || mode < -1 || mode > 2) return false;
+     auto * ctx = (ggml_backend_cuda_context *)backend->context;
+     if (ggml_cuda_fusion_override(ctx) == mode) return true;
+     // Captured graphs encode the old selection and must never be replayed under
+@@ -6520,5 +6533,6 @@
+     std::lock_guard<std::mutex> lock(ggml_cuda_fusion_override_mutex);
+     if (mode == -1) ggml_cuda_fusion_overrides.erase(ctx);
+     else ggml_cuda_fusion_overrides[ctx] = mode;
++    ggml_cuda_fusion_override_count.store(ggml_cuda_fusion_overrides.size(), std::memory_order_release);
+     return true;
+ }

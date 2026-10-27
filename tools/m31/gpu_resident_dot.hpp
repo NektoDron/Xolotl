@@ -32,6 +32,10 @@ public:
     void multiply(int type,const void * device_weights,int columns,int rows,
                   int count,const float * device_input,float * device_output,
                   bool original_tiled);
+    // Opt-in exact IQ3 n1 only; count>1 and other types keep multiply().
+    void reserve_iq3_n1(int maximum_columns,int maximum_rows);
+    void multiply_iq3_n1(const void * device_weights,int columns,int rows,
+                         const float * device_input,float * device_output);
     void abort() noexcept;
     size_t scratch_bytes() const;
 private:

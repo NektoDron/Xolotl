@@ -16,6 +16,9 @@ class CpuFusedDecode {
     ggml_backend_t backend;
     ggml_threadpool_t pool;
     unsigned threads;
+    // Opt-in: pair gate/up rows, then quantize completed independent blocks.
+    // Default zero retains the accepted v8 work partition and barriers.
+    unsigned paired_quant = 0;
     ggml_context * context = nullptr;
     ggml_gallocr_t allocator = nullptr;
     ggml_cgraph * graph = nullptr;
@@ -32,8 +35,71 @@ class CpuFusedDecode {
     static std::pair<size_t, size_t> range(size_t size, int ith, int nth) {
         return {size * size_t(ith) / size_t(nth), size * size_t(ith + 1) / size_t(nth)};
     }
+    static void compute_paired(ggml_tensor * output, int ith, int nth, CpuFusedDecode & self) {
+        const auto & w = self.weight;
+        const auto & t = self.trait;
+        if (ith == 0) {
+            ggml_get_type_traits_cpu(t[0]->vec_dot_type)->from_float(self.input, self.quant[0].data(), int64_t(self.embd));
+            if (t[0]->vec_dot_type != t[1]->vec_dot_type)
+                ggml_get_type_traits_cpu(t[1]->vec_dot_type)->from_float(self.input, self.quant[1].data(), int64_t(self.embd));
+        }
+        ggml_barrier(self.pool);
+        const auto * qup = t[0]->vec_dot_type == t[1]->vec_dot_type ? self.quant[0].data() : self.quant[1].data();
+        const auto quantize = ggml_get_type_traits_cpu(t[2]->vec_dot_type)->from_float;
+        const size_t qstride = ggml_row_size(t[2]->vec_dot_type, int64_t(self.ff));
+        const size_t block = size_t(ggml_blck_size(t[2]->vec_dot_type));
+        const bool block_quant = self.paired_quant > 1 && block <= 256 && self.ff % block == 0 &&
+                                 self.used * (self.ff / block) >= size_t(nth);
+        const size_t tile = block_quant ? block : 1;
+        auto [begin, end] = range(self.used * (self.ff / tile), ith, nth);
+        for (size_t task = begin; task < end; ++task) {
+            const size_t rank = task / (self.ff / tile), first = task % (self.ff / tile) * tile;
+            float local[256];
+            for (size_t offset = 0; offset < tile; ++offset) {
+                const size_t row = first + offset;
+                float gate_value, up_value;
+                const auto * gate_row = static_cast<const uint8_t *>(w[0]->data) + size_t(self.ids[rank]) * w[0]->nb[2] + row * w[0]->nb[1];
+                const auto * up_row = static_cast<const uint8_t *>(w[1]->data) + size_t(self.ids[rank]) * w[1]->nb[2] + row * w[1]->nb[1];
+                t[0]->vec_dot(int(self.embd), &gate_value, 0, gate_row, 0, self.quant[0].data(), 0, 1);
+                t[1]->vec_dot(int(self.embd), &up_value, 0, up_row, 0, qup, 0, 1);
+                if (self.scales[0]) gate_value *= self.scales[0][self.ids[rank]];
+                if (self.scales[1]) up_value *= self.scales[1][self.ids[rank]];
+                const float a = std::min(gate_value, 7.f), b = std::clamp(up_value, -7.f, 7.f);
+                const float glu = a / (1.f + expf(1.702f * (-a)));
+                const float value = glu * (b + 1.f);
+                if (block_quant) local[offset] = value;
+                else self.hidden[rank * self.ff + row] = value;
+            }
+            if (block_quant)
+                quantize(local, self.quant[2].data() + rank * qstride + ggml_row_size(t[2]->vec_dot_type, int64_t(first)), int64_t(tile));
+        }
+        ggml_barrier(self.pool);
+        if (!block_quant) {
+            for (size_t rank = size_t(ith); rank < self.used; rank += size_t(nth))
+                quantize(self.hidden.data() + rank * self.ff, self.quant[2].data() + rank * qstride, int64_t(self.ff));
+            ggml_barrier(self.pool);
+        }
+        std::tie(begin, end) = range(self.used * self.embd, ith, nth);
+        for (size_t item = begin; item < end; ++item) {
+            const size_t rank = item / self.embd, row = item % self.embd;
+            const auto * source = static_cast<const uint8_t *>(w[2]->data) + size_t(self.ids[rank]) * w[2]->nb[2] + row * w[2]->nb[1];
+            float value;
+            t[2]->vec_dot(int(self.ff), &value, 0, source, 0, self.quant[2].data() + rank * qstride, 0, 1);
+            if (self.scales[2]) value *= self.scales[2][self.ids[rank]];
+            self.down[item] = value * self.route_weights[rank];
+        }
+        ggml_barrier(self.pool);
+        std::tie(begin, end) = range(self.embd, ith, nth);
+        auto * destination = static_cast<float *>(output->data);
+        for (size_t row = begin; row < end; ++row) {
+            float sum = self.down[row];
+            for (size_t rank = 1; rank < self.used; ++rank) sum += self.down[rank * self.embd + row];
+            destination[row] = sum;
+        }
+    }
     static void compute(ggml_tensor * output, int ith, int nth, void * opaque) {
         auto & self = *static_cast<CpuFusedDecode *>(opaque);
+        if (self.paired_quant) { compute_paired(output, ith, nth, self); return; }
         const auto & w = self.weight;
         const auto & t = self.trait;
         if (ith == 0) {
@@ -90,6 +156,12 @@ public:
         : backend(cpu), pool(threadpool), threads(n_threads) {
         if (!cpu || !ggml_backend_is_cpu(cpu) || !threadpool || !threads || threads > GGML_MAX_N_THREADS)
             throw std::invalid_argument("M31 fused CPU: requires CPU backend and matching persistent pool");
+        if (const char * value = std::getenv("M31_CPU_FUSED_PAIRED_QUANT")) {
+            if (std::strcmp(value, "0") == 0) paired_quant = 0;
+            else if (std::strcmp(value, "1") == 0) paired_quant = 1;
+            else if (std::strcmp(value, "2") == 0) paired_quant = 2;
+            else throw std::invalid_argument("M31 fused CPU: M31_CPU_FUSED_PAIRED_QUANT must be 0, 1 or 2");
+        }
     }
     ~CpuFusedDecode() { if (allocator) ggml_gallocr_free(allocator); if (context) ggml_free(context); }
     CpuFusedDecode(const CpuFusedDecode &) = delete;

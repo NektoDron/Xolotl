@@ -1,0 +1,39 @@
+{
+  "format": "m31-runtime-profile-v1",
+  "name": "port7-baseline",
+  "inherits": "native-gpu.json",
+  "description": "Принятые параметры v8; все дополнительные режимы port7 явно выключены. Исторический native-gpu.json сохранён.",
+  "environment": {
+    "M31_CPU_FUSED_PAIRED_QUANT": "0",
+    "M31_DENSE_PINNED_IO": "0",
+    "M31_DENSE_IO_TRACE": "0",
+    "M31_GPU_CACHED_DECODE_NATIVE": "0",
+    "M31_GPU_CACHED_DECODE_EXACT": "0",
+    "M31_GPU_DECODE_SEED_HOT": "0",
+    "M31_GPU_DECODE_FUSION": "0",
+    "M31_GPU_RMS_FUSION": "0",
+    "M31_DECODE_FUSION_UNFENCED": "0",
+    "M31_DSPARK_PERSISTENT_VERIFY": "0",
+    "M31_DSPARK_SHARED_INPUTS": "0",
+    "M31_DSPARK_BATCH_DENSE": "0",
+    "M31_DSPARK_BATCH_OPS": "0",
+    "M31_DSPARK_GPU_CACHED": "0",
+    "M31_DSPARK_CAPTURE_REUSE": "0",
+    "M31_DSPARK_SHARED_OVERLAP": "0",
+    "M31_DSPARK_VIEW_INPUTS": "0",
+    "M31_DSPARK_COALESCE_INPUTS": "0",
+    "M31_DSPARK_PACKED_ROUTED": "0",
+    "M31_DSPARK_CAPTURE_VIEW": "0",
+    "M31_DSPARK_BATCH_MSA": "0",
+    "M31_MSA_SORTED_LOOKUP": "0",
+    "M31_GPU_CACHED_GROUPED": "0",
+    "M31_GPU_CACHED_IQ3_IMMA": "0",
+    "M31_GPU_CACHED_GATE_UP": "0",
+    "M31_GPU_CACHED_RANK_OUTER": "0",
+    "M31_CPU_BATCH_PAIR": "0"
+  },
+  "port7_provenance": {
+    "base": "accepted native-gpu/v8 48 controls",
+    "additional_controls": "Explicit zero defaults; no claim of a completed new-build acceptance."
+  }
+}

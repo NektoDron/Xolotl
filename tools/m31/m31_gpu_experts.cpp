@@ -6,10 +6,13 @@
 #include "prefill_layer_banks.hpp"
 #include "gpu_native_gu.hpp"
 #include "cpu_pack_spans.hpp"
+#include "cached_decode_merge.hpp"
+#include "cached_decode_merge_rank_outer.hpp"
 
 #include "ggml-alloc.h"
 #ifdef M31_CPU_QUANTS_CUDA
 #include "gpu_cpu_quants.hpp"
+#include "gpu_cached_exact.hpp"
 #include "cpu_gpu_host_ops.hpp"
 #include "cpu_gpu_host_executor.hpp"
 #endif
@@ -125,7 +128,25 @@ struct GpuExperts::Impl {
     std::vector<Layer> layers;
     std::map<uint64_t, Entry> entries;
     std::set<uint64_t> seeded_keys;
+    std::set<uint64_t> decode_seeded_keys;
+    std::vector<uint32_t> decode_seed_order;
+    bool decode_seed_armed = false;
     std::set<uint64_t> active_read_keys;
+    struct CachedDecodeGraph {
+        std::unique_ptr<Context> context;
+        ggml_gallocr_t allocator = nullptr;
+        ggml_cgraph * graph = nullptr;
+        ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
+        std::array<ggml_tensor *,3> scale_inputs{};
+        std::array<std::vector<float>,3> scales;
+        std::vector<int32_t> mapped;
+        std::vector<float> gpu_terms, cpu_terms, missing_weights;
+        std::vector<int32_t> missing_ids;
+        std::vector<uint8_t> resident;
+        size_t scratch = 0;
+        ~CachedDecodeGraph() { if(allocator)ggml_gallocr_free(allocator); }
+    };
+    std::vector<std::unique_ptr<CachedDecodeGraph>> cached_decode_graphs;
     Stats stat;
     uint64_t clock = 0;
     int max_chunk = 0;
@@ -136,6 +157,7 @@ struct GpuExperts::Impl {
     bool parallel_reduce = false;
     bool ranked_prefetch = false;
     bool native_gu_concat = false;
+    bool cached_decode_exact = false,cached_verify_enabled = false;
     bool layer_banks_requested = false;
     bool bank_prefetch_enabled = false;
 #ifdef M31_REGISTERED_ARENA_CUDA
@@ -149,6 +171,8 @@ struct GpuExperts::Impl {
 #endif
 #ifdef M31_CPU_QUANTS_CUDA
     std::unique_ptr<GpuCpuQuants> cpu_quants;
+    std::unique_ptr<GpuCachedExact> cached_exact_worker,cached_batch_worker;
+    uint64_t cached_rank_outer_calls=0;
     std::array<std::vector<float>, 3> exact_outputs;
     std::vector<float> exact_activation;
 #endif
@@ -163,6 +187,10 @@ struct GpuExperts::Impl {
     ~Impl() {
         // A worker borrows arena role spans and destination pool metadata.
         // Join it before any of those can be freed, including failure shutdown.
+#ifdef M31_CPU_QUANTS_CUDA
+        cached_batch_worker.reset(); // Both actual raw readers drain before pool/registration.
+        cached_exact_worker.reset();
+#endif
         background.reset();
 #ifdef M31_REGISTERED_ARENA_CUDA
         layer_banks.reset(); // Copy streams and actual consumers drain before pool/registration.
@@ -204,7 +232,7 @@ struct GpuExperts::Impl {
         }
         auto victim=entries.end();
         for (auto it=entries.begin();it!=entries.end();++it)
-            if (!protected_keys.count(it->first) && !seeded_keys.count(it->first) && !active_read_keys.count(it->first) &&
+            if (!protected_keys.count(it->first) && !seeded_keys.count(it->first) && !decode_seeded_keys.count(it->first) && !active_read_keys.count(it->first) &&
                 (victim==entries.end() || it->second.last_used<victim->second.last_used)) victim=it;
         if (victim==entries.end()) {
             check(!required, "all cache slots are protected; increase expert cache budget");
@@ -214,6 +242,36 @@ struct GpuExperts::Impl {
         entries.erase(victim);
         ++stat.evictions;
         return slot;
+    }
+    void leave_decode_seed() {
+        if (decode_seed_order.empty()) return;
+        // Decode-only pins never reduce the next prefill streaming capacity.
+        decode_seeded_keys.clear();
+        decode_seed_armed = true;
+    }
+    void prime_decode_seed() {
+        if (!decode_seed_armed || decode_seed_order.empty()) return;
+        const auto start=Clock::now();
+        finish_prefetch();
+        const uint64_t before=stat.upload_bytes;
+        std::set<uint64_t> pins;
+        for(auto id:decode_seed_order)pins.insert(id);
+        try {
+            if(uploads)uploads->begin_batch();
+            for(auto id:decode_seed_order)load(int(id / g.experts),int(id % g.experts),pins);
+            if(uploads){uploads->finish();uploads->synchronize();}
+            ggml_backend_synchronize(backend);
+            decode_seeded_keys=std::move(pins);decode_seed_armed=false;
+            ++stat.decode_seed_primes;stat.decode_seed_upload_bytes+=stat.upload_bytes-before;
+            stat.decode_seed_seconds+=elapsed(start);
+            std::fprintf(stderr,"M31 decode-only seed: hot=%zu upload_bytes=%llu seconds=%.6f\n",
+                decode_seeded_keys.size(),(unsigned long long)(stat.upload_bytes-before),elapsed(start));
+        } catch (...) {
+            // A partially uploaded seed cannot be exposed through stale cache metadata.
+            ready=false; // Set before draining: a second CUDA error must stay terminal.
+            try { if(uploads)uploads->synchronize();ggml_backend_synchronize(backend); } catch (...) {}
+            throw;
+        }
     }
     void begin_prefetch(int layer, int n, const std::set<uint64_t> & current_keys) {
 #ifdef M31_REGISTERED_ARENA_CUDA
@@ -656,6 +714,7 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
     p_->stat.budget_bytes = size_t(cache_gib * 1073741824.0);
     p_->stat.q8_activations = q8_activations;
     p_->layers.resize(size_t(g.layers));
+    p_->cached_decode_graphs.resize(size_t(g.layers));
     const size_t alignment = ggml_backend_buft_get_alignment(p_->buffer_type);
     size_t stride_multiple = alignment, maximum_span = 0;
     const char * role_names[] = {"gate", "up", "down"};
@@ -774,6 +833,11 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
     std::fprintf(stderr, "M31 GPU experts: fixed_slots=%zu slot_stride=%zu pool_bytes=%zu budget=%zu pinned=%d source_q8=%d (layer mul_mat_id; graph scratch separate)\n",
                  p_->stat.slot_count, p_->stat.slot_stride, p_->stat.pool_bytes, p_->stat.budget_bytes,
                  int(p_->stat.pinned_staging), int(p_->stat.q8_activations));
+    if(const char *value=std::getenv("M31_GPU_CACHED_DECODE_EXACT"))p_->cached_decode_exact=std::string(value)=="1";
+    if(const char *value=std::getenv("M31_DSPARK_GPU_CACHED"))p_->cached_verify_enabled=std::string(value)=="1";
+#ifndef M31_CPU_QUANTS_CUDA
+    check(!p_->cached_decode_exact&&!p_->cached_verify_enabled,"exact cached subset requires STRATA_M31_CPU_QUANTS_CUDA");
+#endif
     const char * exact_mode = std::getenv("M31_GPU_EXACT");
     const bool requested_exact = exact_mode && std::string(exact_mode) == "1";
     const char * fast_mode = std::getenv("M31_GPU_FAST_FFN");
@@ -814,6 +878,8 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
 #else
     check(!requested_exact, "M31_GPU_EXACT requires STRATA_M31_CPU_QUANTS_CUDA=ON");
 #endif
+    check((!p_->cached_decode_exact&&!p_->cached_verify_enabled)||(!requested_exact&&!requested_fast&&!p_->layer_banks_requested),
+          "exact cached subset requires native prefill with the ordinary LRU pool");
     if(p_->layer_banks_requested){
         check(!requested_exact&&!requested_fast,"layer banks require native ggml experts");
         const char *chain=std::getenv("M31_GPU_PREFILL_CHAIN");
@@ -826,8 +892,29 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
         check(false,"layer banks require registered arena CUDA support");
 #endif
     }
-    p_->ready = true;
-    const char * hot_text = std::getenv("M31_GPU_SEED_HOT");
+#ifdef M31_CPU_QUANTS_CUDA
+    if(p_->cached_decode_exact){
+        // Allocate its small fixed buffers before the planner snapshot. The
+        // helper restores an explicit pool affinity mask inside its worker.
+        p_->cached_exact_worker=std::make_unique<GpuCachedExact>(int(g.embd),int(g.expert_ff),int(g.used));
+        p_->stat.decode_scratch_bytes=p_->cached_exact_worker->stats().device_bytes;
+    }
+#endif
+#ifdef M31_CPU_QUANTS_CUDA
+    if(p_->cached_verify_enabled){
+        p_->cached_batch_worker=std::make_unique<GpuCachedExact>(int(g.embd),int(g.expert_ff),int(g.used),8);
+        p_->stat.decode_scratch_bytes+=p_->cached_batch_worker->stats().device_bytes;
+    }
+#endif
+    p_->ready = true; // No partial helper allocation is exposed after init failure.
+    const char * decode_hot_text=std::getenv("M31_GPU_DECODE_SEED_HOT");
+    const bool deferred_decode_seed=decode_hot_text&&*decode_hot_text&&std::string(decode_hot_text)!="0";
+    const char * hot_text = deferred_decode_seed?decode_hot_text:std::getenv("M31_GPU_SEED_HOT");
+    if(deferred_decode_seed){
+        const char *ordinary=std::getenv("M31_GPU_SEED_HOT");
+        check(!ordinary||std::string(ordinary)=="0","ordinary and decode-only seeds are mutually exclusive");
+        check(!p_->layer_banks_requested&&!requested_exact&&!requested_fast,"decode-only seeds require native LRU experts");
+    }
     if (hot_text && *hot_text) {
         try {
             const std::string count_text(hot_text);
@@ -851,7 +938,12 @@ void GpuExperts::init(const GgufModel & model, const Geometry & g, const ExpertA
                 check(receipt.hot == hot && receipt.slots == p_->stat.slot_count,
                       "seed hot count/cache slots differ from trusted preflight receipt");
                 cache_seed::verify_current_model(receipt, model);
-                seed_hot(rank_path, receipt.expected, size_t(hot));
+                if(deferred_decode_seed){
+                    const auto rank=cache_seed::read(rank_path,receipt.expected);
+                    check(hot<=rank.ids.size()&&hot<=p_->stat.slot_count,"decode seed exceeds cache slots");
+                    p_->decode_seed_order.assign(rank.ids.begin(),rank.ids.begin()+size_t(hot));
+                    p_->decode_seed_armed=true;
+                }else seed_hot(rank_path, receipt.expected, size_t(hot));
             }
         } catch (...) {
             p_->ready = false; // A failed env initialization must never expose a usable partial cache.
@@ -899,6 +991,7 @@ void GpuExperts::forward_into(int layer, int n, const std::vector<float> & x,
           "layer needs " + std::to_string(selected.size()) + " distinct expert slots; cache has " + std::to_string(p_->stat.slot_count) +
           "; minimum batch cache bytes=" + std::to_string(selected.size() * p_->stat.slot_stride));
     if (p_->profile) p_->stat.prepare_seconds += Impl::elapsed(prepare_start);
+    if(n>1)p_->leave_decode_seed();
     try {
         // Keep N+1 DMA in flight through its dense attention graph. Publish its
         // entries before any load/reservation can reuse a reserved destination.
@@ -982,6 +1075,8 @@ void GpuExperts::forward_into(int layer, int n, const std::vector<float> & x,
 }
 
 #include "gpu_device_forward_impl.hpp"
+#include "gpu_cached_decode_impl.hpp"
+#include "gpu_cached_batched_impl.hpp"
 
 bool GpuExperts::forward_cached(int layer, int n, const std::vector<float> & x,
                                 const std::vector<int32_t> & ids, const std::vector<float> & weights,
@@ -1042,6 +1137,17 @@ void GpuExperts::print_profile(const char * label) const {
         1000*s.prepare_seconds, 1000*s.pack_seconds, 1000*s.upload_submit_seconds,
         1000*s.upload_wait_seconds, 1000*s.execute_seconds, 1000*s.gate_seconds,
         1000*s.up_seconds, 1000*s.oai_seconds, 1000*s.down_seconds, 1000*s.reduce_seconds);
+    std::fprintf(stderr,"M31 GPU cached hybrid label=%s forwards=%llu route_lookups=%llu resident_routes=%llu hit_rate=%.6f submit_ms=%.3f cpu_miss_ms=%.3f join_ms=%.3f scratch_bytes=%zu seed_primes=%llu seed_bytes=%llu seed_ms=%.3f\n",
+        label?label:"live",(unsigned long long)s.hybrid_forwards,(unsigned long long)s.decode_route_lookups,
+        (unsigned long long)s.decode_resident_routes,double(s.decode_resident_routes)/double(std::max<uint64_t>(1,s.decode_route_lookups)),
+        1000*s.hybrid_submit_seconds,1000*s.hybrid_cpu_seconds,1000*s.hybrid_join_seconds,s.decode_scratch_bytes,
+        (unsigned long long)s.decode_seed_primes,(unsigned long long)s.decode_seed_upload_bytes,1000*s.decode_seed_seconds);
+    std::fprintf(stderr,"M31 GPU cached batched label=%s calls=%llu forwards=%llu tokens=%llu routes=%llu hits=%llu hit_rate=%.6f allmiss=%llu seed_ms=%.3f submit_ms=%.3f cpu_ms=%.3f join_ms=%.3f wall_ms=%.3f\n",
+        label?label:"live",(unsigned long long)s.cached_batch_calls,(unsigned long long)s.cached_batch_forwards,
+        (unsigned long long)s.cached_batch_tokens,(unsigned long long)s.cached_batch_routes,(unsigned long long)s.cached_batch_hits,
+        double(s.cached_batch_hits)/double(std::max<uint64_t>(1,s.cached_batch_routes)),(unsigned long long)s.cached_batch_allmiss,
+        1000*s.cached_batch_seed_seconds,1000*s.cached_batch_submit_seconds,1000*s.cached_batch_cpu_seconds,
+        1000*s.cached_batch_join_seconds,1000*s.cached_batch_wall_seconds);
     std::fprintf(stderr, "M31 GPU prefetch profile label=%s batches=%llu experts=%llu bytes=%llu join_host_ms=%.3f pack_host_ms=%.3f staging_wait_host_ms=%.3f submit_host_ms=%.3f\n",
         label?label:"live",(unsigned long long)s.prefetch_batches,(unsigned long long)s.prefetched_experts,
         (unsigned long long)s.prefetch_bytes,1000*s.prefetch_wait_seconds,1000*s.prefetch_pack_seconds,
@@ -1062,9 +1168,42 @@ void GpuExperts::print_profile(const char * label) const {
 #endif
 #ifdef M31_CPU_QUANTS_CUDA
     if (p_->cpu_quants) p_->cpu_quants->print_profile(label);
+    if(p_->cached_batch_worker){
+        const auto e=p_->cached_batch_worker->stats();
+        std::fprintf(stderr,"M31 GPU cached batch worker label=%s jobs=%llu assignments=%llu joins=%llu H2D_bytes=%llu D2H_bytes=%llu worker_ms=%.3f gate_up_ms=%.3f oai_ms=%.3f down_ms=%.3f device_bytes=%zu pinned_bytes=%zu\n",
+            label?label:"live",(unsigned long long)e.jobs,(unsigned long long)e.experts,(unsigned long long)e.joins,
+            (unsigned long long)e.h2d_bytes,(unsigned long long)e.d2h_bytes,1000*e.worker_seconds,
+            1000*e.gate_up_seconds,1000*e.oai_seconds,1000*e.down_seconds,e.device_bytes,e.pinned_bytes);
+    }
+    if(p_->cached_exact_worker){
+        const auto e=p_->cached_exact_worker->stats();
+        std::fprintf(stderr,"M31 GPU cached exact label=%s jobs=%llu experts=%llu joins=%llu H2D_bytes=%llu D2H_bytes=%llu worker_ms=%.3f gate_up_ms=%.3f oai_ms=%.3f down_ms=%.3f device_bytes=%zu pinned_bytes=%zu\n",
+            label?label:"live",(unsigned long long)e.jobs,(unsigned long long)e.experts,(unsigned long long)e.joins,
+            (unsigned long long)e.h2d_bytes,(unsigned long long)e.d2h_bytes,1000*e.worker_seconds,
+            1000*e.gate_up_seconds,1000*e.oai_seconds,1000*e.down_seconds,e.device_bytes,e.pinned_bytes);
+        if(e.iq3_imma_calls||e.joined_gu_jobs||p_->cached_rank_outer_calls)std::fprintf(stderr,"M31 GPU cached acceleration label=%s iq3_imma_calls=%llu iq3_imma_rows=%llu rank_outer_calls=%llu joined_gu_jobs=%llu joined_gu_assignments=%llu joined_gu_groups=%llu\n",
+            label?label:"live",(unsigned long long)e.iq3_imma_calls,(unsigned long long)e.iq3_imma_rows,(unsigned long long)p_->cached_rank_outer_calls,
+            (unsigned long long)e.joined_gu_jobs,(unsigned long long)e.joined_gu_assignments,(unsigned long long)e.joined_gu_groups);
+    }
 #endif
 #ifdef M31_FAST_FFN_CUDA
     if (p_->fast_ffn) p_->fast_ffn->print_profile(label);
+#endif
+}
+
+void GpuExperts::print_cached_batch_profile(const char *label) const {
+#ifdef M31_CPU_QUANTS_CUDA
+    if(!p_->cached_batch_worker)return;
+    const auto e=p_->cached_batch_worker->stats();
+    if(!e.grouped_jobs)return;
+    std::fprintf(stderr,"M31 GPU cached grouped label=%s jobs=%llu assignments=%llu grouped_jobs=%llu grouped_assignments=%llu unique_grouped_experts=%llu multiply_calls=%llu saved_multiply_calls=%llu worker_ms=%.3f gate_up_ms=%.3f oai_ms=%.3f down_ms=%.3f device_bytes=%zu pinned_bytes=%zu\n",
+        label?label:"verify",(unsigned long long)e.jobs,(unsigned long long)e.experts,
+        (unsigned long long)e.grouped_jobs,(unsigned long long)e.grouped_assignments,
+        (unsigned long long)e.grouped_unique_experts,(unsigned long long)e.multiply_calls,
+        (unsigned long long)(3*e.experts-e.multiply_calls),1000*e.worker_seconds,
+        1000*e.gate_up_seconds,1000*e.oai_seconds,1000*e.down_seconds,e.device_bytes,e.pinned_bytes);
+#else
+    (void)label;
 #endif
 }
 
@@ -1139,7 +1278,25 @@ bool GpuExperts::native_gpu_math() const {
 #endif
     return true;
 }
-size_t GpuExperts::workspace_bytes() const {return p_->stat.scratch_bytes;}
+size_t GpuExperts::workspace_bytes() const {return p_->stat.scratch_bytes+p_->stat.decode_scratch_bytes;}
+void GpuExperts::release_prefill_workspace() {
+    check(p_->ready&&native_gpu_math(),"release prefill workspace requires ready native experts");
+    check(p_->active_read_keys.empty(),"cannot release scratch with an active expert consumer");
+    p_->finish_prefetch();
+#ifdef M31_CPU_QUANTS_CUDA
+    if(p_->cached_batch_worker)p_->cached_batch_worker->drain();
+    if(p_->cached_exact_worker)p_->cached_exact_worker->drain();
+#endif
+    if(p_->uploads)p_->uploads->synchronize();
+#ifdef M31_REGISTERED_ARENA_CUDA
+    if(p_->layer_banks)p_->layer_banks->drain();
+#endif
+    ggml_backend_synchronize(p_->backend);clear_captures(p_->backend);
+    if(p_->allocator)ggml_gallocr_free(p_->allocator);
+    p_->allocator=ggml_gallocr_new(p_->buffer_type);
+    if(!p_->allocator){p_->ready=false;throw std::runtime_error("M31 GPU experts: empty prefill allocator recreation failed");}
+    p_->stat.scratch_bytes=0;
+}
 int GpuExperts::fast_expert_batch_rows() const {
 #ifdef M31_FAST_FFN_CUDA
     return p_->fast_ffn ? p_->fast_ffn->expert_batch_rows() : 0;
@@ -1179,5 +1336,6 @@ void GpuExperts::reset_stats() {
     p_->stat.pool_bytes = old.pool_bytes;
     p_->stat.occupied_slots = old.occupied_slots;
     p_->stat.seeded_slots = old.seeded_slots;
+    p_->stat.decode_scratch_bytes = old.decode_scratch_bytes;
 }
 } // namespace strata::m31

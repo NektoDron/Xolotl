@@ -21,6 +21,9 @@
 #include <limits>
 #include "gpu_fast_quant.cuh"
 
+// Exact n1 IQ3 prototype promoted after isolated CPU/GPU raw-bit proof.
+#include "gpu_iq3_lane_exact.cuh"
+
 namespace strata::m31 {
 namespace {
 void cuda_check(cudaError_t result) {
@@ -186,8 +189,8 @@ void gpu_quantize_cpu_compatible(int type,const float *input,void *output,
 struct GpuDeviceDots::Impl {
     cudaStream_t stream;
     uint8_t *quant=nullptr;
-    int32_t *ids=nullptr,*routes=nullptr,*tiles=nullptr;
-    size_t quant_capacity=0,ids_capacity=0,routes_capacity=0,tiles_capacity=0;
+    int32_t *ids=nullptr,*routes=nullptr,*tiles=nullptr,*iq3_partials=nullptr;
+    size_t quant_capacity=0,ids_capacity=0,routes_capacity=0,tiles_capacity=0,iq3_capacity=0;
     bool pending=false,mma32=false,mma256=false;
     explicit Impl(void *borrowed):stream(static_cast<cudaStream_t>(borrowed)){
         const char *mode=std::getenv("M31_GPU_FAST_FFN_MMA32");
@@ -204,12 +207,12 @@ struct GpuDeviceDots::Impl {
         cuda_check(cudaFree(p));p=nullptr;capacity=0;
         cuda_check(cudaMalloc(reinterpret_cast<void **>(&p),bytes));capacity=bytes;
     }
-    ~Impl(){drain();cudaFree(quant);cudaFree(ids);cudaFree(routes);cudaFree(tiles);}
+    ~Impl(){drain();cudaFree(quant);cudaFree(ids);cudaFree(routes);cudaFree(tiles);cudaFree(iq3_partials);}
 };
 GpuDeviceDots::GpuDeviceDots(void *stream):p_(std::make_unique<Impl>(stream)){}
 GpuDeviceDots::~GpuDeviceDots()=default;
 void GpuDeviceDots::abort()noexcept{p_->drain();}
-size_t GpuDeviceDots::scratch_bytes()const{return p_->quant_capacity+p_->ids_capacity+p_->routes_capacity+p_->tiles_capacity;}
+size_t GpuDeviceDots::scratch_bytes()const{return p_->quant_capacity+p_->ids_capacity+p_->routes_capacity+p_->tiles_capacity+p_->iq3_capacity;}
 void GpuDeviceDots::reserve(int columns,int rows,int count_max) {
     if(columns<=0||columns%256||rows<=0||count_max<=0||count_max>65535||
        std::max(columns,rows)>std::numeric_limits<int>::max()-255)
@@ -220,6 +223,20 @@ void GpuDeviceDots::reserve(int columns,int rows,int count_max) {
     p_->reserve(p_->ids,p_->ids_capacity,size_t(count_max)*2*sizeof(int32_t));
     p_->reserve(p_->routes,p_->routes_capacity,size_t(count_max)*sizeof(int32_t));
     p_->reserve(p_->tiles,p_->tiles_capacity,((size_t(count_max)+63)/64)*3*sizeof(int32_t));
+}
+void GpuDeviceDots::reserve_iq3_n1(int columns,int rows) {
+    p_->reserve(p_->iq3_partials,p_->iq3_capacity,iq3_lane_exact::scratch_bytes(columns,rows));
+}
+void GpuDeviceDots::multiply_iq3_n1(const void *weights,int columns,int rows,
+                                  const float *input,float *output) {
+    if(!weights||!input||!output||input==output||columns<=0||columns%256||rows<=0)
+        throw std::invalid_argument("M31 IQ3 n1: invalid pointers/shape");
+    const size_t packed_bytes=ggml_row_size(GGML_TYPE_Q8_K,columns);
+    p_->reserve(p_->quant,p_->quant_capacity,packed_bytes);
+    reserve_iq3_n1(columns,rows);
+    p_->pending=true;
+    gpu_quantize_cpu_compatible(GGML_TYPE_Q8_K,input,p_->quant,columns,1,p_->stream);
+    iq3_lane_exact::multiply(weights,p_->quant,columns,rows,p_->iq3_partials,output,p_->stream);
 }
 void GpuDeviceDots::multiply(int type,const void *weights,int columns,int rows,int count,
                             const float *input,float *output,bool original_tiled) {
