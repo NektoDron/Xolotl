@@ -30,6 +30,22 @@ python3 tools/m31/profile_plan.py \
 потребитель. GPU сессия по-прежнему резервируется штатным aictl launcher.
 Профиль ничего не развёртывает и не меняет defaults программы.
 
+`vision-shortprefill.json` включает адаптивный префилл для EPYC9654/RTX5090:
+2–31 новый токен — CPU experts, 32–1024 — распределение CPU/GPU по стоимости
+экспертов, дальше — исходный слоевой путь. Dense/attention остаются на GPU.
+CUDA quant/OAI сохраняют численный контракт GPU oracle; NVFP4 layers остаются
+на GPU. Профиль сохраняет history prefetch, отключает whole-prompt KV cache
+и требует прежнего резервирования карты через aictl. Основной default
+программы `M31_SHORT_PREFILL_MODE=off` не изменён.
+
+Порог выбран по развёртке16…2048, а не по одному изображению. Измерения,
+численная приёмка и границы результата описаны в
+[`docs/m31/shortprefill.md`](../../../docs/m31/shortprefill.md) и
+`/mnt/ai/logs/m31-vision/REPORT-shortprefill.final.md`.
+Цель fresh PNG515 <1с не достигнута; точные повторы из KV cache и добавление
+к live KV внутри Engine — разные сценарии. Prewarm encoder настраивается
+отдельно через `vision-ttft-encoder.example.json`.
+
 `exact-debug.json` наследует native профиль и явно включает EXACT1,
 CHAIN0, FAST0, CPU_QUANTS1. Нужна сборка
 `STRATA_M31_CPU_QUANTS_CUDA=ON`; поле requires описывает это требование,

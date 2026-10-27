@@ -1,3 +1,22 @@
+# MiniMax-M3.1: адаптивный префилл, скоростная цель частично выполнена
+
+27.10.2026. Функциональный локальный commit `8742b26c`.
+Отчёт `/mnt/ai/logs/m31-vision/REPORT-shortprefill.final.md`.
+Opt-in профиль `tools/m31/profiles/vision-shortprefill.json`: CPU2…31,
+CPU/GPU cost-based hybrid32…1024, затем v8. Глобальный MODEoff сохранён;
+n1 decode не переключается. Точные CUDA quant/OAI + CPU expert matrices
+дают full-row побитность: финальные10/10 gates,16042rows (ref PNG/video,
+code128/text515/code3000, полный профиль и только MODEauto). HTTPvision6/6,
+tools3/3, TTFT15/15 PASS. CPU/CUDA build и post-merge ELF identity PASS.
+Warm PNG real encode TTFT2,727→1,792с, native forward1,661с;
+text515 warm2,846→1,898с, raw sameIDs1,777с. Цель<1с не достигнута.
+Engine live-KV append+100/+300:1,02/1,45с; HTTP partial-prefix reuse не добавлен.
+Same-day long old→new:4K1325,84→1325,90;16K1536,05→1548,10;
+32K1234,64→1256,82t/s (native prompt, два measured повтора).
+Подробные gates/порог/cost model: `docs/m31/shortprefill.md`.
+
+---
+
 # MiniMax-M3.1: TTFT разобран, оптимизации opt-in
 
 27.10.2026. Функциональный commit342bcc74, отчёт
