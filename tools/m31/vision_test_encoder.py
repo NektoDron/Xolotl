@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """CPU-only checks for ownership, deferred selection and backend cache identity."""
+import io
 import json
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import threading
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from vision_batch import PR_SHA
 from vision_encoder import VisionEncoder
@@ -103,6 +105,82 @@ class EncoderSelectionTests(unittest.TestCase):
             both_keys = attempt(self.encoder())
         self.assertEqual(len(both_keys), 2)
         self.assertEqual(len(both_keys-cpu_keys), 1)
+
+    def test_unload_waits_for_inflight_encode_read(self):
+        e = self.encoder('cpu')
+        worker = Mock()
+        worker.stdin, worker.stdout = io.StringIO(), io.StringIO()
+        worker.poll.return_value = None
+        worker.wait.return_value = 0
+        e.process = worker
+        reading, release, unloading, unloaded = (threading.Event() for _ in range(4))
+        failures = []
+
+        def blocked_read():
+            reading.set()
+            if not release.wait(timeout=2):
+                raise AssertionError('test did not release encoder read')
+            # Verify process ownership survives until the ongoing read returns.
+            self.assertIs(e.process, worker)
+            self.assertFalse(worker.stdout.closed)
+            raise RuntimeError('request completed at read barrier')
+
+        def request():
+            try:
+                e.encode('prompt', [self.root/'media'])
+            except Exception as exc:
+                failures.append(exc)
+
+        def unload():
+            unloading.set()
+            e.unload()
+            unloaded.set()
+
+        with patch.object(e, '_start'), patch.object(e, '_read', side_effect=blocked_read):
+            request_thread = threading.Thread(target=request, daemon=True)
+            request_thread.start()
+            self.assertTrue(reading.wait(timeout=2))
+            unload_thread = threading.Thread(target=unload, daemon=True)
+            unload_thread.start()
+            self.assertTrue(unloading.wait(timeout=2))
+            try:
+                self.assertFalse(unloaded.wait(timeout=.05), 'unload bypassed the active encode lock')
+                self.assertIs(e.process, worker)
+                self.assertFalse(worker.stdout.closed)
+            finally:
+                release.set()
+                request_thread.join(timeout=2)
+                unload_thread.join(timeout=2)
+        self.assertFalse(request_thread.is_alive())
+        self.assertFalse(unload_thread.is_alive())
+        self.assertTrue(unloaded.is_set())
+        self.assertIsNone(e.process)
+        self.assertTrue(worker.stdout.closed)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], RuntimeError)
+        self.assertEqual(str(failures[0]), 'request completed at read barrier')
+
+    def test_read_failure_can_close_under_encode_lock(self):
+        e = self.encoder('cpu')
+        worker = Mock()
+        worker.stdin, worker.stdout = io.StringIO(), io.StringIO('invalid JSON\n')
+        worker.poll.return_value = 0
+        e.process = worker
+        failures = []
+        def request():
+            try:
+                e.encode('prompt', [self.root/'media'])
+            except Exception as exc:
+                failures.append(exc)
+        with patch.object(e, '_start'), patch('vision_encoder.select.select', return_value=([worker.stdout], [], [])):
+            thread = threading.Thread(target=request, daemon=True)
+            thread.start(); thread.join(timeout=2)
+        self.assertFalse(thread.is_alive(), 'read error deadlocked while closing worker')
+        self.assertIsNone(e.process)
+        self.assertTrue(worker.stdout.closed)
+        self.assertEqual(len(failures), 1)
+        self.assertIsInstance(failures[0], RuntimeError)
+        self.assertEqual(str(failures[0]), 'invalid vision encoder response')
 
     def test_precision_environment_separates_actual_cache_keys(self):
         def attempt(e):

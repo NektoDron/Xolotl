@@ -42,7 +42,7 @@ class VisionEncoder:
                                       reason='deferred' if backend == 'auto' else 'explicit')
         self.adapter, self.cache_dir = str(Path(adapter).resolve()), Path(cache_dir).resolve()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.timeout, self.lock = float(timeout), threading.Lock()
+        self.timeout, self.lock = float(timeout), threading.RLock()
         self.config = dict(model=str(Path(model).resolve()), mmproj=str(Path(mmproj).resolve()),
                            backend='cpu' if backend == 'auto' else backend, threads=int(threads), cpu_workers=int(cpu_workers),
                            encode=True, encoder_mode='single', add_special=False,
@@ -203,6 +203,12 @@ class VisionEncoder:
             return manifest
 
     def close(self):
+        # Read failures close from inside encode/restart while this lock is
+        # already held. RLock also makes external unload wait for that request.
+        with self.lock:
+            self._close_unlocked()
+
+    def _close_unlocked(self):
         process, self.process = self.process, None
         if process is not None:
             if process.poll() is None:
