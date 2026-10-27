@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """CPU-only protocol tests; no subprocess model, GPU or large GGUF needed."""
 import importlib.util
+import http.client
 import json
 import os
 from pathlib import Path
 import threading
+import sys
+import time
 import unittest
 from unittest.mock import patch
 
@@ -23,7 +26,7 @@ class FakeEngine:
     def write(self, value):
         self.writes.append(value)
 
-    def read(self):
+    def read(self, timeout=None):
         return next(self.queue)
 
 
@@ -103,7 +106,7 @@ class ProtocolTests(unittest.TestCase):
         events = app.events({"tokens": [1], "grammar_check": True}, [])
         self.assertEqual(next(events)["event"], "prefill")
         events.close()
-        self.assertEqual(engine.writes[-2:], [{"accepted": True}, {"continue": False}])
+        self.assertEqual(engine.writes[-2:], [{"accepted": False, "allowed": []}, {"continue": False}])
 
     def test_ack_precedes_stream_parse(self):
         engine = FakeEngine([{"event": "token", "token": 10}, done()])
@@ -176,7 +179,7 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError): app.prepare({**base, "reasoning_effort": 7})
 
     def test_sampling_rejects_invalid_numbers_and_context_overflow(self):
-        for body in ({"top_p": float("nan")}, {"temperature": -1}, {"min_p": 1.1}, {"top_k": True}, {"max_tokens": 129}):
+        for body in ({"top_p": float("nan")}, {"temperature": -1}, {"min_p": 1.1}, {"top_k": True}, {"max_tokens": -2}, {"max_completion_tokens": True}):
             with self.assertRaises(ValueError):
                 server.request_parameters(body, 128, 1)
 
@@ -187,6 +190,149 @@ class ProtocolTests(unittest.TestCase):
     def test_max_tokens_zero(self):
         params, _ = server.request_parameters({"max_tokens": 0}, 128, 128)
         self.assertEqual(params["max_tokens"], 0)
+
+
+class SafetyTests(unittest.TestCase):
+    def test_grammar_helper_failure_sends_negative_ack_and_drains(self):
+        engine = FakeEngine([{"event": "sample", "token": 10},
+                             {"event": "error", "error": "empty grammar candidates"},
+                             {"event": "token", "token": 11}, done()])
+        class BrokenGrammar(FakeTokenizer):
+            def call(self, req):
+                if req["op"] == "grammar_check":
+                    raise RuntimeError("grammar helper failed")
+                return super().call(req)
+        app = server.Application(engine, BrokenGrammar({11: b"fresh"}))
+        with self.assertRaisesRegex(RuntimeError, "grammar helper failed"):
+            list(app.events({"tokens": [1]}, []))
+        self.assertEqual(engine.writes[-1], {"accepted": False, "allowed": []})
+        # The previous terminal error was consumed before unlocking the channel.
+        self.assertEqual(list(app.events({"tokens": [2]}, []))[-1]["message"]["content"], "fresh")
+
+    def test_cancel_does_not_call_failed_grammar_helper(self):
+        engine = FakeEngine([{"event": "prefill"}, {"event": "sample", "token": 10},
+                             {"event": "error", "error": "empty grammar candidates"}])
+        class BrokenGrammar(FakeTokenizer):
+            def call(self, req):
+                raise AssertionError("cancellation must not call tokenizer")
+        app = server.Application(engine, BrokenGrammar({}))
+        events = app.events({"tokens": [1]}, [])
+        next(events)
+        events.close()
+        self.assertEqual(engine.writes[-1], {"accepted": False, "allowed": []})
+        with self.assertRaises(StopIteration): engine.read()
+
+    def test_generation_aliases_and_context_clamping(self):
+        cases = [({}, 127), ({"max_tokens": 256}, 127),
+                 ({"max_completion_tokens": 7}, 7), ({"max_tokens": -1}, 127),
+                 ({"max_tokens": 2, "max_completion_tokens": 3}, 3),
+                 ({"max_tokens": 2, "max_completion_tokens": 3, "n_predict": 4}, 4)]
+        for body, expected in cases:
+            with self.subTest(body=body):
+                self.assertEqual(server.request_parameters(body, 128, 1)[0]["max_tokens"], expected)
+        with self.assertRaisesRegex(ValueError, "prompt exceeds"):
+            server.request_parameters({}, 128, 129)
+
+    def test_disconnected_before_start_does_not_touch_engine(self):
+        engine = FakeEngine([])
+        app = server.Application(engine, FakeTokenizer({}))
+        with self.assertRaises(server.ClientDisconnected):
+            list(app.events({"tokens": [1]}, [], cancelled=lambda: True))
+        self.assertEqual(engine.writes, [])
+
+    def test_nonstream_disconnect_sends_cancel_and_drains(self):
+        engine = FakeEngine([{"event": "token", "token": 10}, done()])
+        disconnected = [False]
+        class DisconnectingTokenizer(FakeTokenizer):
+            def call(self, req):
+                disconnected[0] = True
+                return super().call(req)
+        app = server.Application(engine, DisconnectingTokenizer({10: b"ok"}))
+        with self.assertRaises(server.ClientDisconnected):
+            list(app.events({"tokens": [1]}, [], stream_parse=False, cancelled=lambda: disconnected[0]))
+        self.assertEqual(engine.writes[-1], {"continue": False})
+        with self.assertRaises(StopIteration): engine.read()
+
+    def test_inference_queue_wait_is_bounded_and_slot_released(self):
+        app = server.Application(FakeEngine([]), FakeTokenizer({}))
+        app.queue_timeout = 0.01
+        app.lock.acquire()
+        try:
+            with self.assertRaisesRegex(server.ServerBusy, "timed out"):
+                with app.inference_slot(): pass
+        finally:
+            app.lock.release()
+        with app.inference_slot(): pass
+        self.assertTrue(app.inference_queue.acquire(blocking=False))
+        self.assertTrue(app.inference_queue.acquire(blocking=False))
+        try:
+            with self.assertRaisesRegex(server.ServerBusy, "full"):
+                with app.inference_slot(): pass
+        finally:
+            app.inference_queue.release()
+            app.inference_queue.release()
+
+    def test_rpc_partial_frame_timeout_invalidates_channel(self):
+        code = "import sys,time,json;print(json.dumps(dict(event='ready')),flush=True);sys.stdout.write('{');sys.stdout.flush();time.sleep(30)"
+        rpc = server.RPC([sys.executable, "-c", code], read_timeout=0.05)
+        try:
+            start = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "timed out"):
+                rpc.read()
+            self.assertLess(time.monotonic() - start, 1.0)
+            self.assertIsNotNone(rpc.failure)
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                rpc.write({"tokens": [1]})
+            with self.assertRaisesRegex(RuntimeError, "unavailable"):
+                rpc.read()
+        finally:
+            rpc.close()
+
+    def test_rpc_blocked_write_invalidates_channel(self):
+        code = "import time,json;print(json.dumps(dict(event='ready')),flush=True);time.sleep(30)"
+        rpc = server.RPC([sys.executable, "-c", code], read_timeout=0.05)
+        try:
+            start = time.monotonic()
+            with self.assertRaisesRegex(RuntimeError, "write timed out"):
+                rpc.write({"content": "x" * 1024 * 1024})
+            self.assertLess(time.monotonic() - start, 1.0)
+            self.assertIsNotNone(rpc.failure)
+        finally:
+            rpc.close()
+
+    def test_http_busy_is_503_with_retry_after(self):
+        app = server.Application(FakeEngine([]), FakeTokenizer({}))
+        app.inference_queue.acquire()
+        app.inference_queue.acquire()
+        class QuietHandler(server.Handler):
+            def log_message(self, *args): pass
+        http_server = server.ThreadingHTTPServer(("127.0.0.1", 0), QuietHandler)
+        http_server.app = app
+        thread = threading.Thread(target=http_server.handle_request)
+        thread.start()
+        connection = http.client.HTTPConnection(*http_server.server_address, timeout=1.0)
+        try:
+            connection.request("POST", "/completion", json.dumps({"prompt": [1]}), {"Connection": "close"})
+            response = connection.getresponse()
+            self.assertEqual(response.status, 503)
+            self.assertEqual(response.getheader("Retry-After"), "1")
+            self.assertIn("queue is full", json.loads(response.read())["error"]["message"])
+        finally:
+            connection.close()
+            thread.join(timeout=1)
+            http_server.server_close()
+            app.inference_queue.release()
+            app.inference_queue.release()
+
+    def test_rpc_nonobject_frame_invalidates_channel(self):
+        code = "import time,json;print(json.dumps(dict(event='ready')),flush=True);print('[]',flush=True);time.sleep(30)"
+        rpc = server.RPC([sys.executable, "-c", code], read_timeout=0.1)
+        try:
+            with self.assertRaisesRegex(RuntimeError, "must be an object"):
+                rpc.read()
+            self.assertIsNotNone(rpc.failure)
+        finally:
+            rpc.close()
 
 
 @unittest.skipUnless(os.environ.get("M31_TEST_TOKENIZER") and os.environ.get("M31_TEST_MODEL"),

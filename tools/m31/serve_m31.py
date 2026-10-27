@@ -11,6 +11,9 @@ import codecs
 import contextlib
 import json
 import os
+import queue
+import select
+import socket
 from pathlib import Path
 import signal
 import subprocess
@@ -22,38 +25,118 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
 class RPC:
-    def __init__(self, argv):
+    """Line RPC with bounded waits; a timed-out channel is never reused."""
+    def __init__(self, argv, read_timeout=300.0, startup_timeout=600.0):
+        if read_timeout <= 0 or startup_timeout <= 0:
+            raise ValueError("RPC timeouts must be positive")
         self.lock = threading.RLock()
+        self.read_timeout = read_timeout
+        self.failure = None
+        self.lines = queue.Queue(maxsize=8)
+        self.stopped = threading.Event()
         self.process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                         text=True, encoding="utf-8", bufsize=1)
-        self.ready = self.read()
-        if self.ready.get("event") != "ready":
+        os.set_blocking(self.process.stdin.fileno(), False)
+        self.reader = threading.Thread(target=self._receive, daemon=True, name="m31-rpc-reader")
+        self.reader.start()
+        try:
+            self.ready = self.read(timeout=startup_timeout)
+            if self.ready.get("event") != "ready":
+                raise RuntimeError(f"helper did not become ready: {self.ready}")
+        except BaseException:
             self.close()
-            raise RuntimeError(f"helper did not become ready: {self.ready}")
+            raise
+
+    def _receive(self):
+        try:
+            while not self.stopped.is_set():
+                # A missing newline cannot make the request thread wait forever.
+                line = self.process.stdout.readline(64 * 1024 * 1024 + 1)
+                if len(line) > 64 * 1024 * 1024:
+                    raise RuntimeError("helper RPC frame exceeds 64 MiB")
+                item = line if line else EOFError("helper closed stdout")
+                while not self.stopped.is_set():
+                    try:
+                        self.lines.put(item, timeout=0.1)
+                        break
+                    except queue.Full:
+                        pass
+                if not line:
+                    return
+        except Exception as exc:
+            while not self.stopped.is_set():
+                try:
+                    self.lines.put(exc, timeout=0.1)
+                    return
+                except queue.Full:
+                    pass
+
+    def invalidate(self, reason):
+        self.failure = self.failure or str(reason)
+        self.stopped.set()
+        if self.process.poll() is None:
+            with contextlib.suppress(ProcessLookupError):
+                self.process.terminate()
+
+    def _healthy(self):
+        if self.failure is not None:
+            raise RuntimeError(f"helper RPC unavailable: {self.failure}")
 
     def write(self, value):
-        self.process.stdin.write(json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n")
-        self.process.stdin.flush()
+        self._healthy()
+        # Nonblocking pipe writes also bound requests whose helper stopped
+        # consuming stdin. A timeout invalidates the whole framed channel.
+        data = memoryview((json.dumps(value, ensure_ascii=False, allow_nan=False) + "\n").encode("utf-8"))
+        deadline = time.monotonic() + self.read_timeout
+        try:
+            while data:
+                try:
+                    written = os.write(self.process.stdin.fileno(), data)
+                    if written <= 0:
+                        raise BrokenPipeError("helper closed stdin")
+                    data = data[written:]
+                except BlockingIOError:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0 or not select.select([], [self.process.stdin], [], remaining)[1]:
+                        raise TimeoutError("helper RPC write timed out")
+        except (OSError, ValueError) as exc:
+            self.invalidate(exc)
+            raise RuntimeError(f"helper RPC write failed: {exc}") from exc
 
-    def read(self):
-        line = self.process.stdout.readline()
-        if not line:
-            raise RuntimeError(f"helper exited: rc={self.process.poll()}")
-        value = json.loads(line)
-        return value
+    def read(self, timeout=None):
+        self._healthy()
+        try:
+            item = self.lines.get(timeout=self.read_timeout if timeout is None else timeout)
+            if isinstance(item, Exception):
+                raise item
+            value = json.loads(item)
+            if not isinstance(value, dict):
+                raise ValueError("helper RPC response must be an object")
+            return value
+        except (queue.Empty, ValueError, EOFError, OSError) as exc:
+            reason = "helper RPC timed out" if isinstance(exc, queue.Empty) else str(exc)
+            self.invalidate(reason)
+            raise RuntimeError(reason) from exc
+        except Exception as exc:
+            self.invalidate(exc)
+            raise RuntimeError(f"helper RPC read failed: {exc}") from exc
 
     def call(self, value):
-        with self.lock:
+        if not self.lock.acquire(timeout=self.read_timeout):
+            raise RuntimeError("helper RPC is busy")
+        try:
             self.write(value)
             result = self.read()
             if "error" in result:
                 raise RuntimeError(result["error"])
             return result
+        finally:
+            self.lock.release()
 
     def close(self):
+        self.stopped.set()
         if self.process.poll() is None:
-            # An idle helper exits normally on EOF, releasing Engine and flushing
-            # its GPU/cache counters. SIGTERM bypasses those destructors.
+            # EOF lets a healthy, idle engine flush profiling/cache counters.
             with contextlib.suppress(BrokenPipeError, OSError, ValueError):
                 self.process.stdin.close()
             try:
@@ -65,6 +148,18 @@ class RPC:
                 except subprocess.TimeoutExpired:
                     self.process.kill()
                     self.process.wait()
+        self.reader.join(timeout=1)
+        with contextlib.suppress(BrokenPipeError, OSError, ValueError):
+            self.process.stdin.close()
+        self.process.stdout.close()
+
+
+class ServerBusy(RuntimeError):
+    pass
+
+
+class ClientDisconnected(ConnectionError):
+    pass
 
 
 def validate_messages(messages):
@@ -84,11 +179,14 @@ def validate_messages(messages):
 
 
 def request_parameters(body, context, prompt_tokens):
-    maximum = body.get("max_tokens", body.get("n_predict", 256))
-    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < 0:
-        raise ValueError("max_tokens must be a nonnegative integer")
-    if prompt_tokens + maximum > context:
-        raise ValueError("prompt plus max_tokens exceeds configured context")
+    # Match native/OpenAI aliases; omitted or -1 means the remaining context.
+    maximum = body.get("n_predict", body.get("max_completion_tokens", body.get("max_tokens", -1)))
+    if isinstance(maximum, bool) or not isinstance(maximum, int) or maximum < -1:
+        raise ValueError("generation limit must be an integer >= -1")
+    if prompt_tokens > context:
+        raise ValueError("prompt exceeds configured context")
+    available = context - prompt_tokens
+    maximum = available if maximum == -1 else min(maximum, available)
     if body.get("n", 1) != 1:
         raise ValueError("only n=1 is supported")
     for key in ("frequency_penalty", "presence_penalty"):
@@ -141,10 +239,28 @@ class Application:
         self.engine, self.tokenizer, self.model = engine, tokenizer, model
         self.profile = profile
         self.lock = threading.Lock()
+        self.inference_queue = threading.BoundedSemaphore(2)
+        self.queue_timeout = 1.0
         self.context = int(engine.ready["context"])
         if int(engine.ready["vocab"]) != int(tokenizer.ready["vocab"]):
             raise ValueError("engine/tokenizer vocabulary mismatch")
         self.pieces = {}
+
+    @contextlib.contextmanager
+    def inference_slot(self):
+        # One running request and one bounded waiter; reject further clients.
+        if not self.inference_queue.acquire(blocking=False):
+            raise ServerBusy("inference queue is full")
+        acquired = False
+        try:
+            acquired = self.lock.acquire(timeout=self.queue_timeout)
+            if not acquired:
+                raise ServerBusy("inference queue wait timed out")
+            yield
+        finally:
+            if acquired:
+                self.lock.release()
+            self.inference_queue.release()
 
     def tokenize(self, text, **kwargs):
         return self.tokenizer.call({"op": "tokenize", "content": text, **kwargs})["tokens"]
@@ -158,11 +274,21 @@ class Application:
             tools = body.get("tools", [])
             if not isinstance(tools, list):
                 raise ValueError("tools must be an array")
+            for tool in tools:
+                function = tool.get("function") if isinstance(tool, dict) else None
+                if (not isinstance(tool, dict) or tool.get("type") != "function" or
+                        not isinstance(function, dict) or not isinstance(function.get("name"), str) or
+                        not function["name"] or not isinstance(function.get("parameters", {}), dict)):
+                    raise ValueError("tools must contain function objects with a name and parameters object")
+            if not isinstance(body.get("parallel_tool_calls", True), bool):
+                raise ValueError("parallel_tool_calls must be boolean")
             kwargs = body.get("chat_template_kwargs", {})
             if not isinstance(kwargs, dict):
                 raise ValueError("chat_template_kwargs must be an object")
             kwargs = dict(kwargs)
             enable_thinking = kwargs.get("enable_thinking", True)
+            if not isinstance(enable_thinking, bool):
+                raise ValueError("enable_thinking must be boolean")
             if "reasoning_effort" in body:
                 effort = body["reasoning_effort"]
                 if not isinstance(effort, str):
@@ -199,29 +325,42 @@ class Application:
             self.pieces[token] = bytes(self.tokenizer.call({"op": "piece", "token": token})["bytes"])
         return self.pieces[token]
 
-    def events(self, params, stops, chat=True, stream_parse=True):
+    def events(self, params, stops, chat=True, stream_parse=True, cancelled=lambda: False):
         """Caller holds self.lock. Consume fully, or close generator to cancel/drain."""
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         text = ""
         previous = {"role": "assistant", "content": "", "reasoning_content": ""}
         waiting_ack = False
+        waiting_grammar = False
+        started = False
         completed = False
         tool_ids = {}
         try:
+            if cancelled():
+                raise ClientDisconnected("client disconnected")
             self.engine.write(params)
+            started = True
             while True:
                 event = self.engine.read()
                 if event.get("event") == "error":
                     completed = True
                     raise RuntimeError(event["error"])
                 if event["event"] == "sample":
+                    waiting_grammar = True
+                    if cancelled():
+                        raise ClientDisconnected("client disconnected")
                     self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
+                    waiting_grammar = False
                 elif event["event"] == "prefill":
+                    if cancelled():
+                        raise ClientDisconnected("client disconnected")
                     yield event
                 elif event["event"] == "token":
                     waiting_ack = True
                     text += decoder.decode(self.piece(event["token"]))
                     safe_text, stop = clipped_text(text, stops)
+                    if cancelled():
+                        raise ClientDisconnected("client disconnected")
                     # Stop decisions precede ACK. The native next forward can overlap
                     # PEG work; cancellation still drains at most one token boundary.
                     self.engine.write({"continue": not stop})
@@ -275,28 +414,51 @@ class Application:
                 else:
                     raise RuntimeError(f"unexpected engine event: {event}")
         finally:
-            if not completed:
-                # Cancel at the next token boundary and consume its final event before reusing stdin.
-                if not waiting_ack:
-                    while True:
-                        event = self.engine.read()
-                        if event["event"] == "sample":
-                            self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
-                        elif event["event"] == "token":
-                            waiting_ack = True
+            if started and not completed:
+                # Grammar failure must unblock the native sample handshake before
+                # waiting for its terminal error. Never invoke the failed helper
+                # while draining, and never reuse an undrained channel.
+                unwinding = sys.exc_info()[0] is not None
+                try:
+                    if waiting_grammar:
+                        self.engine.write({"accepted": False, "allowed": []})
+                    elif waiting_ack:
+                        self.engine.write({"continue": False})
+                    deadline = time.monotonic() + 30.0
+                    for _ in range(16):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise RuntimeError("engine cancellation timed out")
+                        event = self.engine.read(timeout=remaining)
+                        kind = event.get("event")
+                        if kind in ("done", "error"):
                             break
-                        if event["event"] in ("done", "error"):
-                            completed = True
-                            break
-                if waiting_ack:
-                    self.engine.write({"continue": False})
-                    event = self.engine.read()
-                    if event["event"] not in ("done", "error"):
-                        raise RuntimeError("engine did not acknowledge cancellation")
+                        if kind == "sample":
+                            self.engine.write({"accepted": False, "allowed": []})
+                        elif kind == "token":
+                            self.engine.write({"continue": False})
+                        elif kind != "prefill":
+                            raise RuntimeError("unexpected engine event during cancellation")
+                    else:
+                        raise RuntimeError("engine cancellation exceeded event limit")
+                except Exception as exc:
+                    if hasattr(self.engine, "invalidate"):
+                        self.engine.invalidate(f"cancellation failed: {exc}")
+                    if not unwinding:
+                        raise
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
+    timeout = 60.0
+
+    def disconnected(self):
+        try:
+            if not select.select([self.connection], [], [], 0)[0]:
+                return False
+            return not self.connection.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+        except (OSError, ValueError):
+            return True
 
     @property
     def app(self):
@@ -307,12 +469,14 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        if status == 503:
+            self.send_header("Retry-After", "1")
         self.end_headers()
         self.wfile.write(payload)
 
     def do_GET(self):
         if self.path in ("/health", "/healthz"):
-            alive = self.app.engine.process.poll() is None and self.app.tokenizer.process.poll() is None
+            alive = all(rpc.process.poll() is None and rpc.failure is None for rpc in (self.app.engine, self.app.tokenizer))
             self.json(200 if alive else 503, {"status": "ok" if alive else "error"})
         elif self.path == "/v1/models":
             self.json(200, {"object": "list", "data": [{"id": self.app.model, "object": "model", "created": 0, "owned_by": "local"}]})
@@ -342,7 +506,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             chat = self.path == "/v1/chat/completions"
             native = self.path == "/completion"
-            with self.app.lock:
+            with self.app.inference_slot():
                 params, stops = self.app.prepare(body, chat)
                 request_id, created = "chatcmpl-" + uuid.uuid4().hex, int(time.time())
                 if body.get("stream", False):
@@ -370,7 +534,7 @@ class Handler(BaseHTTPRequestHandler):
                         return value
 
                     emit(chunk({"role": "assistant"} if chat else {}))
-                    with contextlib.closing(self.app.events(params, stops, chat)) as events:
+                    with contextlib.closing(self.app.events(params, stops, chat, cancelled=self.disconnected)) as events:
                         for event in events:
                             if event["event"] == "delta":
                                 emit(chunk(event["delta"]))
@@ -382,7 +546,7 @@ class Handler(BaseHTTPRequestHandler):
                     emit("[DONE]")
                 else:
                     done = None
-                    with contextlib.closing(self.app.events(params, stops, chat, stream_parse=False)) as events:
+                    with contextlib.closing(self.app.events(params, stops, chat, stream_parse=False, cancelled=self.disconnected)) as events:
                         for event in events:
                             if event["event"] == "done":
                                 done = event
@@ -399,18 +563,19 @@ class Handler(BaseHTTPRequestHandler):
                         value = {"id": request_id, "object": "chat.completion" if chat else "text_completion",
                                  "created": created, "model": self.app.model, "choices": [choice], "usage": usage, "timings": timings}
                     self.json(200, value)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ClientDisconnected, TimeoutError):
             self.close_connection = True
         except Exception as exc:
             if streaming:
                 try:
                     self.wfile.write(("data: " + json.dumps({"error": {"message": str(exc)}}) + "\n\ndata: [DONE]\n\n").encode())
                     self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
+                except (BrokenPipeError, ConnectionResetError, TimeoutError):
                     pass
             else:
-                self.json(400 if isinstance(exc, (ValueError, KeyError, TypeError)) else 500,
-                          {"error": {"message": str(exc), "type": "invalid_request_error" if isinstance(exc, ValueError) else "server_error"}})
+                status = 503 if isinstance(exc, ServerBusy) else 400 if isinstance(exc, (ValueError, KeyError, TypeError)) else 500
+                with contextlib.suppress(BrokenPipeError, ConnectionResetError, TimeoutError):
+                    self.json(status, {"error": {"message": str(exc), "type": "invalid_request_error" if status == 400 else "server_error"}})
 
 
 def main():
@@ -438,7 +603,7 @@ def main():
             "--gpu-experts-gib", str(args.gpu_experts_gib), "--gpu-experts-min-tokens", str(args.gpu_experts_min_tokens)]
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
-    tokenizer = RPC([args.tokenizer, args.model])
+    tokenizer = RPC([args.tokenizer, args.model], read_timeout=30.0)
     engine = None
     server = None
     try:
