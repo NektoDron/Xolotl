@@ -1,3 +1,25 @@
+# MiniMax-M3.1: vision принят
+
+27.10.2026. Ветка `aiserver/m31-vision`, функциональный код `23ccb294`.
+Итог `/mnt/ai/logs/m31-vision/REPORT.final.md`, приёмка `acceptance.final.json`.
+Картинки/видео идут через mtmd CPU/CUDA и native `forward_mixed`: весь stream
+одним v8 prefill, main positions linear (не M-RoPE). PNG515/video3863/code128:
+все4506 logits rows побитно GPU oracle. HTTP vision6/6, tools3/3 PASS.
+Cold TTFT PNG4.36048с/video4.04333с против ref5.238/36.171; warm3.06169/3.20453с.
+RTX5090 GPU0: mainctx40000/cache7 + encoder peak28382MiB, auto→CUDA.
+CPU fallback6×16, cache backend+GGMLenv; CPU/GPU encoder outputs различаются,
+поэтому паритет заявлен отдельно по backend. Stock PR CUDA PNG побитен.
+
+Опционально: standalone `tools/m31/serve_m31.py --vision-config FILE`, common
+bridge config vision; схема `docs/m31/vision-http.md`. Frozen binaries/receipts
+`/mnt/ai/logs/m31-vision/final-build/`, все исходники/коммиты локальные, push нет.
+Merge актуального `aiserver/m31-port` faeb1332 Already up to date; CPU/CUDA
+пересборка и107unittest (10optional skips)+NumPy/tiny прошли.
+Свой preset m31-vision-test снят, свои GPU/build units закончены; GPU1/prod не
+менялись, duty8084 healthy. GPU0 затем забрала соседняя сессия, её не останавливать.
+
+---
+
 # MiniMax-M3.1: port6, M2 принят
 
 Отчёт: /mnt/ai/logs/m31-port/REPORT-port6.final.md. Машинная приёмка:
