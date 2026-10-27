@@ -6,7 +6,7 @@ diff --git a/ggml/include/ggml-cuda.h b/ggml/include/ggml-cuda.h
  GGML_BACKEND_API bool ggml_backend_cuda_allreduce_tensor(ggml_backend_t * backends, struct ggml_tensor ** tensors, size_t n_backends);
  
 +// M31 per-node projection dispatch. Mark before allocation/capture; immutable
-+// afterwards. Only contiguous 2D F32/Q6_K/Q8_0 weights, F32 input and K1..4 are
++// afterwards. Only contiguous 2D F32/Q4_K/Q5_K/Q6_K/Q8_0 weights, F32 input and K1..4 are
 +// supported. Source weights must be leaf NONE tensors in a bound immutable
 +// WEIGHTS buffer; computed/CAST operands and unbound leaves are rejected before
 +// allocation. Rejects unsupported nodes without mutation. Preserves precision and
@@ -42,7 +42,7 @@ diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 +    auto * weight_buffer = weight->view_src ? weight->view_src->buffer : weight->buffer;
 +    if (weight->op != GGML_OP_NONE || !weight_buffer ||
 +            ggml_backend_buffer_get_usage(weight_buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) return false;
-+    if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_Q6_K && weight->type != GGML_TYPE_Q8_0) return false;
++    if (weight->type != GGML_TYPE_F32 && weight->type != GGML_TYPE_Q4_K && weight->type != GGML_TYPE_Q5_K && weight->type != GGML_TYPE_Q6_K && weight->type != GGML_TYPE_Q8_0) return false;
 +    return input->type == GGML_TYPE_F32 && ggml_get_op_params_i32(node,1) == GGML_HINT_NONE &&
 +        weight->ne[0] > 0 && weight->ne[1] > 0 && input->ne[0] == weight->ne[0] &&
 +        input->ne[1] >= 1 && input->ne[1] <= 4 &&

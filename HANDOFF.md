@@ -1,3 +1,46 @@
+# UD-Q2_K_XL завершён: NOT_ACCEPTED, новых заданий нет
+
+Итог `/mnt/ai/logs/m31-port/REPORT-q2kxl.final.md`, копия
+`docs/m31/q2kxl-results.md`, машина `q2-final-summary.json` в каталоге логов.
+Очередь `q2-wave/queue.json` закрыта: active/pending пусты.
+**Не продолжать старые очереди, подготовленные jobs или watchers автоматически.**
+
+ReferenceQ2E3: PP484/532.8/479.1,TG26.11/25.21/24.37,GSM97/tools19 PASS.
+NativeQ2baseline: median2 PP1678.8/1550.25/1302.1,
+TG27.785/26.635/27.605;16Kv1TG24.71<25 сохранён. GSM97/tools17 FAIL.
+Primary matched4(allCPUexpertstorage+GPUopoffload/F16)224rowsbitwisePASS;
+residentE3 baselineKLFAIL (.010596mean/.360217max).
+
+Cachednative3E3layers(cache9.88/384slots/decodeonlyseed384) code128/tail32
+побитноPASS. Finalprofile6656native4исполнены, ноcleanordinaryE3F16oracle2048
+сstockFFN59pruning FAIL:3000top1.875/meanKL.226658,
+16K.84375/.213821,32K.6875/1.980432,maxKL13.538279на32K.
+**Cached benchmark и новая GSM/tools НЕ запускались;97/17 емунепереносить.**
+Source/profile/seedpreparationполезныкакresearchoptin, некакacceptedrecipe.
+Дальнейшаяидеяmicrobatch2048внутрислоясreuseweights толькоdesign, нереализована.
+
+Baseline2speed/freshV8/E4/обеquality/shortcachedчистыотпозднегоинцидента.
+Внешнийwatchdog создалгонкуforce-minerstart; contaminated oldcap16runtimeOOM
+иfirstordinaryrest3 невалидныкакчистыеcapacity/numericproof.
+WatchermainPID2880483temporarilySTOP17:41:50→CONT18:03:28, originalunitbytes
+равны; configне менялся. RootNVMLmonitorостановлен1066samples/0contaminatedactive.
+Чистыйretry214/209active/0foreignподтверждаетистинныйnumericalFAIL.
+
+FinalresourcesPASS15: ownmodel/worker/experimentunits/PIDs/listenersнет,
+cardlockfree,tempkeysremoved,13baselinepresets/topkeys/V8ELFunchanged,
+GPU1pearl/CPUdutyalive,holdfilepresent. Watchrestoredoriginalpolicyможет
+вернутьminer0вidle; rootеёнепереписывал. Visionworktreeне трогали.
+Ничего не удаляли/непушили, permanentpresetsне оставляли.
+
+Canonical `build-port7-canonical/q2-v1`:49CPU/CUDAstagesPASS,GCC14/CUDA13.1/sm120a,
+gen2b51de98...,serve2e2a4de3... . Existing989sourcefilesпослеbuildunchanged,
+новыетолькоstandalonehelpers/docs. Runtime/defaultIQ3typespreservedoptin.
+Коммитыa9e482aa,adcf5daa,68c8a7e3,3268df5a; docscommit/finalHEADсмmachineJSON.
+Принятойruntime/qualityостаётсяprotectedport6v8(97/19), еёноваяприёмканепереноситсянаQ2.
+
+
+---
+
 # MiniMax-M3.1: текущая приёмка post-merge v14
 
 27.10.2026. Ветка `aiserver/m31-vision`; merge `7a0f5e6a` включает

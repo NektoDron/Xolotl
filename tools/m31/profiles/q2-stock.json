@@ -1,0 +1,16 @@
+{
+  "format": "m31-runtime-profile-v1",
+  "name": "q2-stock",
+  "inherits": "port7-baseline.json",
+  "description": "UD-Q2_K_XL: штатный CUDA MMQ prefill и CPU RoutedGraph decode для исходной проверки совместимости. Экспериментальная приёмка ведётся отдельно.",
+  "environment": {
+    "M31_CPU_DIRECT": "0",
+    "M31_CPU_FUSED": "0",
+    "M31_CPU_STOCK_EXPERTS": "0"
+  },
+  "q2_provenance": {
+    "model_revision": "b17b7f5459c0b8f127ea12ee774409b282521d6a",
+    "model_quant": "UD-Q2_K_XL",
+    "status": "Experimental; no inherited IQ3_S quality or speed acceptance."
+  }
+}

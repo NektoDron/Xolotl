@@ -1,5 +1,14 @@
 # Профили M31
 
+`q2-stock.json` и `q2-native.json` предназначены только для отдельной волны
+UD-Q2_K_XL. Оба наследуют `port7-baseline.json`: stock выключает custom CPU
+decode и использует RoutedGraph, native включает `M31_CPU_STOCK_EXPERTS=1`
+для штатных IQ2_XS dot-функций в существующем fused CPU decode. Флаг
+выключен без явного opt-in; арифметика прежних IQ3_XXS/IQ4_XS/NVFP4
+не меняется. DSpark/batch-dense и GPU cached decode остаются выключенными.
+Эти профили не наследуют качество или приёмку IQ3_S; результаты нового
+кванта фиксируются отдельно в `REPORT-q2kxl.final.md`.
+
 `native-gpu.json` содержит48 ENV значений и CLI параметры финального native
 CUDA кандидата port6: ctx40000, max chunk32768, CPU80, host32, pack8,
 expert cache7GiB, RAM arena170GiB, seed0. Включены reuse, persistent pool,

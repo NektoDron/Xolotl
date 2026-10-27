@@ -5,7 +5,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -17,8 +19,7 @@ class CpuDirectDecode {
     std::vector<uint8_t> qgate, qup, qdown;
     std::vector<float> gate, up, hidden, down;
     static const ggml_type_traits_cpu * traits(const ggml_tensor * weight) {
-        if (!weight || !weight->data || (weight->type != GGML_TYPE_IQ3_XXS &&
-            weight->type != GGML_TYPE_IQ4_XS && weight->type != GGML_TYPE_NVFP4))
+        if (!weight || !weight->data || !supported_weight(weight))
             throw std::invalid_argument("M31 direct CPU: unsupported expert weight");
         auto result = ggml_get_type_traits_cpu(weight->type);
         if (!result || !result->vec_dot || !ggml_get_type_traits_cpu(result->vec_dot_type)->from_float)
@@ -33,10 +34,35 @@ class CpuDirectDecode {
         for (size_t row = 0; row < rows; ++row) quant(input + row * size_t(columns), output.data() + row * stride, columns);
     }
 public:
+    // IQ2_XS is deliberately an opt-in to the existing stock nrc=1 CPU dots.
+    // It has no weight from_float callback: only activation quantization is used.
+    // Existing accepted formats return before consulting the new environment flag.
+    static bool supported_type(ggml_type type) {
+        if (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_NVFP4)
+            return true;
+        if (type != GGML_TYPE_IQ2_XS) return false;
+        const char * enabled = std::getenv("M31_CPU_STOCK_EXPERTS");
+        if (!enabled || std::strcmp(enabled, "1") != 0) return false;
+        const auto * wt = ggml_get_type_traits_cpu(type);
+        const auto * activation = wt ? ggml_get_type_traits_cpu(wt->vec_dot_type) : nullptr;
+        return wt && wt->vec_dot && activation && activation->from_float;
+    }
+    static bool supported_weight(const ggml_tensor * weight) {
+        if (!weight || !supported_type(weight->type)) return false;
+        if (weight->type != GGML_TYPE_IQ2_XS) return true;
+        const auto * wt = ggml_get_type_traits_cpu(weight->type);
+        return weight->ne[0] > 0 && weight->ne[0] <= std::numeric_limits<int>::max() &&
+            weight->ne[0] % ggml_blck_size(weight->type) == 0 &&
+            weight->ne[0] % ggml_blck_size(wt->vec_dot_type) == 0 &&
+            weight->ne[1] > 0 && weight->ne[1] <= 65536 &&
+            weight->ne[2] > 0 && weight->ne[2] <= 128 && weight->ne[3] == 1 &&
+            weight->nb[0] == ggml_type_size(weight->type) &&
+            weight->nb[1] == ggml_row_size(weight->type, weight->ne[0]) &&
+            weight->nb[2] >= weight->nb[1] * size_t(weight->ne[1]);
+    }
     static bool supported(const ggml_tensor * wg, const ggml_tensor * wu, const ggml_tensor * wd) {
         for (auto tensor : {wg, wu, wd}) {
-            if (!tensor || (tensor->type != GGML_TYPE_IQ3_XXS && tensor->type != GGML_TYPE_IQ4_XS &&
-                tensor->type != GGML_TYPE_NVFP4)) return false;
+            if (!supported_weight(tensor)) return false;
         }
         return true;
     }

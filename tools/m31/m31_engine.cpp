@@ -1747,7 +1747,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         bool direct_supported = true;
         for (int l = int(p_->g.dense_lead); l < p_->g.layers; ++l)
             for (int type : {p_->g.gate_types[size_t(l)], p_->g.up_types[size_t(l)], p_->g.down_types[size_t(l)]})
-                direct_supported = direct_supported && (type == GGML_TYPE_IQ3_XXS || type == GGML_TYPE_IQ4_XS || type == GGML_TYPE_NVFP4);
+                direct_supported = direct_supported && CpuDirectDecode::supported_type(ggml_type(type));
         // Construct before ggml strict-affinity can pin the calling thread.
         if (enabled("M31_CPU_DIRECT") && !cfg.tap && cfg.threads <= 64 && direct_supported)
             p_->cpu_direct = std::make_unique<CpuDirectDecode>(unsigned(cfg.threads));
