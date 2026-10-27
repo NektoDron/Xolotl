@@ -33,10 +33,11 @@ public:
     // stay immutable/alive until wait(). Owner reserves DISJOINT slots before
     // start: no current compute or another uploader may read/write these slots.
     // Owner publishes its cache entries only after a successful wait().
-    void start(std::vector<Job> jobs, bool compact = true) {
+    // Optional registration and its immutable arena sources outlive wait().
+    void start(std::vector<Job> jobs, bool compact = true, const GpuRegisteredArena *registration = nullptr) {
         require(!active(), "start while previous work is uncollected");
         require(!jobs.empty() && jobs.size() <= 8192, "invalid bounded prefetch job count");
-        future_ = std::async(std::launch::async, [this, jobs=std::move(jobs), compact]() {
+        future_ = std::async(std::launch::async, [this, jobs=std::move(jobs), compact, registration]() {
             if (!backend_) {
                 backend_ = ggml_backend_dev_init(device_, nullptr);
                 require(backend_ != nullptr, "private backend initialization failed");
@@ -47,7 +48,8 @@ public:
                 uploads_->begin_batch();
                 for (const auto & job : jobs) {
                     const auto & a=job.spans[0], &b=job.spans[1], &c=job.spans[2];
-                    if (compact) uploads_->enqueue_spans(job.destination,{a,b,c});
+                    if (registration) uploads_->enqueue_registered_spans(job.destination,{a,b,c},*registration);
+                    else if (compact) uploads_->enqueue_spans(job.destination,{a,b,c});
                     else uploads_->enqueue(job.destination,{
                         {a.offset,a.data,a.bytes},{b.offset,b.data,b.bytes},{c.offset,c.data,c.bytes}});
                 }
@@ -59,6 +61,8 @@ public:
                 result.packed_bytes -= before.packed_bytes;
                 result.upload_bytes -= before.upload_bytes;
                 result.staging_reuses -= before.staging_reuses;
+                result.registered_uploads -= before.registered_uploads;
+                result.registered_source_bytes -= before.registered_source_bytes;
                 result.pack_seconds -= before.pack_seconds;
                 result.staging_wait_seconds -= before.staging_wait_seconds;
                 result.submit_seconds -= before.submit_seconds;

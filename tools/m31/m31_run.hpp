@@ -88,7 +88,7 @@ inline Args parse(int argc, char ** argv) {
                                  "--rows all|last|last:N|stride:N --head-tail N --taps none|layers|all]");
     if (a.backend != "cpu" && a.backend != "cuda") throw std::runtime_error("backend must be cpu or cuda");
     if (a.taps != "none" && a.taps != "layers" && a.taps != "all") throw std::runtime_error("invalid taps mode");
-    if (a.chunk > 8192 || a.context > 1048576) throw std::runtime_error("chunk/context above correctness-tool cap");
+    if (a.chunk > 32768 || a.context > 1048576) throw std::runtime_error("chunk/context above correctness-tool cap");
     if (a.head_tail && (a.taps != "none" || (a.rows != "last" && a.rows.rfind("last:", 0) != 0)))
         throw std::runtime_error("bounded head requires --rows last|last:N and --taps none");
     if (a.backend == "cuda") {

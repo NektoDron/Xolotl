@@ -44,7 +44,8 @@ public:
     Engine & operator=(const Engine &) = delete;
     bool init(const std::string & gguf, const Config & cfg, std::string & error);
     const Geometry & geometry() const;
-    // Append one chunk. On error, reset() is required before retrying: caches may be partially written.
+    // Append one chunk. A preflight rejection preserves valid state. Once execution
+    // starts, an error requires reset(): caches may be partially written.
     bool forward(const int32_t * tokens, int n, std::string & error);
     // Logits for a consecutive set of rows in the last chunk. Small row slices avoid vocab*n scratch.
     bool logits(int row, int count, std::vector<float> & out, std::string & error);

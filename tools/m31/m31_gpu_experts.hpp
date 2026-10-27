@@ -1,4 +1,4 @@
-// Opt-in M2 expert execution. Original GGUF quants, one cache shared by all layers.
+// M2 expert execution. Original GGUF quants, one cache shared by all layers.
 #pragma once
 #include "m31_arena.hpp"
 
@@ -19,6 +19,7 @@ public:
         uint64_t hits = 0, misses = 0, evictions = 0, upload_bytes = 0;
         uint64_t graph_batches = 0, forwards = 0;
         uint64_t cached_forwards = 0;
+        uint64_t fast_forwards = 0;
         // Wall time on the calling thread. Async upload_submit can overlap prior
         // DMA; execute includes device completion and must not be called pure kernel time.
         double prepare_seconds = 0, pack_seconds = 0, upload_submit_seconds = 0;
@@ -46,8 +47,8 @@ public:
               ggml_backend_t backend, double cache_gib, int max_chunk, bool q8_activations = false);
 
     // x: [embd,n]; ids and weights: [used,n], all in contiguous GGML order.
-    // Runs one layer-batched mul_mat_id graph with the original [used,n] shape and
-    // slot-remapped IDs. Contributions are summed on GPU in the original top-k order.
+    // Runs native ggml GPU math by default; custom resident FFN and CPU-exact
+    // verification (M31_GPU_EXACT=1) require explicit opt-in. Contributions use original top-k order.
     // Uses OAI SwiGLU(alpha=1.702,limit=7) and each role's external NVFP4 scale.
     std::vector<float> forward(int layer, int n, const std::vector<float> & x,
                                const std::vector<int32_t> & ids,
@@ -57,6 +58,13 @@ public:
     void forward_into(int layer, int n, const std::vector<float> & x,
                       const std::vector<int32_t> & ids, const std::vector<float> & weights,
                       std::vector<float> & output);
+    // Device-only prefill. All tensors are contiguous GPU F32 [embd,n]; dense
+    // input/shared/residual descriptors and buffers stay alive until return.
+    // The destination is separate. Only IDs/route weights/scales cross H2D.
+    // Completes the borrowed-backend or private fast stream before returning.
+    void forward_device(int layer,int n,ggml_tensor * normalized,
+                        const std::vector<int32_t> & ids,const std::vector<float> & weights,
+                        ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination);
     // A cache miss returns false without uploading, evicting, touching LRU or output.
     // A hit executes the complete original [used,n] graph, preserving accumulation.
     // Synchronizes the borrowed backend before exact-dot raw-stream execution.
@@ -66,6 +74,13 @@ public:
     // Readable during a live HTTP worker; no destructor or signal shutdown needed.
     void print_profile(const char * label = "live") const;
     bool exact_cpu_math() const;
+    bool fast_gpu_math() const;
+    bool native_gpu_math() const;
+    size_t workspace_bytes() const;
+    // Actual configured per-expert local GEMM bound, or zero outside fast mode.
+    int fast_expert_batch_rows() const;
+    bool fast_fused_reduction() const;
+    bool fast_rank_phases() const;
     // Caller first runs cache_seed_preflight.py against current GGUF headers/stats.
     // Expected identity/content hashes come from its trusted receipt, not the rank itself.
     // Cold-cache initialization only; seed DMA is complete before returning.

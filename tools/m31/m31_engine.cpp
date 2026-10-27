@@ -8,6 +8,11 @@
 #include "cpu_fused_decode.hpp"
 #include "cpu_threadpool_config.hpp"
 #include "prefill_plan.hpp"
+#include "msa_chunk_limit.hpp"
+#include "gpu_prefill_hidden.hpp"
+#ifdef M31_ENGINE_CUDA
+#include "gpu_attention_fill.hpp"
+#endif
 
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
@@ -190,11 +195,11 @@ struct AttentionInputs {
         if (buffer) ggml_backend_buffer_free(buffer);
         if (context) ggml_free(context);
     }
-    AttentionInputs(ggml_backend_t backend, const Geometry & g, int count, int64_t keys) : n(count), nk(keys) {
+    AttentionInputs(ggml_backend_t backend, const Geometry & g, int count, int64_t keys, bool f16_causal = false) : n(count), nk(keys) {
         context = ggml_init({64 * 1024, nullptr, true});
         require(context != nullptr, "shared attention input metadata allocation failed");
         positions = ggml_new_tensor_1d(context, GGML_TYPE_I32, n);
-        mask = ggml_new_tensor_3d(context, GGML_TYPE_F32, nk, 1, n);
+        mask = ggml_new_tensor_3d(context, f16_causal ? GGML_TYPE_F16 : GGML_TYPE_F32, nk, 1, n);
         bias = ggml_new_tensor_3d(context, GGML_TYPE_F32, nk / g.block, 1, n);
         blocks = ggml_new_tensor_1d(context, GGML_TYPE_I32, nk);
         for (auto t : {positions, mask, bias, blocks}) ggml_set_input(t);
@@ -341,6 +346,14 @@ ggml_tensor * grouped_fa(Graph & b, ggml_tensor * q, ggml_tensor * k, ggml_tenso
     if (ggml_backend_is_cpu(b.backend)) v = ggml_cast(b.c, v, GGML_TYPE_F32);
     auto out = ggml_flash_attn_ext(b.c, q4, k, v, mask, 1.0f / std::sqrt(float(g.head_dim)), 0, 0);
     ggml_prec_set_acc(out, GGML_PREC_F32);
+#ifdef M31_ENGINE_CUDA
+    // Every query can see at most top_blocks complete MSA blocks. The
+    // existing CUDA sparse-FA dispatcher may compact their finite mask cells;
+    // it chooses dense FA when that union would not repay the gather cost.
+    const char * sparse = std::getenv("M31_MSA_SPARSE_FA");
+    if (n > 1 && mask && ggml_backend_is_cuda(b.backend) && sparse && std::string(sparse) == "1")
+        ggml_flash_attn_ext_set_n_kv_max(out, int32_t(g.top_blocks * g.block));
+#endif
     out = ggml_cont(b.c, ggml_permute(b.c, out, 0, 1, 3, 2));
     return ggml_reshape_2d(b.c, out, g.head_dim * g.heads, n);
 }
@@ -357,6 +370,11 @@ struct Engine::Impl {
     ggml_threadpool_t cpu_pool = nullptr;
     std::unique_ptr<Workspace> dense_workspace, cpu_workspace;
     std::unique_ptr<AttentionInputs> attention_inputs;
+    std::unique_ptr<GpuPrefillHidden> prefill_hidden;
+#ifdef M31_ENGINE_CUDA
+    std::unique_ptr<GpuAttentionFill> gpu_attention_fill;
+#endif
+    bool gpu_prefill_chain = false, prefill_chain_active = false;
     struct RoutedGraph {
         std::unique_ptr<Graph> graph;
         ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
@@ -380,8 +398,8 @@ struct Engine::Impl {
     bool gpu_decode_chain = false, dense_async_reads = false, gpu_cached_decode = false;
     bool decode_chain_active = false, native_gather = false, adaptive_prefill = false;
     uint64_t prefill_free_after_resident = 0;
-    int msa_query_tile = 0;
-    bool msa_topk_mask = false;
+    int msa_query_tile = 0, msa_index_tile = 0;
+    bool msa_topk_mask = false, causal_f16 = false, msa_index_nvis = false;
     std::unique_ptr<CpuDirectDecode> cpu_direct;
     std::unique_ptr<CpuFusedDecode> cpu_fused;
 #ifdef M31_SHARED_OVERLAP_TESTING
@@ -457,6 +475,10 @@ struct Engine::Impl {
         dense_workspace.reset();
         cpu_workspace.reset();
         attention_inputs.reset();
+        prefill_hidden.reset();
+#ifdef M31_ENGINE_CUDA
+        gpu_attention_fill.reset();
+#endif
         close_weights();
         if (state_buffer) ggml_backend_buffer_free(state_buffer);
         if (state) ggml_free(state);
@@ -559,16 +581,51 @@ struct Engine::Impl {
         // changing block selection near ties once more than top_blocks exist.
         ikv = ggml_cast(c, ikv, GGML_TYPE_F32);
         ggml_tensor * cell_block = nullptr; // one upload shared by every query tile
+        uint64_t indexer_cells = 0;
+        auto select_blocks = [&](ggml_tensor * query, ggml_tensor * mask, ggml_tensor * block_bias, int query_n, int64_t key_n) {
+            require(key_n * g.index_heads * query_n < INT32_MAX,
+                    "MSA index tile exceeds int32 kernel indexing; reduce M31_MSA_INDEX_TILE/chunk");
+            indexer_cells += uint64_t(key_n) * uint64_t(g.index_heads) * uint64_t(query_n);
+            auto visible_keys = ikv;
+            if (key_n != nk) {
+                visible_keys = ggml_view_2d(c, ikv, g.index_dim, key_n, ikv->nb[1], 0);
+                mask = ggml_view_3d(c, mask, key_n, 1, query_n, mask->nb[1], mask->nb[2], 0);
+                block_bias = ggml_view_3d(c, block_bias, key_n / g.block, 1, query_n,
+                    block_bias->nb[1], block_bias->nb[2], 0);
+            }
+            auto score = ggml_mul_mat(c, visible_keys, ggml_reshape_2d(c, query, g.index_dim, g.index_heads * query_n));
+            ggml_prec_set_acc(score, GGML_PREC_F32);
+            score = ggml_reshape_3d(c, score, key_n, g.index_heads, query_n);
+            // The CUDA F32 ADD path expects a F32 second operand. Convert
+            // only the current causal tile when its shared storage is F16.
+            if (mask->type != GGML_TYPE_F32) mask = ggml_cast(c, mask, GGML_TYPE_F32);
+            score = msa_topk_mask && n > 1 ? ggml_add_inplace(c, score, mask) : ggml_add(c, score, mask);
+            auto bs = b.tap(ggml_pool_2d(c, score, GGML_OP_POOL_MAX, int(g.block), 1, int(g.block), 1, 0, 0), "msa_bs", l);
+            return b.tap(ggml_top_k(c, ggml_add(c, bs, block_bias), int(top)), "msa_topk", l);
+        };
         auto attend_queries = [&](ggml_tensor * q, ggml_tensor * iq, ggml_tensor * pos_mask,
                                   ggml_tensor * bias, int query_n) {
-            require(nk * g.index_heads * query_n < INT32_MAX,
-                    "MSA query tile exceeds int32 kernel indexing; reduce query tile/chunk");
-            auto score = ggml_mul_mat(c, ikv, ggml_reshape_2d(c, iq, g.index_dim, g.index_heads * query_n));
-            ggml_prec_set_acc(score, GGML_PREC_F32);
-            score = ggml_reshape_3d(c, score, nk, g.index_heads, query_n);
-            score = msa_topk_mask && n > 1 ? ggml_add_inplace(c, score, pos_mask) : ggml_add(c, score, pos_mask);
-            auto bs = b.tap(ggml_pool_2d(c, score, GGML_OP_POOL_MAX, int(g.block), 1, int(g.block), 1, 0, 0), "msa_bs", l);
-            auto idx = b.tap(ggml_top_k(c, ggml_add(c, bs, bias), int(top)), "msa_topk", l);
+            ggml_tensor * idx = nullptr;
+            if (msa_index_tile <= 0 || query_n <= msa_index_tile) idx = select_blocks(iq, pos_mask, bias, query_n, nk);
+            else for (int first = 0; first < query_n; first += msa_index_tile) {
+                const int count = std::min(msa_index_tile, query_n - first);
+                auto query = ggml_view_3d(c, iq, g.index_dim, g.index_heads, count,
+                    iq->nb[1], iq->nb[2], size_t(first) * iq->nb[2]);
+                auto mask = ggml_view_3d(c, pos_mask, nk, 1, count,
+                    pos_mask->nb[1], pos_mask->nb[2], size_t(first) * pos_mask->nb[2]);
+                auto block_bias = ggml_view_3d(c, bias, blocks, 1, count,
+                    bias->nb[1], bias->nb[2], size_t(first) * bias->nb[2]);
+                // No query in this tile can see later key blocks. Retain at
+                // least `top` blocks so padded -inf picks preserve the output
+                // shape, while all finite candidates and local bias stay live.
+                const int64_t key_n = msa_index_nvis
+                    ? std::min(nk, std::max(top * g.block, kv_length(start + first + count, g))) : nk;
+                auto selected = select_blocks(query, mask, block_bias, count, key_n);
+                // Only compact block IDs cross tile boundaries. Flash attention
+                // keeps the complete query geometry: splitting its queries changes
+                // CUDA reduction scheduling and failed the model numeric gate.
+                idx = idx ? ggml_concat(c, idx, selected, 2) : selected;
+            }
             ggml_tensor * result = nullptr;
             if (n == 1) {
                 // Match the oracle's score-sorted gather order, including future/padded rows masked at -inf.
@@ -656,6 +713,11 @@ struct Engine::Impl {
         if (cfg.profile && l == 0 && msa_query_tile > 0 && n > 1)
             std::fprintf(stderr, "M31 MSA query tiles: pos=%lld n=%d keys=%lld tile=%d count=%d native_mask=%d\n",
                 (long long)start, n, (long long)nk, tile, (n + tile - 1) / tile, int(native_gather));
+        if (cfg.profile && l == 0 && n > 1 && msa_index_tile > 0)
+            std::fprintf(stderr, "M31 MSA index tiles: pos=%lld n=%d keys=%lld tile=%d visible_prefix=%d cells=%llu full_cells=%llu (GEMM geometry, not device timing)\n",
+                (long long)start, n, (long long)nk, msa_index_tile, int(msa_index_nvis),
+                (unsigned long long)indexer_cells,
+                (unsigned long long)(uint64_t(nk) * uint64_t(g.index_heads) * uint64_t(n)));
         result = b.tap(result, "kqv_out", l);
         return ggml_mul_mat(c, wt("attn_output.weight"), result);
     }
@@ -814,13 +876,14 @@ struct Engine::Impl {
         const auto build_start = cfg.profile ? Clock::now() : Clock::time_point{};
         auto & b = *storage.graph;
         auto c = b.c;
-        storage.input = (!decode_chain_active || l == 0 || g.routed(l - 1))
+        storage.input = !prefill_chain_active && (!decode_chain_active || l == 0 || g.routed(l - 1))
             ? b.input(GGML_TYPE_F32, g.embd, n) : nullptr;
-        auto hidden_input = decode_chain_active && l > 0 ? previous_hidden(b, l - 1, storage.input) : storage.input;
+        auto hidden_input = prefill_chain_active ? b.borrow(prefill_hidden->current())
+            : (decode_chain_active && l > 0 ? previous_hidden(b, l - 1, storage.input) : storage.input);
         storage.nk = kv_length(pos + n, g);
         const int64_t nb = storage.nk / g.block;
         storage.positions = attention_inputs ? attention_inputs->positions : b.input(GGML_TYPE_I32, n);
-        storage.mask = attention_inputs ? attention_inputs->mask : b.input(GGML_TYPE_F32, storage.nk, 1, n);
+        storage.mask = attention_inputs ? attention_inputs->mask : b.input(causal_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32, storage.nk, 1, n);
         storage.bias = attention_inputs ? attention_inputs->bias : b.input(GGML_TYPE_F32, nb, 1, n);
         cell_blocks_input = nullptr;
         auto a = attention(b, l, pos, n, hidden_input, storage.positions, storage.mask, storage.bias, stable_decode);
@@ -912,13 +975,15 @@ struct Engine::Impl {
         if (cfg.profile) timings.dense_compute += elapsed(compute_start);
         const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
         if (!g.routed(l)) {
-            if (decode_chain_active) { /* the next graph consumes this device output */ }
+            if (prefill_chain_active) { /* copied to persistent GPU hidden before graph release */ }
+            else if (decode_chain_active) { /* the next graph consumes this device output */ }
             else if (dense_async_reads) read_async(storage->output, hidden);
             else if (reuse_host_reads) read_host(storage->output, hidden);
             else hidden = Graph::read(storage->output);
         }
         else {
-            if (dense_async_reads) {
+            if (prefill_chain_active) { /* norm/residual/shared stay in this live GPU graph */ }
+            else if (dense_async_reads) {
                 if (!decode_chain_active) read_async(storage->residual, residual);
                 read_async(storage->norm, ffn_input);
                 if (!decode_chain_active && !shared_overlap) read_async(storage->shared, shared);
@@ -954,6 +1019,26 @@ struct Engine::Impl {
             dense_drain.pending = false;
         }
         if (cfg.profile) timings.dense_read += elapsed(read_start);
+        if (prefill_chain_active) {
+            // ID/weight reads above join the backend. The current graph owns
+            // norm/shared/residual until forward_device has joined its private
+            // FFN stream; no tensor aliases survive its destruction below.
+            double routed_seconds = 0;
+            if (!g.routed(l)) prefill_hidden->copy_and_advance(backend, storage->output);
+            else {
+                require(gpu_experts && !gpu_experts->exact_cpu_math(), "GPU prefill chain lost its device expert executor");
+                if (cfg.route_observer) cfg.route_observer(l,n,ids,route_weights);
+                const auto routed_start = cfg.profile ? Clock::now() : Clock::time_point{};
+                gpu_experts->forward_device(l,n,storage->norm,ids,route_weights,
+                    storage->shared,storage->residual,prefill_hidden->next());
+                if (cfg.profile) { routed_seconds = elapsed(routed_start); timings.routed_compute += routed_seconds; }
+                prefill_hidden->advance();
+            }
+            const auto destroy_start = cfg.profile ? Clock::now() : Clock::time_point{};
+            temporary.graph.reset();
+            if (cfg.profile) { timings.dense_destroy += elapsed(destroy_start); timings.dense += elapsed(dense_start)-routed_seconds; }
+            return;
+        }
         const auto destroy_start = cfg.profile ? Clock::now() : Clock::time_point{};
         temporary.graph.reset(); // cached graphs/captures retain their buffers and tensor addresses
         if (cfg.profile) {
@@ -1074,16 +1159,31 @@ struct Engine::Impl {
 
     void fill_attention(ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * bias,
                         ggml_tensor * cell_blocks, int n, int64_t nk, int64_t nb) {
+#ifdef M31_ENGINE_CUDA
+        if (gpu_attention_fill) {
+            const auto started = cfg.profile ? Clock::now() : Clock::time_point{};
+            gpu_attention_fill->fill(positions,mask,bias,cell_blocks,pos,int(g.block),int(g.local_blocks));
+            if (cfg.profile) std::fprintf(stderr,
+                "M31 GPU attention-fill pos=%lld n=%d keys=%lld bytes=%zu milliseconds=%.3f\n",
+                (long long)pos,n,(long long)nk,ggml_nbytes(mask)+ggml_nbytes(bias)+ggml_nbytes(positions)+(cell_blocks?ggml_nbytes(cell_blocks):0),1000*elapsed(started));
+            return;
+        }
+#endif
         std::vector<int32_t> positions_h(size_t(n), 0);
-        std::vector<float> mask_h(size_t(nk * n), -INFINITY), bias_h(size_t(nb * n), 0);
+        std::vector<float> mask_h, bias_h(size_t(nb * n), 0);
+        std::vector<ggml_fp16_t> half_mask_h;
+        if (mask->type == GGML_TYPE_F16) half_mask_h.assign(size_t(nk * n), ggml_fp32_to_fp16(-INFINITY));
+        else mask_h.assign(size_t(nk * n), -INFINITY);
         for (int t = 0; t < n; ++t) {
             positions_h[size_t(t)] = int32_t(pos + t);
-            std::fill_n(mask_h.data() + size_t(t) * nk, size_t(pos + t + 1), 0);
+            if (mask->type == GGML_TYPE_F16)
+                std::fill_n(half_mask_h.data() + size_t(t) * nk, size_t(pos + t + 1), ggml_fp16_t(0));
+            else std::fill_n(mask_h.data() + size_t(t) * nk, size_t(pos + t + 1), 0);
             for (int64_t b = (pos + t) / g.block, local = 0; local < g.local_blocks && b >= 0; ++local, --b)
                 bias_h[size_t(t) * nb + b] = 1e30f;
         }
         ggml_backend_tensor_set(positions, positions_h.data(), 0, ggml_nbytes(positions));
-        ggml_backend_tensor_set(mask, mask_h.data(), 0, ggml_nbytes(mask));
+        ggml_backend_tensor_set(mask, mask->type == GGML_TYPE_F16 ? static_cast<const void *>(half_mask_h.data()) : static_cast<const void *>(mask_h.data()), 0, ggml_nbytes(mask));
         ggml_backend_tensor_set(bias, bias_h.data(), 0, ggml_nbytes(bias));
         if (cell_blocks) {
             std::vector<int32_t> blocks(size_t(nk), 0);
@@ -1153,9 +1253,28 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->gpu_decode_chain = enabled("M31_GPU_DECODE_CHAIN") && cuda && cfg.dense_decode_cache && !cfg.tap;
         p_->dense_async_reads = (enabled("M31_DENSE_ASYNC_READS") || p_->gpu_decode_chain) && cuda && cfg.reuse_allocations && !cfg.tap;
         p_->gpu_cached_decode = enabled("M31_GPU_CACHED_DECODE") && cuda && !cfg.tap;
+        p_->gpu_prefill_chain = enabled("M31_GPU_PREFILL_CHAIN") && cuda;
+        if (enabled("M31_GPU_CAUSAL_FILL")) {
+            require(cuda && cfg.reuse_allocations,"GPU causal fill requires CUDA and reusable attention inputs");
+            p_->gpu_attention_fill = std::make_unique<GpuAttentionFill>(p_->backend);
+        }
         p_->native_gather = enabled("M31_GPU_NATIVE_GATHER") && cuda && !cfg.tap;
         p_->adaptive_prefill = enabled("M31_PREFILL_ADAPTIVE") && cuda;
         p_->msa_topk_mask = enabled("M31_MSA_TOPK_MASK") && cuda && !cfg.tap;
+        if (const char * text = std::getenv("M31_MSA_INDEX_TILE")) {
+            char * end = nullptr;
+            const long requested = std::strtol(text, &end, 10);
+            require(end != text && end && *end == '\0' && (requested == 0 ||
+                (requested >= 128 && requested <= 8192 && requested % 128 == 0)),
+                "M31_MSA_INDEX_TILE must be 0 or a multiple of 128 in 128..8192");
+            p_->msa_index_tile = int(requested);
+        }
+        p_->msa_index_nvis = enabled("M31_MSA_INDEX_NVIS") && cuda;
+        require(!p_->msa_index_nvis || p_->msa_index_tile > 0,
+            "M31_MSA_INDEX_NVIS requires M31_MSA_INDEX_TILE>0");
+        p_->causal_f16 = enabled("M31_MSA_CAUSAL_F16") && cuda;
+        require(!p_->causal_f16 || (p_->msa_index_tile > 0 && p_->msa_topk_mask),
+            "M31_MSA_CAUSAL_F16 requires M31_MSA_INDEX_TILE>0 and M31_MSA_TOPK_MASK=1");
         if (const char * text = std::getenv("M31_MSA_QUERY_TILE")) {
             char * end = nullptr;
             const long requested = std::strtol(text, &end, 10);
@@ -1211,14 +1330,19 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
             p_->gpu_experts->init(*p_->model, p_->g, *p_->host.arena, p_->backend, cfg.gpu_experts_gib, cfg.max_chunk);
             require(!p_->gpu_cached_decode || p_->gpu_experts->exact_cpu_math(), "cached decode requires CPU-exact GPU math");
         }
+        if (p_->gpu_prefill_chain) {
+            require(cfg.reuse_allocations && cfg.cpu_residual && !cfg.tap && p_->gpu_experts && !p_->gpu_experts->exact_cpu_math(),
+                "GPU prefill chain requires reuse/cpu-residual/no-taps and native or fast GPU experts");
+            p_->prefill_hidden = std::make_unique<GpuPrefillHidden>();
+        }
         if (p_->adaptive_prefill) {
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
             p_->prefill_free_after_resident = free_bytes;
             require(free_bytes > 0, "device did not report free VRAM for adaptive prefill");
         }
-        if (cfg.profile) std::fprintf(stderr, "M31 native gather=%d adaptive_prefill=%d top_k_mask=%d query_tile=%d free_after_resident=%llu\n",
-            int(p_->native_gather), int(p_->adaptive_prefill), int(p_->msa_topk_mask), p_->msa_query_tile,
+        if (cfg.profile) std::fprintf(stderr, "M31 native gather=%d adaptive_prefill=%d top_k_mask=%d query_tile=%d index_tile=%d causal_f16=%d index_nvis=%d free_after_resident=%llu\n",
+            int(p_->native_gather), int(p_->adaptive_prefill), int(p_->msa_topk_mask), p_->msa_query_tile, p_->msa_index_tile, int(p_->causal_f16), int(p_->msa_index_nvis),
             (unsigned long long)p_->prefill_free_after_resident);
         p_->ready = true;
         return true;
@@ -1230,7 +1354,10 @@ int64_t Engine::position() const { return p_->pos; }
 int Engine::prefill_chunk(int requested, std::string & error) const {
     try {
         require(p_->ready && !p_->poisoned && requested > 0 && p_->pos < p_->cfg.context, "invalid prefill planning state");
-        const int limit = int(std::min<int64_t>({requested, p_->cfg.max_chunk, p_->cfg.context - p_->pos}));
+        const int requested_limit = int(std::min<int64_t>({requested, p_->cfg.max_chunk, p_->cfg.context - p_->pos}));
+        const int limit = msa_chunk_limit(p_->pos,requested_limit,p_->g.index_heads,p_->g.block,
+                                          p_->msa_index_tile,p_->msa_query_tile);
+        require(limit > 0,"MSA int32 indexing does not admit even one query at this position");
         if (!p_->adaptive_prefill || limit == 1) return limit;
         PrefillBudget budget;
         // Snapshot after resident weights/full KV/cache allocation credits scratch
@@ -1241,6 +1368,24 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
         budget.extra_scratch_bytes = 1ULL << 30;
         budget.max_chunk = limit;
         budget.attention_query_tile = p_->msa_query_tile;
+        budget.indexer_query_tile = p_->msa_index_tile;
+        budget.causal_f16 = p_->causal_f16;
+        budget.gpu_prefill_chain = p_->gpu_prefill_chain && limit >= p_->cfg.gpu_experts_min_tokens;
+        budget.retained_hidden_bytes = p_->prefill_hidden ? p_->prefill_hidden->bytes() : 0;
+        budget.native_gpu_ffn = p_->gpu_experts && p_->gpu_experts->native_gpu_math();
+        if (budget.native_gpu_ffn) budget.retained_routed_bytes = p_->gpu_experts->workspace_bytes();
+        if (p_->dense_workspace)
+            budget.retained_dense_bytes = ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0);
+#ifdef M31_FAST_FFN_CUDA
+        budget.fast_gpu_ffn = p_->gpu_experts && p_->gpu_experts->fast_gpu_math();
+        if (budget.fast_gpu_ffn) {
+            budget.extra_scratch_bytes = 0; // explicit retained FFN budget below
+            budget.fast_expert_rows = p_->gpu_experts->fast_expert_batch_rows();
+            budget.fast_fused_reduction = p_->gpu_experts->fast_fused_reduction();
+            budget.fast_rank_phases = p_->gpu_experts->fast_rank_phases();
+            budget.retained_routed_bytes = p_->gpu_experts->stats().scratch_bytes;
+        }
+#endif
         budget.f16_mask = p_->native_gather;
         budget.top_k_mask = p_->msa_topk_mask;
         budget.inplace_score = p_->msa_topk_mask;
@@ -1263,6 +1408,7 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
 void Engine::reset() {
     p_->clear_dense_decode_cache(true);
     p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false; p_->decode_chain_active = false;
+    p_->prefill_chain_active = false;
 }
 
 bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
@@ -1271,8 +1417,14 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         require(p_->ready && !p_->poisoned, "not initialized or reset required after a failed pass");
         require(tokens && n > 0 && n <= p_->cfg.max_chunk && p_->pos + n <= p_->cfg.context, "invalid pass size/context");
         const auto & g = p_->g;
-        p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
+        require(msa_chunk_limit(p_->pos,n,g.index_heads,g.block,p_->msa_index_tile,p_->msa_query_tile)==n,
+                "pass exceeds MSA int32 indexing; split it with prefill_chunk()");
         for (int i = 0; i < n; ++i) require(tokens[i] >= 0 && tokens[i] < g.vocab, "token id out of range");
+        // Validation above has not touched KV, hidden, graph state or streams.
+        // A caller can re-plan a rejected pass without resetting valid state.
+        p_->poisoned = true;
+        p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
+        p_->prefill_chain_active = p_->gpu_prefill_chain && n > 1 && n >= p_->cfg.gpu_experts_min_tokens;
         auto emb = p_->host.get("token_embd.weight");
         p_->hidden.resize(size_t(g.embd * n));
         const auto * traits = ggml_get_type_traits(emb->type);
@@ -1283,15 +1435,22 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
             if (emb->type == GGML_TYPE_F32) std::memcpy(dst, row, size_t(g.embd) * sizeof(float));
             else traits->to_float(row, dst, g.embd);
         }
-        p_->poisoned = true;
         if (p_->cfg.reuse_allocations) {
             const auto nk = kv_length(p_->pos + n, g);
             if (!p_->attention_inputs || p_->attention_inputs->n != n || p_->attention_inputs->nk != nk) {
                 p_->clear_dense_decode_cache(); // references the old shared positions/mask/bias
-                p_->attention_inputs = std::make_unique<AttentionInputs>(p_->backend, g, n, nk);
+                // Previous forward is complete. Release the old quadratic mask
+                // before allocating its replacement, rather than holding both
+                // until unique_ptr move-assignment finishes.
+                p_->attention_inputs.reset();
+                p_->attention_inputs = std::make_unique<AttentionInputs>(p_->backend, g, n, nk, p_->causal_f16);
             }
             auto & inputs = *p_->attention_inputs;
             p_->fill_attention(inputs.positions, inputs.mask, inputs.bias, inputs.blocks, n, nk, nk / g.block);
+        }
+        if (p_->prefill_chain_active) {
+            p_->prefill_hidden->prepare(p_->backend,g.embd,n);
+            p_->prefill_hidden->seed(p_->hidden); // only the embedding input crosses H2D
         }
         const auto started = std::chrono::steady_clock::now();
         const auto previous_host_reads = p_->host_reads.reads;
@@ -1301,6 +1460,9 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         const double prepare_seconds = p_->cfg.profile ? Impl::elapsed(prepare_started) : 0;
         p_->timings = {};
         for (int l = 0; l < g.layers; ++l) p_->layer(l, n);
+        // The head consumes prefill_hidden directly. CPU hidden still contains
+        // only the initial embeddings and must not be used for this forward.
+
         if (p_->cfg.profile) {
             const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
             std::fprintf(stderr, "M31 forward pos=%lld n=%d seconds=%.6f tps=%.3f\n",
@@ -1319,6 +1481,22 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
                 (unsigned long long)(p_->host_reads.reuses-previous_host_reuses),
                 (unsigned long long)(p_->host_reads.growths-previous_host_growths),
                 (unsigned long long)(p_->host_reads.bytes-previous_host_bytes), p_->host_retained_bytes());
+            if (n > 1) {
+                size_t free_bytes = 0, total_bytes = 0;
+                ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
+                size_t dense_weights = 0;
+                for (auto buffer : p_->device.buffers) dense_weights += ggml_backend_buffer_get_size(buffer);
+                const auto * experts = p_->gpu_experts ? &p_->gpu_experts->stats() : nullptr;
+                std::fprintf(stderr,
+                    "M31 memory pos=%lld n=%d dense_workspace=%zu attention_inputs=%zu expert_scratch=%zu prefill_hidden=%zu kv=%zu expert_pool=%zu dense_weights=%zu backend_free=%zu backend_total=%zu\n",
+                    (long long)p_->pos, n,
+                    p_->dense_workspace ? ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0) : 0,
+                    p_->attention_inputs ? ggml_backend_buffer_get_size(p_->attention_inputs->buffer) : 0,
+                    experts ? experts->scratch_bytes : 0,
+                    p_->prefill_hidden ? p_->prefill_hidden->bytes() : 0,
+                    p_->state_buffer ? ggml_backend_buffer_get_size(p_->state_buffer) : 0,
+                    experts ? experts->pool_bytes : 0, dense_weights, free_bytes, total_bytes);
+            }
             if (p_->timings.shared_batches) std::fprintf(stderr,
                 "M31 shared-stages pos=%lld n=%d batches=%llu enqueue_ms=%.3f wait_ms=%.3f read_ms=%.3f\n",
                 (long long)p_->pos, n, (unsigned long long)p_->timings.shared_batches,
@@ -1329,7 +1507,7 @@ bool Engine::forward(const int32_t * tokens, int n, std::string & error) {
         p_->last_n = n;
         p_->poisoned = false;
         return true;
-    } catch (const std::exception & e) { p_->poisoned = true; error = e.what(); return false; }
+    } catch (const std::exception & e) { error = e.what(); return false; }
 }
 
 bool Engine::logits(int row, int count, std::vector<float> & out, std::string & error) {
@@ -1345,14 +1523,20 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
                 stable_decode ? 1024 * 1024 : 32 * 1024 * 1024,
                 stable_decode ? 512 : 8192);
             auto & b = *storage.graph;
-            storage.input = b.input(GGML_TYPE_F32, p_->g.embd, count);
-            auto head_input = p_->decode_chain_active ? p_->previous_hidden(b, int(p_->g.layers - 1), storage.input) : storage.input;
+            storage.input = p_->prefill_chain_active ? nullptr : b.input(GGML_TYPE_F32, p_->g.embd, count);
+            auto head_input = storage.input;
+            if (p_->prefill_chain_active) {
+                auto hidden = b.borrow(p_->prefill_hidden->current());
+                head_input = ggml_view_2d(b.c,hidden,p_->g.embd,count,hidden->nb[1],size_t(row)*hidden->nb[1]);
+            } else if (p_->decode_chain_active)
+                head_input = p_->previous_hidden(b,int(p_->g.layers-1),storage.input);
             auto norm = b.tap(rms(b, head_input, p_->dense->get("output_norm.weight"), p_->g.rms_eps), "result_norm");
             storage.output = b.tap(ggml_mul_mat(b.c, p_->dense->get("output.weight"), norm), "result_output");
             b.allocate({storage.output});
         }
         auto & b = *storage.graph;
-        ggml_backend_tensor_set(storage.input, p_->hidden.data() + size_t(row) * p_->g.embd, 0, ggml_nbytes(storage.input));
+        if (storage.input)
+            ggml_backend_tensor_set(storage.input, p_->hidden.data() + size_t(row) * p_->g.embd, 0, ggml_nbytes(storage.input));
         const double setup_seconds = p_->cfg.profile ? Impl::elapsed(head_started) : 0;
         const auto compute_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         b.compute();

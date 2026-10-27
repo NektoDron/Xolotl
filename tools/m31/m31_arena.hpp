@@ -5,12 +5,14 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "prefill_thp_mapping.hpp"
+#include "gpu_registered_arena.hpp"
 
 #include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <cstdlib>
 #include <fstream>
 #include <map>
 #include <stdexcept>
@@ -25,7 +27,12 @@ public:
         std::array<size_t, 3> role_offsets{}, role_bytes{};
         bool routed = false;
     };
-    ~ExpertArena() { if (buffer_) ggml_backend_buffer_free(buffer_); }
+    ~ExpertArena() {
+        // Registration workers and DMA users must finish before source pages
+        // disappear. GpuExperts is destroyed before its borrowed ExpertArena.
+        registration_.reset();
+        if (buffer_) ggml_backend_buffer_free(buffer_);
+    }
     ExpertArena() = default;
     ExpertArena(const ExpertArena &) = delete;
     ExpertArena & operator=(const ExpertArena &) = delete;
@@ -100,12 +107,37 @@ public:
                 if (!buffer_) throw std::runtime_error("M31 arena: THP CPU buffer wrapper failed");
             }
         }
+        bool register_arena=false;
+#ifdef M31_REGISTERED_ARENA_CUDA
+        if(const char *value=std::getenv("M31_GPU_REGISTER_ARENA"))register_arena=std::strcmp(value,"1")==0;
+        if(!buffer_&&register_arena){
+            // Page-aligned ownership avoids registering a neighbour's first or
+            // last malloc page and permits disjoint1GiB CUDA registrations.
+            constexpr size_t page=4096;
+            if(bytes_>SIZE_MAX-(page-1))throw std::runtime_error("M31 arena: allocation alignment overflow");
+            void *memory=nullptr;
+            if(posix_memalign(&memory,page,(bytes_+page-1)/page*page)!=0||!memory)
+                throw std::runtime_error("M31 arena: page-aligned allocation failed");
+            own_memory_.reset(memory);
+            buffer_=ggml_backend_cpu_buffer_from_ptr(memory,bytes_);
+            if(!buffer_)throw std::runtime_error("M31 arena: registered CPU buffer wrapper failed");
+        }
+#endif
         if (!buffer_) {
         buffer_ = ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), bytes_);
         }
         if (!buffer_) throw std::runtime_error("M31 arena: CPU allocation failed");
         ggml_backend_buffer_set_usage(buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         auto * base = static_cast<uint8_t *>(ggml_backend_buffer_get_base(buffer_));
+#ifdef M31_REGISTERED_ARENA_CUDA
+        if(register_arena){
+            GpuRegisteredArena::Options options;
+            options.asynchronous=true;
+            registration_=std::make_shared<GpuRegisteredArena>(nullptr,base,bytes_,std::move(options));
+        }
+#else
+        (void)register_arena;
+#endif
         for (int l = 0; l < g.layers; ++l) {
             const auto & layer = layers_[size_t(l)];
             if (!layer.routed) continue;
@@ -131,9 +163,13 @@ public:
                 if (layer.tail_offset) std::memcpy(dst + layer.tail_offset, tail, sizeof tail);
             }
         }
+#ifdef M31_REGISTERED_ARENA_CUDA
+        if(registration_)registration_->finish();
+#endif
         const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-        std::fprintf(stderr, "M31 RAM arena: bytes=%zu experts=%lld seconds=%.3f (exact packed weights, pageable)\n",
-                     bytes_, (long long) (g.experts * (g.layers - g.dense_lead)), seconds);
+        std::fprintf(stderr, "M31 RAM arena: bytes=%zu experts=%lld seconds=%.3f (exact packed weights, %s)\n",
+                     bytes_, (long long) (g.experts * (g.layers - g.dense_lead)), seconds,
+                     registration_?"registered in parallel with fill":"pageable");
         if (thp_) {
             const auto & stat = thp_->stats();
             const auto actual = thp_->anon_huge_pages();
@@ -150,11 +186,16 @@ public:
     size_t bytes() const { return bytes_; }
     const std::vector<Layer> & layers() const { return layers_; }
     const PrefillThpMapping * thp_mapping() const { return thp_.get(); }
+    const GpuRegisteredArena * registration() const {return registration_.get();}
 private:
     ggml_backend_buffer_t buffer_ = nullptr;
     size_t bytes_ = 0;
     std::vector<Layer> layers_;
     std::map<std::string, Slice> slices_;
+    // Unconditional fields keep this header's class layout identical in CPU and
+    // CUDA translation units. CPU-only builds never instantiate registration.
+    std::shared_ptr<GpuRegisteredArena> registration_;
+    std::unique_ptr<void,decltype(&std::free)> own_memory_{nullptr,&std::free};
     // Keep existing field offsets unchanged; free the borrowed ggml wrapper in
     // the destructor body before this owner releases the underlying mmap.
     std::unique_ptr<PrefillThpMapping> thp_;

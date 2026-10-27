@@ -33,12 +33,17 @@ if [ "$M31_MODE" = cuda ]; then
     if [ -f "$M31_VENDOR/ggml/CMakeLists.txt" ]; then
         M31_FLAGS+=("-DFETCHCONTENT_SOURCE_DIR_STRATA_LLAMACPP=$M31_VENDOR")
     fi
-    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON -DSTRATA_M31_CPU_QUANTS_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
+    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=ON -DSTRATA_GGML_CUDA=ON
+                -DSTRATA_M31_CPU_QUANTS_CUDA=ON -DSTRATA_M31_FAST_FFN_CUDA=ON
+                -DSTRATA_M31_REGISTERED_ARENA_CUDA=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+                -DCMAKE_CUDA_ARCHITECTURES=120a
                 -DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc -DCUDAToolkit_ROOT=/usr/local/cuda
                 -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14
                 '-DCMAKE_CUDA_FLAGS=-U_GNU_SOURCE -D_DEFAULT_SOURCE -include /home/nekto/.local/include/cuda13_glibc_compat.h')
 else
-    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=OFF -DSTRATA_GGML_CUDA=OFF -DSTRATA_M31_CPU_QUANTS_CUDA=OFF)
+    M31_FLAGS+=(-DSTRATA_ENABLE_CUDA=OFF -DSTRATA_GGML_CUDA=OFF
+                -DSTRATA_M31_CPU_QUANTS_CUDA=OFF -DSTRATA_M31_FAST_FFN_CUDA=OFF
+                -DSTRATA_M31_REGISTERED_ARENA_CUDA=OFF -DCMAKE_EXPORT_COMPILE_COMMANDS=ON)
 fi
 # Root CMake fetches its own pinned ggml and applies its patch in OUR build tree.
 # Never point its write-capable FetchContent path at up5 or the reference agent's worktree.

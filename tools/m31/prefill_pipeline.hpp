@@ -2,6 +2,7 @@
 // destination tensor must outlive the uploader (including its destructor).
 #pragma once
 #include "ggml-backend.h"
+#include "gpu_registered_arena.hpp"
 #include <algorithm>
 #include <array>
 #include <functional>
@@ -32,8 +33,8 @@ public:
     struct Span { size_t offset; const void * data; size_t bytes; size_t extent; };
     struct Stats {
         uint64_t batches = 0, uploads = 0, packed_bytes = 0, upload_bytes = 0;
-        uint64_t staging_reuses = 0;
-        size_t staging_bytes = 0, depth = 0;
+        uint64_t staging_reuses = 0, registered_uploads = 0, registered_source_bytes = 0;
+        size_t staging_bytes = 0, depth = 0, copy_streams = 0;
         bool pinned = false, asynchronous = false;
         // Host wall times only; DMA execution is asynchronous. Collected only
         // when M31_GPU_EXPERT_PROFILE=1; never interpreted as device timings.
@@ -45,6 +46,8 @@ public:
                    bool allow_async = true, size_t staging_limit = 256 * 1024 * 1024,
                    Copier copier = {})
         : compute_(compute), bytes_(slot_bytes), copier_(std::move(copier)) {
+        depth = environment_size("M31_GPU_UPLOAD_DEPTH", depth, 1, 16);
+        const size_t stream_count = environment_size("M31_GPU_UPLOAD_STREAMS", 1, 1, 4);
         require(compute && slot_bytes && depth && depth <= 16 &&
                 slot_bytes <= staging_limit / depth, "invalid bounded staging budget");
         const char * profile = std::getenv("M31_GPU_EXPERT_PROFILE");
@@ -65,12 +68,21 @@ public:
         try {
             if (allow_async && type == GGML_BACKEND_DEVICE_TYPE_GPU &&
                 props.caps.async && props.caps.events && host) {
-                transfer_ = ggml_backend_dev_init(device, nullptr);
-                require(transfer_ != nullptr, "transfer backend initialization failed");
+                transfers_.resize(std::min(stream_count, depth), nullptr);
+                frontiers_.resize(transfers_.size(), nullptr);
+                for (size_t i = 0; i < transfers_.size(); ++i) {
+                    transfers_[i] = ggml_backend_dev_init(device, nullptr);
+                    require(transfers_[i] != nullptr, "transfer backend initialization failed");
+                    frontiers_[i] = ggml_backend_event_new(device);
+                    require(frontiers_[i] != nullptr, "transfer frontier event allocation failed");
+                }
+                stat_.copy_streams = transfers_.size();
                 ready_ = ggml_backend_event_new(device);
                 readers_ = ggml_backend_event_new(device);
                 require(ready_ && readers_, "batch event allocation failed");
+                size_t index = 0;
                 for (auto & stage : stages_) {
+                    stage.transfer = transfers_[index++ % transfers_.size()];
                     stage.buffer = ggml_backend_buft_alloc_buffer(host, bytes_);
                     require(stage.buffer != nullptr, "pinned staging allocation failed");
                     stage.event = ggml_backend_event_new(device);
@@ -96,7 +108,7 @@ public:
         require(!active_, "begin_batch while a batch is open");
         if (stat_.asynchronous) {
             ggml_backend_event_record(readers_, compute_);
-            ggml_backend_event_wait(transfer_, readers_);
+            for (auto transfer : transfers_) ggml_backend_event_wait(transfer, readers_);
         } else {
             ggml_backend_synchronize(compute_);
         }
@@ -141,8 +153,8 @@ public:
         account(stat_.pack_seconds, pack_start);
         const auto submit_start = timestamp();
         if (stat_.asynchronous) {
-            ggml_backend_tensor_set_async(transfer_, destination, data, 0, bytes_);
-            ggml_backend_event_record(stage.event, transfer_);
+            ggml_backend_tensor_set_async(stage.transfer, destination, data, 0, bytes_);
+            ggml_backend_event_record(stage.event, stage.transfer);
             stage.busy = true;
         } else {
             ggml_backend_tensor_set(destination, data, 0, bytes_);
@@ -209,7 +221,7 @@ public:
             }
             const auto submit_start = timestamp();
             if (stat_.asynchronous)
-                ggml_backend_tensor_set_async(transfer_, destination, data + offset, span.offset, span.extent);
+                ggml_backend_tensor_set_async(stage.transfer, destination, data + offset, span.offset, span.extent);
             else
                 ggml_backend_tensor_set(destination, data + offset, span.offset, span.extent);
             account(stat_.submit_seconds, submit_start);
@@ -220,13 +232,63 @@ public:
         // may overwrite any of its compact spans only after this event completes.
         if (stat_.asynchronous && packed) {
             const auto submit_start = timestamp();
-            ggml_backend_event_record(stage.event, transfer_);
+            ggml_backend_event_record(stage.event, stage.transfer);
             stage.busy = true;
             account(stat_.submit_seconds, submit_start);
         }
         ++stat_.uploads;
         stat_.upload_bytes += packed;
         cursor_ = (cursor_ + 1) % stages_.size();
+    }
+
+    // Direct DMA from a registered immutable arena. Unlike enqueue_spans(),
+    // the original source must remain alive/unchanged until DMA completes. The
+    // registration owner validates every source range and outlives this ring.
+    // Only backend padding uses the pinned ring, which is fenced as usual.
+    void enqueue_registered_spans(ggml_tensor * destination,
+            std::initializer_list<Span> spans,const GpuRegisteredArena &registration) {
+        require(active_ && stat_.asynchronous, "registered upload requires an open asynchronous batch");
+        require(destination && ggml_is_contiguous(destination) && ggml_nbytes(destination)==bytes_,
+                "destination must be one contiguous complete slot");
+        size_t total=0,maximum_padding=0,raw=0;
+        for(auto a=spans.begin();a!=spans.end();++a) {
+            require(a->offset<=bytes_ && a->extent<=bytes_-a->offset && a->bytes<=a->extent,
+                    "invalid registered upload span");
+            require(!a->bytes || registration.contains(a->data,a->bytes), "source lies outside registered arena");
+            require(a->extent<=bytes_-total, "registered spans exceed slot budget");
+            for(auto b=spans.begin();b!=a;++b)
+                require(!a->extent || !b->extent || a->offset>=b->offset+b->extent ||
+                        b->offset>=a->offset+a->extent,"overlapping registered upload spans");
+            total+=a->extent;raw+=a->bytes;
+            maximum_padding=std::max(maximum_padding,a->extent-a->bytes);
+        }
+        auto &stage=stages_[cursor_];
+        if(stage.busy) {
+            const auto begin=timestamp();ggml_backend_event_synchronize(stage.event);
+            ++stat_.staging_reuses;account(stat_.staging_wait_seconds,begin);
+        }
+        auto *zero=static_cast<uint8_t *>(ggml_backend_buffer_get_base(stage.buffer));
+        const auto pack_begin=timestamp();
+        if(maximum_padding)std::memset(zero,0,maximum_padding);
+        account(stat_.pack_seconds,pack_begin);
+        const auto submit_begin=timestamp();
+        for(const auto &span:spans) {
+            size_t copied=0;
+            while(copied<span.bytes) {
+                const auto *source=static_cast<const uint8_t *>(span.data)+copied;
+                const size_t part=registration.contiguous_bytes(source,span.bytes-copied);
+                require(part>0,"registered span has no ready contiguous registration piece");
+                ggml_backend_tensor_set_async(stage.transfer,destination,source,span.offset+copied,part);
+                copied+=part;
+            }
+            if(span.extent>span.bytes)ggml_backend_tensor_set_async(stage.transfer,destination,zero,
+                    span.offset+span.bytes,span.extent-span.bytes);
+        }
+        if(total){ggml_backend_event_record(stage.event,stage.transfer);stage.busy=true;}
+        account(stat_.submit_seconds,submit_begin);
+        ++stat_.uploads;++stat_.registered_uploads;
+        stat_.upload_bytes+=total;stat_.registered_source_bytes+=raw;
+        cursor_=(cursor_+1)%stages_.size();
     }
 
     // Publish all uploads queued so far while keeping this batch open. Consumers
@@ -241,7 +303,14 @@ public:
     ggml_backend_event_t checkpoint() {
         require(active_, "checkpoint outside a batch");
         if (stat_.asynchronous) {
-            ggml_backend_event_record(ready_, transfer_);
+            // Join every copy stream into stream0. Waiting on ready_ covers all
+            // published role DMAs, including streams that stage reuse has not
+            // yet synchronized. Events are recorded before their waits.
+            for (size_t i = 1; i < transfers_.size(); ++i) {
+                ggml_backend_event_record(frontiers_[i], transfers_[i]);
+                ggml_backend_event_wait(transfers_[0], frontiers_[i]);
+            }
+            ggml_backend_event_record(ready_, transfers_[0]);
             ggml_backend_event_wait(compute_, ready_);
             return ready_;
         }
@@ -257,9 +326,16 @@ public:
         active_ = false;
         ++stat_.batches;
     }
+    // Borrowed completion fence of the last finished batch. A private CUDA
+    // consumer enqueues its wait before this uploader starts/re-records another
+    // batch. The owner still protects destination reuse until consumption ends.
+    ggml_backend_event_t completion_event() const {
+        require(!active_, "completion_event before finish");
+        return stat_.asynchronous && stat_.batches ? ready_ : nullptr;
+    }
     void synchronize() {
         require(!active_, "synchronize before finish");
-        if (transfer_) ggml_backend_synchronize(transfer_);
+        for (auto transfer : transfers_) if (transfer) ggml_backend_synchronize(transfer);
         ggml_backend_synchronize(compute_);
     }
     const Stats & stats() const { return stat_; }
@@ -273,14 +349,28 @@ private:
     struct Stage {
         ggml_backend_buffer_t buffer = nullptr;
         ggml_backend_event_t event = nullptr;
+        ggml_backend_t transfer = nullptr;
         std::vector<uint8_t> fallback;
         bool busy = false;
     };
+    static size_t environment_size(const char * name, size_t fallback, size_t low, size_t high) {
+        const char * value = std::getenv(name);
+        if (!value) return fallback;
+        require(*value != 0, "empty upload tuning environment");
+        size_t result = 0;
+        for (const char * p = value; *p; ++p) {
+            require(*p >= '0' && *p <= '9' && result <= high / 10, "invalid upload tuning environment");
+            result = result * 10 + size_t(*p - '0');
+            require(result <= high, "upload tuning environment exceeds bound");
+        }
+        require(result >= low && result <= high, "upload tuning environment outside bounds");
+        return result;
+    }
     static void require(bool condition, const char * message) {
         if (!condition) throw std::runtime_error(std::string("M31 prefill uploads: ") + message);
     }
     void release() noexcept {
-        if (transfer_) ggml_backend_synchronize(transfer_);
+        for (auto transfer : transfers_) if (transfer) ggml_backend_synchronize(transfer);
         if (compute_) ggml_backend_synchronize(compute_);
         for (auto & stage : stages_) {
             if (stage.event) ggml_backend_event_free(stage.event);
@@ -290,11 +380,15 @@ private:
         }
         if (ready_) ggml_backend_event_free(ready_);
         if (readers_) ggml_backend_event_free(readers_);
-        if (transfer_) ggml_backend_free(transfer_);
+        for (auto frontier : frontiers_) if (frontier) ggml_backend_event_free(frontier);
+        for (auto transfer : transfers_) if (transfer) ggml_backend_free(transfer);
+        frontiers_.clear();
+        transfers_.clear();
         ready_ = readers_ = nullptr;
-        transfer_ = nullptr;
     }
-    ggml_backend_t compute_ = nullptr, transfer_ = nullptr;
+    ggml_backend_t compute_ = nullptr;
+    std::vector<ggml_backend_t> transfers_;
+    std::vector<ggml_backend_event_t> frontiers_;
     ggml_backend_event_t ready_ = nullptr, readers_ = nullptr;
     size_t bytes_ = 0, cursor_ = 0;
     Copier copier_;

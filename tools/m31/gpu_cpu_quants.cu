@@ -1,4 +1,5 @@
 #include "gpu_cpu_quants.hpp"
+#include "gpu_resident_dot.hpp"
 #include "cpu_gpu_host_ops.hpp"
 #include "gpu_pinned_scratch.hpp"
 #include "prefill_route_worklist.hpp"
@@ -17,6 +18,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <limits>
+#include "gpu_fast_quant.cuh"
 
 namespace strata::m31 {
 namespace {
@@ -30,6 +33,8 @@ __device__ float ue4m3(uint8_t x) {
 }
 #include "gpu_cpu_quants_batched.cuh"
 #include "gpu_cpu_quants_tensor.cuh"
+#include "gpu_fast_mma.cuh"
+#include "gpu_fast_mma256.cuh"
 // Eight lanes reproduce the eight AVX2 accumulators; the reduction uses the
 // same (upper+lower), (lane0+lane2), (lane0+lane1) tree as hsum_float_8.
 template<int Type>
@@ -134,6 +139,128 @@ __global__ void multiply_kernel(const uint8_t * pool, size_t stride, int columns
     }
     if (lane == 0) output[size_t(route)*rows+row] = Type == GGML_TYPE_IQ3_XXS && !tiled ? 0.25f*acc : acc;
 }
+template<bool Q80>
+__global__ void resident_quantize_kernel(const float * input,uint8_t * output) {
+    const size_t element=size_t(blockIdx.x)*256+threadIdx.x;
+    const float x=input[element];
+    if constexpr(Q80) {
+        float maximum=fabsf(x);
+        for(int offset=16;offset;offset>>=1)
+            maximum=fmaxf(maximum,__shfl_xor_sync(0xffffffffu,maximum,offset));
+        const float inverse=maximum?__fdiv_rn(127.f,maximum):0.f;
+        auto &block=reinterpret_cast<block_q8_0 *>(output)[element/32];
+        block.qs[threadIdx.x%32]=int8_t(__float2int_rn(__fmul_rn(x,inverse)));
+        if(!(threadIdx.x%32))block.d=__float2half_rn(__fdiv_rn(maximum,127.f));
+    } else {
+        float scale;
+        const float inverse=fast_quant_detail::q8k_inverse(x,scale);
+        const int q=min(127,__float2int_rn(__fmul_rn(x,inverse)));
+        auto &block=reinterpret_cast<block_q8_K *>(output)[blockIdx.x];
+        block.qs[threadIdx.x]=int8_t(q);
+        int sum=q;
+        for(int offset=1;offset<16;offset<<=1)
+            sum+=__shfl_xor_sync(0xffffffffu,sum,offset);
+        if(!(threadIdx.x%16))block.bsums[threadIdx.x/16]=int16_t(sum);
+        if(!threadIdx.x)block.d=scale;
+    }
+}
+__global__ void resident_metadata_kernel(int32_t *ids,int32_t *routes,int32_t *tiles,
+                                        int count,bool tiled) {
+    const int i=int(blockIdx.x)*blockDim.x+threadIdx.x;
+    if(i<count){ids[i]=0;ids[count+i]=tiled?1:0;routes[i]=i;}
+    if(i<(count+63)/64){tiles[i*3]=0;tiles[i*3+1]=i*64;tiles[i*3+2]=min(64,count-i*64);}
+}
+}
+void gpu_quantize_cpu_compatible(int type,const float *input,void *output,
+                                int columns,int count,void *stream_pointer) {
+    if(!input || !output || columns<=0 || columns%256 || count<=0 ||
+       size_t(columns/256)*size_t(count)>size_t(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("M31 resident quant: invalid pointers/shape");
+    const unsigned blocks=unsigned(size_t(columns/256)*count);
+    const auto stream=static_cast<cudaStream_t>(stream_pointer);
+    if(type==GGML_TYPE_Q8_K)resident_quantize_kernel<false><<<blocks,256,0,stream>>>(input,static_cast<uint8_t *>(output));
+    else if(type==GGML_TYPE_Q8_0)resident_quantize_kernel<true><<<blocks,256,0,stream>>>(input,static_cast<uint8_t *>(output));
+    else throw std::invalid_argument("M31 resident quant: unsupported activation type");
+    cuda_check(cudaGetLastError());
+}
+struct GpuDeviceDots::Impl {
+    cudaStream_t stream;
+    uint8_t *quant=nullptr;
+    int32_t *ids=nullptr,*routes=nullptr,*tiles=nullptr;
+    size_t quant_capacity=0,ids_capacity=0,routes_capacity=0,tiles_capacity=0;
+    bool pending=false,mma32=false,mma256=false;
+    explicit Impl(void *borrowed):stream(static_cast<cudaStream_t>(borrowed)){
+        const char *mode=std::getenv("M31_GPU_FAST_FFN_MMA32");
+        mma32=mode&&std::string(mode)=="1";
+        const char *whole=std::getenv("M31_GPU_FAST_FFN_MMA256");
+        mma256=whole&&std::string(whole)=="1";
+        if(mma256)std::fprintf(stderr,"M31 resident dot: opt-in whole-K256 integer MMA enabled (takes precedence over MMA32)\n");
+        else if(mma32)std::fprintf(stderr,"M31 resident dot: opt-in explicit m16n8k32 integer MMA enabled\n");
+    }
+    void drain()noexcept{if(pending)cudaStreamSynchronize(stream);pending=false;}
+    template<class T>void reserve(T *&p,size_t &capacity,size_t bytes) {
+        if(capacity>=bytes)return;
+        // cudaFree waits for prior stream consumers if an allocation grows.
+        cuda_check(cudaFree(p));p=nullptr;capacity=0;
+        cuda_check(cudaMalloc(reinterpret_cast<void **>(&p),bytes));capacity=bytes;
+    }
+    ~Impl(){drain();cudaFree(quant);cudaFree(ids);cudaFree(routes);cudaFree(tiles);}
+};
+GpuDeviceDots::GpuDeviceDots(void *stream):p_(std::make_unique<Impl>(stream)){}
+GpuDeviceDots::~GpuDeviceDots()=default;
+void GpuDeviceDots::abort()noexcept{p_->drain();}
+size_t GpuDeviceDots::scratch_bytes()const{return p_->quant_capacity+p_->ids_capacity+p_->routes_capacity+p_->tiles_capacity;}
+void GpuDeviceDots::reserve(int columns,int rows,int count_max) {
+    if(columns<=0||columns%256||rows<=0||count_max<=0||count_max>65535||
+       std::max(columns,rows)>std::numeric_limits<int>::max()-255)
+        throw std::invalid_argument("M31 resident dot reserve: invalid shape");
+    const int width=((std::max(columns,rows)+255)/256)*256;
+    const size_t bytes=ggml_row_size(GGML_TYPE_Q8_K,width)*size_t(count_max);
+    p_->reserve(p_->quant,p_->quant_capacity,bytes);
+    p_->reserve(p_->ids,p_->ids_capacity,size_t(count_max)*2*sizeof(int32_t));
+    p_->reserve(p_->routes,p_->routes_capacity,size_t(count_max)*sizeof(int32_t));
+    p_->reserve(p_->tiles,p_->tiles_capacity,((size_t(count_max)+63)/64)*3*sizeof(int32_t));
+}
+void GpuDeviceDots::multiply(int type,const void *weights,int columns,int rows,int count,
+                            const float *input,float *output,bool original_tiled) {
+    if((type!=GGML_TYPE_IQ3_XXS&&type!=GGML_TYPE_IQ4_XS&&type!=GGML_TYPE_NVFP4)||
+       !weights||!input||!output||input==output||columns<=0||columns%256||rows<=0||count<=0||count>65535||
+       size_t(rows)*size_t(count)*8>size_t(std::numeric_limits<int>::max()))
+        throw std::invalid_argument("M31 resident dot: unsupported type/pointers/shape");
+    const bool tiled=original_tiled&&type!=GGML_TYPE_NVFP4;
+    const int activation=type==GGML_TYPE_NVFP4?GGML_TYPE_Q8_0:GGML_TYPE_Q8_K;
+    const size_t row_bytes=ggml_row_size(ggml_type(activation),columns);
+    const size_t tile_count=(size_t(count)+63)/64;
+    p_->reserve(p_->quant,p_->quant_capacity,row_bytes*count);
+    p_->reserve(p_->ids,p_->ids_capacity,size_t(count)*2*sizeof(int32_t));
+    p_->reserve(p_->routes,p_->routes_capacity,size_t(count)*sizeof(int32_t));
+    p_->reserve(p_->tiles,p_->tiles_capacity,tile_count*3*sizeof(int32_t));
+    p_->pending=true;
+    resident_metadata_kernel<<<(count+255)/256,256,0,p_->stream>>>(p_->ids,p_->routes,p_->tiles,count,tiled);
+    cuda_check(cudaGetLastError());
+    gpu_quantize_cpu_compatible(activation,input,p_->quant,columns,count,p_->stream);
+    const auto *packed=static_cast<const uint8_t *>(weights);
+    if(tiled) {
+        const dim3 grid(unsigned((rows+15)/16),unsigned(tile_count));
+        if(p_->mma256){
+            if(type==GGML_TYPE_IQ3_XXS)multiply_tensor_mma256_kernel<GGML_TYPE_IQ3_XXS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+            else multiply_tensor_mma256_kernel<GGML_TYPE_IQ4_XS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+        }else if(p_->mma32){
+            if(type==GGML_TYPE_IQ3_XXS)multiply_tensor_mma32_kernel<GGML_TYPE_IQ3_XXS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+            else multiply_tensor_mma32_kernel<GGML_TYPE_IQ4_XS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+        }else{
+            if(type==GGML_TYPE_IQ3_XXS)multiply_tensor_kernel<GGML_TYPE_IQ3_XXS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+            else multiply_tensor_kernel<GGML_TYPE_IQ4_XS><<<grid,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->routes,p_->tiles,output);
+        }
+    } else {
+        const unsigned blocks=unsigned((size_t(rows)*count*8+127)/128);
+#define M31_RESIDENT_SHORT(T) multiply_kernel<T><<<blocks,128,0,p_->stream>>>(packed,0,columns,rows,1,count,p_->quant,row_bytes,true,p_->ids,nullptr,output,true)
+        if(type==GGML_TYPE_IQ3_XXS){M31_RESIDENT_SHORT(GGML_TYPE_IQ3_XXS);}
+        else if(type==GGML_TYPE_IQ4_XS){M31_RESIDENT_SHORT(GGML_TYPE_IQ4_XS);}
+        else{M31_RESIDENT_SHORT(GGML_TYPE_NVFP4);}
+#undef M31_RESIDENT_SHORT
+    }
+    cuda_check(cudaGetLastError());
 }
 struct GpuCpuQuants::Impl {
     GpuHostExecutor host{[] {
