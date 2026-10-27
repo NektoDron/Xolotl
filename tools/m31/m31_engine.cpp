@@ -10,6 +10,9 @@
 #include "prefill_plan.hpp"
 #include "msa_chunk_limit.hpp"
 #include "gpu_prefill_hidden.hpp"
+#include "shortprefill_policy.hpp"
+#include "shortprefill_cpu_executor.hpp"
+#include "shortprefill_cuda_executor.hpp"
 #ifdef M31_ENGINE_CUDA
 #include "gpu_attention_fill.hpp"
 #endif
@@ -30,8 +33,12 @@
 #include <cmath>
 #include <cstring>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <map>
+#include <numeric>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 #ifdef M31_SHARED_OVERLAP_NVTX
 #include "nvtx3/nvToolsExt.h"
@@ -375,6 +382,14 @@ struct Engine::Impl {
     std::unique_ptr<GpuAttentionFill> gpu_attention_fill;
 #endif
     bool gpu_prefill_chain = false, prefill_chain_active = false;
+    ShortPrefillPolicy::Mode short_prefill_mode = ShortPrefillPolicy::Mode::off;
+    std::unique_ptr<ShortPrefillCpuExecutor> short_cpu_executor;
+    std::unique_ptr<ShortPrefillCudaExecutor> short_cuda_executor;
+    bool short_cuda_math = false, short_nvfp4_cpu = false;
+    std::vector<int32_t> short_all_routes;
+    Engine::PrefillStats short_cpu_stats;
+    int short_compare_layers = 0;
+    std::string short_compare_directory;
     struct RoutedGraph {
         std::unique_ptr<Graph> graph;
         ggml_tensor * input = nullptr, * ids = nullptr, * weights = nullptr, * output = nullptr;
@@ -469,6 +484,8 @@ struct Engine::Impl {
                          (unsigned long long)s.upload_bytes, s.resident_bytes, s.peak_resident_bytes, s.scratch_bytes, s.pinned_staging);
         }
         gpu_experts.reset();
+        short_cpu_executor.reset();
+        short_cuda_executor.reset();
         cpu_fused.reset();
         cpu_direct.reset();
         cpu_decode_graphs.clear();
@@ -734,9 +751,13 @@ struct Engine::Impl {
         return output;
     }
 
+    struct CpuPrefillPhases {
+        double graph_build = 0, upload = 0, compute = 0, read = 0, reduce = 0;
+    };
+
     void routed_cpu_into(int l, int n, const std::vector<float> & x,
                           const std::vector<int32_t> & ids, const std::vector<float> & weights,
-                          std::vector<float> & output) {
+                          std::vector<float> & output, CpuPrefillPhases * phases = nullptr) {
         const auto setup_start = cfg.profile ? Clock::now() : Clock::time_point{};
         if ((cpu_fused || cpu_direct) && n == 1 && !cfg.tap) {
             const std::string prefix = "blk." + std::to_string(l) + ".ffn_";
@@ -765,6 +786,7 @@ struct Engine::Impl {
             if (!cpu_decode_graphs[size_t(l)]) cpu_decode_graphs[size_t(l)] = std::make_unique<RoutedGraph>();
             cached = cpu_decode_graphs[size_t(l)].get();
         }
+        const auto graph_start = phases ? Clock::now() : Clock::time_point{};
         if (!cached->graph) {
             // One token has fixed tensor shapes and only IDs/activation/route weights
             // vary. Keep the original ggml graph and its alias plan, not a new graph
@@ -775,18 +797,25 @@ struct Engine::Impl {
                 cached == &temporary ? 8192 : 512);
             build_routed(l, n, *cached);
         }
+        if (phases) phases->graph_build = elapsed(graph_start);
         auto & b = *cached->graph;
+        const auto host_start = phases ? Clock::now() : Clock::time_point{};
         ggml_backend_tensor_set(cached->input, x.data(), 0, ggml_nbytes(cached->input));
         ggml_backend_tensor_set(cached->ids, ids.data(), 0, ggml_nbytes(cached->ids));
         ggml_backend_tensor_set(cached->weights, weights.data(), 0, ggml_nbytes(cached->weights));
-        if (cfg.profile) timings.routed_setup += elapsed(setup_start);
-        const auto compute_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        if (phases) phases->upload = elapsed(host_start);
+        // Device-chain callers account the complete FFN interval once in layer().
+        // Their detailed CPU phases are reported separately below that interval.
+        if (cfg.profile && !phases) timings.routed_setup += elapsed(setup_start);
+        const auto compute_start = cfg.profile || phases ? Clock::now() : Clock::time_point{};
         b.compute();
-        if (cfg.profile) timings.routed_compute += elapsed(compute_start);
-        const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        if (phases) phases->compute = elapsed(compute_start);
+        if (cfg.profile && !phases) timings.routed_compute += elapsed(compute_start);
+        const auto read_start = cfg.profile || phases ? Clock::now() : Clock::time_point{};
         if (reuse_host_reads) read_host(cached->output, output);
         else output = Graph::read(cached->output);
-        if (cfg.profile) timings.routed_read += elapsed(read_start);
+        if (phases) phases->read = elapsed(read_start);
+        if (cfg.profile && !phases) timings.routed_read += elapsed(read_start);
     }
 
     void build_routed(int l, int n, RoutedGraph & storage) {
@@ -823,6 +852,231 @@ struct Engine::Impl {
         storage.ids = id;
         storage.weights = rw;
         storage.output = result;
+    }
+
+    // The dense graph stays alive while CPU experts run. Its shared/residual
+    // tensors stay on the GPU; only normalized input and routed output cross
+    // PCIe. Use a separate allocation: dense_workspace still owns live inputs.
+    void account_cpu_routes(int layer, const std::vector<int32_t> & ids,
+                            const std::vector<size_t> & routes) {
+        std::vector<uint8_t> selected(size_t(g.experts), 0);
+        for (const auto route : routes) selected[size_t(ids[route])] = 1;
+        const std::string prefix = "blk." + std::to_string(layer) + ".ffn_";
+        size_t bytes = 0;
+        for (const char * role : {"gate", "up", "down"}) {
+            const auto * tensor = host.get(prefix + role + "_exps.weight");
+            bytes += ggml_row_size(tensor->type, tensor->ne[0]) * size_t(tensor->ne[1]);
+        }
+        short_cpu_stats.cpu_weight_demand_bytes += bytes * size_t(std::count(selected.begin(), selected.end(), uint8_t(1)));
+        short_cpu_stats.cpu_assignments += routes.size();
+        ++short_cpu_stats.cpu_layers;
+    }
+
+    void routed_cpu_routes(int layer, int n, const std::vector<float> & input,
+                           const std::vector<int32_t> & ids, const std::vector<float> & weights,
+                           const std::vector<int32_t> & routes, std::vector<float> & output, bool reduce = false) {
+        require(n > 1 && input.size() == size_t(g.embd) * size_t(n), "invalid short CPU route input");
+        std::vector<size_t> indices(routes.begin(), routes.end());
+        const std::string prefix = "blk." + std::to_string(layer) + ".ffn_";
+        auto scale = [&](const char * role) {
+            const auto * tensor = host.maybe(prefix + role + "_exps.scale");
+            return tensor ? static_cast<const float *>(tensor->data) : nullptr;
+        };
+        const auto started = Clock::now();
+        auto run = [&](auto & executor) {
+            const auto before = executor.stats();
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>,ShortPrefillCudaExecutor>) {
+                executor.forward(host.get(prefix + "gate_exps.weight"),
+                    host.get(prefix + "up_exps.weight"), host.get(prefix + "down_exps.weight"),
+                    scale("gate"), scale("up"), scale("down"), input, ids, weights, indices, size_t(g.used), output, reduce);
+            } else {
+                require(!reduce,"legacy CPU contributions do not provide fused rank reduction");
+                executor.forward(host.get(prefix + "gate_exps.weight"),
+                    host.get(prefix + "up_exps.weight"), host.get(prefix + "down_exps.weight"),
+                    scale("gate"), scale("up"), scale("down"), input, ids, weights, indices, size_t(g.used), output);
+            }
+            const auto after = executor.stats();
+            short_cpu_stats.cpu_setup_seconds += after.setup_seconds - before.setup_seconds;
+            short_cpu_stats.cpu_compute_seconds += after.compute_seconds - before.compute_seconds;
+            if constexpr (std::is_same_v<std::decay_t<decltype(executor)>,ShortPrefillCudaExecutor>)
+                short_cpu_stats.cpu_reduce_seconds += after.reduce_seconds - before.reduce_seconds;
+            const char * trace = std::getenv("M31_SHORT_PREFILL_PROFILE");
+            if (cfg.profile || (trace && std::string(trace) == "1"))
+                std::fprintf(stderr, "M31 shortprefill_cpu_routes layer=%d n=%d math=%s routes=%zu graph_build_ms=%.3f setup_ms=%.3f host_copy_ms=%.3f cpu_compute_ms=%.3f cpu_read_ms=%.3f\n",
+                    layer,n,short_cuda_math?"cuda":"ggml",routes.size(),1000*(after.graph_build_seconds-before.graph_build_seconds),
+                    1000*(after.setup_seconds-before.setup_seconds),1000*(after.pack_seconds-before.pack_seconds),
+                    1000*(after.compute_seconds-before.compute_seconds),1000*(after.read_seconds-before.read_seconds));
+        };
+        if (short_cuda_math) {
+            if (!short_cuda_executor) short_cuda_executor = std::make_unique<ShortPrefillCudaExecutor>(cpu,cpu_pool,unsigned(cfg.threads),true);
+            run(*short_cuda_executor);
+        } else {
+            if (!short_cpu_executor) short_cpu_executor = std::make_unique<ShortPrefillCpuExecutor>(cpu);
+            run(*short_cpu_executor);
+        }
+        short_cpu_stats.cpu_lane_seconds += elapsed(started);
+        account_cpu_routes(layer, ids, indices);
+    }
+
+    bool cuda_cpu_layer_supported(int layer) const {
+        if (!short_cuda_math) return true;
+        const auto prefix = "blk." + std::to_string(layer) + ".ffn_";
+        for (const char * role : {"gate","up","down"}) {
+            const auto type = host.get(prefix + role + "_exps.weight")->type;
+            if (!ShortPrefillCudaExecutor::supported(type) || (type == GGML_TYPE_NVFP4 && !short_nvfp4_cpu)) return false;
+        }
+        return true;
+    }
+
+    void finish_cpu_prefill(int l, int n, DenseGraph & storage,
+                            const std::vector<int32_t> & ids,
+                            const std::vector<float> & weights) {
+        const auto drain_started = Clock::now();
+        gpu_experts->drain_prefetch();
+        const double drain_seconds = elapsed(drain_started);
+        auto & input = host_reads.input;
+        auto & output = host_reads.moe;
+        const auto read_started = Clock::now();
+        Graph::read_into(storage.norm, input);
+        const double norm_read_seconds = elapsed(read_started);
+        CpuPrefillPhases phases;
+        const auto cpu_started = Clock::now();
+        if (short_cuda_math) {
+            short_all_routes.resize(ids.size());
+            std::iota(short_all_routes.begin(),short_all_routes.end(),int32_t(0));
+            const auto before = short_cpu_stats;
+            const auto before_executor = short_cuda_executor ? short_cuda_executor->stats() : ShortPrefillCudaExecutor::Stats{};
+            routed_cpu_routes(l,n,input,ids,weights,short_all_routes,output,true);
+            const auto after_executor = short_cuda_executor->stats();
+            phases.graph_build = after_executor.graph_build_seconds - before_executor.graph_build_seconds;
+            phases.upload = after_executor.pack_seconds - before_executor.pack_seconds;
+            phases.compute = short_cpu_stats.cpu_compute_seconds - before.cpu_compute_seconds;
+            phases.read = after_executor.read_seconds - before_executor.read_seconds;
+            phases.reduce = after_executor.reduce_seconds - before_executor.reduce_seconds;
+        } else {
+            routed_cpu_into(l, n, input, ids, weights, output, &phases);
+            short_cpu_stats.cpu_lane_seconds += elapsed(cpu_started);
+            short_cpu_stats.cpu_setup_seconds += phases.graph_build + phases.upload;
+            short_cpu_stats.cpu_compute_seconds += phases.compute;
+            std::vector<size_t> all_routes(ids.size());
+            std::iota(all_routes.begin(),all_routes.end(),size_t(0));
+            account_cpu_routes(l, ids, all_routes);
+        }
+        const auto merge_started = Clock::now();
+        Graph merge(backend, cfg, pos, nullptr, 64 * 1024, 32);
+        auto moe = merge.input(GGML_TYPE_F32, g.embd, n);
+        auto ff = ggml_add(merge.c, moe, merge.borrow(storage.shared));
+        auto result = ggml_add(merge.c, ff, merge.borrow(storage.residual));
+        auto copied = ggml_cpy(merge.c, result, merge.borrow(prefill_hidden->next()));
+        merge.allocate({copied});
+        const double merge_build_seconds = elapsed(merge_started);
+        const auto combine_started = Clock::now();
+        ggml_backend_tensor_set(moe, output.data(), 0, ggml_nbytes(moe));
+        merge.compute();
+        const char * trace = std::getenv("M31_SHORT_PREFILL_PROFILE");
+        if (cfg.profile || (trace && std::string(trace) == "1"))
+            std::fprintf(stderr, "M31 shortprefill_cpu layer=%d n=%d drain_ms=%.3f norm_read_ms=%.3f graph_build_ms=%.3f host_copy_ms=%.3f cpu_compute_ms=%.3f cpu_read_ms=%.3f cpu_reduce_ms=%.3f merge_build_ms=%.3f gpu_combine_ms=%.3f\n",
+                l,n,1000*drain_seconds,1000*norm_read_seconds,1000*phases.graph_build,1000*phases.upload,
+                1000*phases.compute,1000*phases.read,1000*phases.reduce,1000*merge_build_seconds,1000*elapsed(combine_started));
+    }
+
+    // Diagnostic only: compare both expert implementations on the SAME dense
+    // output and routes. The GPU result continues into the next layer unchanged.
+    void compare_cpu_prefill(int l, int n, DenseGraph & storage,
+                             const std::vector<int32_t> & ids,
+                             const std::vector<float> & weights) {
+        if (l >= g.dense_lead + short_compare_layers) return;
+        std::vector<float> input, cpu_moe, gpu_moe, cpu_weighted, gpu_combined, shared, residual, cpu_combined, gpu_from_moe;
+        Graph::read_into(storage.norm, input);
+        CpuPrefillPhases phases;
+        if (short_cuda_math) {
+            std::vector<int32_t> all_routes(ids.size());
+            std::iota(all_routes.begin(),all_routes.end(),int32_t(0));
+            const auto before = short_cpu_stats.cpu_compute_seconds;
+            routed_cpu_routes(l,n,input,ids,weights,all_routes,cpu_weighted);
+            phases.compute = short_cpu_stats.cpu_compute_seconds - before;
+            cpu_moe.resize(size_t(g.embd)*size_t(n));
+            for (int token=0;token<n;++token) for (int64_t row=0;row<g.embd;++row) {
+                const size_t first=size_t(token)*size_t(g.used)*size_t(g.embd)+size_t(row);
+                float value=cpu_weighted[first];
+                for (int64_t rank=1;rank<g.used;++rank) value+=cpu_weighted[first+size_t(rank)*size_t(g.embd)];
+                cpu_moe[size_t(token)*size_t(g.embd)+size_t(row)]=value;
+            }
+        } else routed_cpu_into(l,n,input,ids,weights,cpu_moe,&phases);
+        // The expert executor owns separate scratch from the live dense graph
+        // and persistent hidden tensors. This second native calculation returns
+        // the MoE value before shared/residual, on exactly the same routes.
+        gpu_experts->forward_into(l,n,input,ids,weights,gpu_moe);
+        Graph::read_into(prefill_hidden->next(), gpu_combined);
+        Graph::read_into(storage.shared, shared);
+        Graph::read_into(storage.residual, residual);
+        cpu_combined.resize(cpu_moe.size());
+        gpu_from_moe.resize(cpu_moe.size());
+        double squared_error = 0, squared_reference = 0, max_abs = 0;
+        double moe_squared_error = 0, moe_squared_reference = 0, moe_max_abs = 0, native_merge_max_abs = 0;
+        size_t equal = 0, first_different = cpu_moe.size();
+        for (size_t i = 0; i < cpu_moe.size(); ++i) {
+            const float ff = cpu_moe[i] + shared[i];
+            cpu_combined[i] = ff + residual[i];
+            const float gpu_ff = gpu_moe[i] + shared[i];
+            gpu_from_moe[i] = gpu_ff + residual[i];
+            const double moe_difference=double(cpu_moe[i])-gpu_moe[i];
+            moe_squared_error+=moe_difference*moe_difference;
+            moe_squared_reference+=double(gpu_moe[i])*gpu_moe[i];
+            moe_max_abs=std::max(moe_max_abs,std::abs(moe_difference));
+            native_merge_max_abs=std::max(native_merge_max_abs,std::abs(double(gpu_from_moe[i])-gpu_combined[i]));
+            const double difference = double(cpu_combined[i]) - gpu_combined[i];
+            squared_error += difference * difference;
+            squared_reference += double(gpu_combined[i]) * gpu_combined[i];
+            max_abs = std::max(max_abs,std::abs(difference));
+            if (std::memcmp(&cpu_combined[i],&gpu_combined[i],sizeof(float)) == 0) ++equal;
+            else if (first_different == cpu_moe.size()) first_different = i;
+        }
+        const double relative_l2 = std::sqrt(squared_error / std::max(squared_reference,1e-300));
+        const double moe_relative_l2=std::sqrt(moe_squared_error/std::max(moe_squared_reference,1e-300));
+        std::fprintf(stderr,"M31 shortprefill_compare layer=%d n=%d math=%s equal=%zu total=%zu first_difference=%zu max_abs=%.9g relative_l2=%.9g moe_max_abs=%.9g moe_relative_l2=%.9g native_merge_max_abs=%.9g cpu_compute_ms=%.3f\n",
+            l,n,short_cuda_math?"cuda":"ggml",equal,cpu_moe.size(),first_different,max_abs,relative_l2,moe_max_abs,moe_relative_l2,native_merge_max_abs,1000*phases.compute);
+        if (short_compare_directory.empty()) return;
+        const auto directory = std::filesystem::path(short_compare_directory);
+        std::filesystem::create_directories(directory);
+        const auto stem = "pos"+std::to_string(pos)+"_n"+std::to_string(n)+"_l"+std::to_string(l);
+        auto dump = [&](const char * name,const void * data,size_t bytes) {
+            std::ofstream file(directory/(stem+"_"+name+".bin"),std::ios::binary);
+            require(bool(file),"cannot create short prefill diagnostic dump");
+            file.write(static_cast<const char *>(data),std::streamsize(bytes));
+            require(bool(file),"cannot write short prefill diagnostic dump");
+        };
+        for (const auto & item : {std::make_pair("norm",&input),std::make_pair("cpu_moe",&cpu_moe),
+                 std::make_pair("gpu_moe",&gpu_moe),std::make_pair("cpu_weighted",&cpu_weighted),std::make_pair("gpu_from_moe_combined",&gpu_from_moe),
+                 std::make_pair("cpu_combined",&cpu_combined),std::make_pair("gpu_combined",&gpu_combined),
+                 std::make_pair("shared",&shared),std::make_pair("residual",&residual)})
+            dump(item.first,item.second->data(),item.second->size()*sizeof(float));
+        if (short_cuda_math) {
+            for (const auto & item : {std::make_pair("cpu_gate",&short_cuda_executor->gate_values()),
+                    std::make_pair("cpu_up",&short_cuda_executor->up_values()),
+                    std::make_pair("cpu_hidden",&short_cuda_executor->hidden_values())})
+                dump(item.first,item.second->data(),item.second->size()*sizeof(float));
+        }
+        dump("ids",ids.data(),ids.size()*sizeof(int32_t));
+        dump("weights",weights.data(),weights.size()*sizeof(float));
+        const auto prefix = "blk."+std::to_string(l)+".ffn_";
+        std::ofstream meta(directory/(stem+".json"));
+        require(bool(meta),"cannot create short prefill diagnostic metadata");
+        meta << "{\"format\":\"m31-shortprefill-compare-v1\",\"position\":" << pos
+             << ",\"layer\":" << l << ",\"n\":" << n << ",\"embd\":" << g.embd
+             << ",\"used\":" << g.used << ",\"expert_ff\":" << g.expert_ff
+             << ",\"gate_type\":" << int(host.get(prefix+"gate_exps.weight")->type)
+             << ",\"up_type\":" << int(host.get(prefix+"up_exps.weight")->type)
+             << ",\"down_type\":" << int(host.get(prefix+"down_exps.weight")->type)
+             << ",\"math\":\"" << (short_cuda_math?"cuda":"ggml") << "\""
+             << ",\"cpu_hidden_source\":\"" << (short_cuda_math && !short_cuda_executor->hidden_values_are_native()?"cpu_approximate_unused":"cpu_used_for_down_quant") << "\""
+             << ",\"gpu_quant\":" << (short_cuda_math && short_cuda_executor->gpu_quant_enabled()?"true":"false")
+             << ",\"gpu_oai\":" << (short_cuda_math && short_cuda_executor->gpu_oai_enabled()?"true":"false")
+             << ",\"equal\":" << equal << ",\"total\":" << cpu_moe.size()
+             << ",\"max_abs\":" << max_abs << ",\"relative_l2\":" << relative_l2
+             << ",\"moe_max_abs\":" << moe_max_abs << ",\"moe_relative_l2\":" << moe_relative_l2
+             << ",\"native_merge_max_abs\":" << native_merge_max_abs << "}\n";
+        require(bool(meta),"cannot write short prefill diagnostic metadata");
     }
 
     void drain_shared() noexcept {
@@ -1032,8 +1286,26 @@ struct Engine::Impl {
                 require(gpu_experts && !gpu_experts->exact_cpu_math(), "GPU prefill chain lost its device expert executor");
                 if (cfg.route_observer) cfg.route_observer(l,n,ids,route_weights);
                 const auto routed_start = cfg.profile ? Clock::now() : Clock::time_point{};
-                gpu_experts->forward_device(l,n,storage->norm,ids,route_weights,
-                    storage->shared,storage->residual,prefill_hidden->next());
+                if (short_prefill_mode != ShortPrefillPolicy::Mode::off && !cuda_cpu_layer_supported(l)) {
+                    ++short_cpu_stats.cpu_cuda_fallback_layers;
+                    if (cfg.profile) std::fprintf(stderr,"M31 shortprefill_fallback layer=%d n=%d reason=unsupported_cpu_cuda_quant\n",l,n);
+                    gpu_experts->forward_device_no_prefetch(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next());
+                } else if (short_prefill_mode == ShortPrefillPolicy::Mode::cpu)
+                    finish_cpu_prefill(l,n,*storage,ids,route_weights);
+                else if (short_prefill_mode == ShortPrefillPolicy::Mode::hybrid)
+                    gpu_experts->forward_device_hybrid(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next(),
+                        [this](int layer,int rows,const std::vector<float> & input,
+                            const std::vector<int32_t> & route_ids,const std::vector<float> & weights,
+                            const std::vector<int32_t> & routes,std::vector<float> & output) {
+                            routed_cpu_routes(layer,rows,input,route_ids,weights,routes,output);
+                        });
+                else
+                    gpu_experts->forward_device(l,n,storage->norm,ids,route_weights,
+                        storage->shared,storage->residual,prefill_hidden->next());
+                if (short_compare_layers && short_prefill_mode == ShortPrefillPolicy::Mode::off)
+                    compare_cpu_prefill(l,n,*storage,ids,route_weights);
                 if (cfg.profile) { routed_seconds = elapsed(routed_start); timings.routed_compute += routed_seconds; }
                 prefill_hidden->advance();
             }
@@ -1354,6 +1626,68 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
 
 const Geometry & Engine::geometry() const { return p_->g; }
 int64_t Engine::position() const { return p_->pos; }
+
+Engine::PrefillStats Engine::prefill_stats() const {
+    auto result = p_->short_cpu_stats;
+    if (p_->gpu_experts) {
+        const auto & stats = p_->gpu_experts->stats();
+        result.gpu_upload_bytes = stats.upload_bytes;
+        result.gpu_upload_experts = stats.misses;
+        result.gpu_cache_hits = stats.hits;
+        result.gpu_resident_slots = stats.occupied_slots;
+        result.gpu_execute_seconds = stats.execute_seconds;
+        result.short_hybrid_forwards = stats.short_hybrid_forwards;
+        result.short_cpu_experts = stats.short_cpu_experts;
+        result.short_gpu_experts = stats.short_gpu_experts;
+        result.short_cached_experts = stats.short_cached_experts;
+        result.short_cpu_routes = stats.short_cpu_routes;
+        result.short_gpu_routes = stats.short_gpu_routes;
+        result.short_cold_gpu_bytes = stats.short_cold_gpu_bytes;
+        result.short_cpu_seconds = stats.short_cpu_seconds;
+        result.short_wall_seconds = stats.short_wall_seconds;
+    }
+    if (p_->short_cpu_executor) {
+        const auto & stats = p_->short_cpu_executor->stats();
+        result.cpu_executor_graph_builds = stats.graph_builds;
+        result.cpu_executor_graph_hits = stats.graph_hits;
+        result.cpu_executor_graph_build_seconds = stats.graph_build_seconds;
+        result.cpu_executor_pack_seconds = stats.pack_seconds;
+        result.cpu_executor_read_seconds = stats.read_seconds;
+        result.cpu_executor_retained_graphs = stats.retained_graphs;
+        result.cpu_executor_retained_scratch_bytes = stats.retained_scratch_bytes;
+    }
+    if (p_->short_cuda_executor) {
+        const auto & stats = p_->short_cuda_executor->stats();
+        result.cpu_executor_graph_builds += stats.graph_builds;
+        result.cpu_executor_graph_hits += stats.graph_hits;
+        result.cpu_executor_graph_build_seconds += stats.graph_build_seconds;
+        result.cpu_executor_pack_seconds += stats.pack_seconds;
+        result.cpu_executor_read_seconds += stats.read_seconds;
+        result.cpu_executor_retained_graphs += stats.retained_graphs;
+        result.cpu_executor_retained_scratch_bytes += stats.retained_scratch_bytes;
+        result.cpu_gpu_quant_calls = stats.gpu_quant_calls;
+        result.cpu_gpu_quant_h2d_bytes = stats.gpu_quant_h2d_bytes;
+        result.cpu_gpu_quant_d2h_bytes = stats.gpu_quant_d2h_bytes;
+        result.cpu_gpu_quant_seconds = stats.gpu_quant_seconds;
+        result.cpu_gpu_quant_device_bytes = p_->short_cuda_executor->gpu_auxiliary_bytes();
+        result.cpu_gpu_quant_pinned_bytes = p_->short_cuda_executor->gpu_auxiliary_pinned_bytes();
+        result.cpu_gpu_quant_reserve_calls = stats.gpu_quant_reserve_calls;
+        result.cpu_gpu_quant_allocations = stats.gpu_quant_allocations;
+        result.cpu_gpu_quant_runtime_allocations = stats.gpu_quant_runtime_allocations;
+        result.cpu_gpu_quant_reserve_seconds = stats.gpu_quant_reserve_seconds;
+        result.cpu_gpu_quant_host_copy_seconds = stats.gpu_quant_host_copy_seconds;
+        result.cpu_gpu_quant_submit_seconds = stats.gpu_quant_submit_seconds;
+        result.cpu_gpu_quant_wait_seconds = stats.gpu_quant_wait_seconds;
+        result.cpu_gpu_quant_unpack_seconds = stats.gpu_quant_unpack_seconds;
+        result.cpu_gpu_quant_reserved_max_values = stats.gpu_quant_reserved_max_values;
+        result.cpu_gpu_quant_reserved_max_rows = stats.gpu_quant_reserved_max_rows;
+        result.cpu_gpu_quant_stream_priority = stats.gpu_quant_stream_priority;
+        result.cpu_correction_seconds = stats.correction_seconds;
+        result.cpu_correction_groups = stats.correction_groups;
+        result.cpu_correction_bytes = stats.retained_correction_bytes;
+    }
+    return result;
+}
 int Engine::prefill_chunk(int requested, std::string & error) const {
     try {
         require(p_->ready && !p_->poisoned && requested > 0 && p_->pos < p_->cfg.context, "invalid prefill planning state");
@@ -1373,7 +1707,9 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
         budget.attention_query_tile = p_->msa_query_tile;
         budget.indexer_query_tile = p_->msa_index_tile;
         budget.causal_f16 = p_->causal_f16;
-        budget.gpu_prefill_chain = p_->gpu_prefill_chain && limit >= p_->cfg.gpu_experts_min_tokens;
+        budget.gpu_prefill_chain = p_->gpu_prefill_chain &&
+            (limit >= p_->cfg.gpu_experts_min_tokens ||
+             (limit > 1 && ShortPrefillPolicy::environment().select(limit) != ShortPrefillPolicy::Mode::off));
         budget.retained_hidden_bytes = p_->prefill_hidden ? p_->prefill_hidden->bytes() : 0;
         budget.native_gpu_ffn = p_->gpu_experts && p_->gpu_experts->native_gpu_math();
         if (budget.native_gpu_ffn) budget.retained_routed_bytes = p_->gpu_experts->workspace_bytes();
@@ -1389,6 +1725,11 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
             budget.retained_routed_bytes = p_->gpu_experts->stats().scratch_bytes;
         }
 #endif
+        // Activation quantizer buffers are separate persistent CUDA allocations,
+        // created after free_after_resident was captured. Deduct them once even
+        // when the next append falls back to the long native prefill.
+        if (p_->short_cuda_executor)
+            budget.extra_scratch_bytes = prefill_sum(budget.extra_scratch_bytes,p_->short_cuda_executor->gpu_auxiliary_bytes());
         budget.f16_mask = p_->native_gather;
         budget.top_k_mask = p_->msa_topk_mask;
         budget.inplace_score = p_->msa_topk_mask;
@@ -1522,9 +1863,42 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
         // PR mtmd.cpp selects MTMD_POS_TYPE_NORMAL for MiniMax's NEOX RoPE;
         // mtmd-helper's set_position_normal advances once per embedding row.
         // Keep our existing pos+i RoPE, causal masks and MSA block coordinates.
+        auto short_mode = n > 1 ? ShortPrefillPolicy::environment().select(n) : ShortPrefillPolicy::Mode::off;
+        const int short_compare = n > 1 ? ShortPrefillPolicy::bounded("M31_SHORT_PREFILL_COMPARE_LAYERS",0) : 0;
+        require(short_compare <= 3,"M31_SHORT_PREFILL_COMPARE_LAYERS must be in 0..3");
+        bool short_cuda_math = false, short_nvfp4_cpu = false;
+        if (short_mode != ShortPrefillPolicy::Mode::off || short_compare) {
+            const char * math_text = std::getenv("M31_SHORT_PREFILL_MATH");
+            const std::string math = math_text ? math_text : "auto";
+            require(math == "auto" || math == "cuda" || math == "ggml",
+                    "M31_SHORT_PREFILL_MATH must be auto, cuda or ggml");
+            short_cuda_math = math == "cuda" || (math == "auto" && n >= p_->cfg.gpu_experts_min_tokens);
+            // Below the established offload threshold the reference executes
+            // CPU Q8_K/Q8_0. Preserve that arithmetic even in a hybrid sweep.
+            if (short_mode != ShortPrefillPolicy::Mode::off && math == "auto" && !short_cuda_math) short_mode = ShortPrefillPolicy::Mode::cpu;
+            require(!short_cuda_math || p_->cpu_pool,"CUDA-compatible CPU prefill requires the persistent CPU pool");
+            const char * nvfp4_text = std::getenv("M31_SHORT_PREFILL_NVFP4_CPU");
+            require(!nvfp4_text || std::string(nvfp4_text) == "0" || std::string(nvfp4_text) == "1",
+                    "M31_SHORT_PREFILL_NVFP4_CPU must be 0 or 1");
+            short_nvfp4_cpu = nvfp4_text && std::string(nvfp4_text) == "1";
+        }
+        require(short_mode == ShortPrefillPolicy::Mode::off || p_->gpu_prefill_chain,
+                "short prefill requires M31_GPU_PREFILL_CHAIN=1 and its native GPU configuration");
+        if (short_cuda_math && (short_mode != ShortPrefillPolicy::Mode::off || short_compare)) {
+            if (!p_->short_cuda_executor)
+                p_->short_cuda_executor = std::make_unique<ShortPrefillCudaExecutor>(p_->cpu,p_->cpu_pool,unsigned(p_->cfg.threads),true);
+            p_->short_cuda_executor->prepare_gpu_quant(size_t(n),size_t(g.embd),size_t(g.used),size_t(g.expert_ff));
+        }
         p_->poisoned = true;
         p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
-        p_->prefill_chain_active = p_->gpu_prefill_chain && n > 1 && n >= p_->cfg.gpu_experts_min_tokens;
+        p_->short_prefill_mode = short_mode;
+        p_->short_cuda_math = short_cuda_math;
+        p_->short_nvfp4_cpu = short_nvfp4_cpu;
+        p_->short_compare_layers = short_compare;
+        const char * compare_directory = short_compare ? std::getenv("M31_SHORT_PREFILL_COMPARE_DIR") : nullptr;
+        p_->short_compare_directory = compare_directory ? compare_directory : "";
+        p_->prefill_chain_active = p_->gpu_prefill_chain && n > 1 &&
+            (n >= p_->cfg.gpu_experts_min_tokens || short_mode != ShortPrefillPolicy::Mode::off);
         auto emb = p_->host.get("token_embd.weight");
         p_->hidden.resize(size_t(g.embd * n));
         const auto * traits = ggml_get_type_traits(emb->type);

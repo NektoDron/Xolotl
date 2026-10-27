@@ -4,6 +4,8 @@
 #include "prefill_pipeline.hpp"
 #include "prefill_background.hpp"
 #include "prefill_route_history.hpp"
+#include "shortprefill_cost.hpp"
+#include "shortprefill_cpu_lane.hpp"
 #include "prefill_layer_banks.hpp"
 #include "gpu_native_gu.hpp"
 #include "cpu_pack_spans.hpp"
@@ -137,6 +139,8 @@ struct GpuExperts::Impl {
     bool reuse_exact_buffers = false;
     bool parallel_reduce = false;
     bool ranked_prefetch = false;
+    bool suppress_prefetch = false;
+    std::unique_ptr<ShortPrefillCpuLane> short_cpu_lane;
     bool native_gu_concat = false;
     bool layer_banks_requested = false;
     bool bank_prefetch_enabled = false;
@@ -163,6 +167,7 @@ struct GpuExperts::Impl {
 #endif
 
     ~Impl() {
+        short_cpu_lane.reset(); // Join a borrowed Engine CPU callback before teardown.
         // A worker borrows arena role spans and destination pool metadata.
         // Join it before any of those can be freed, including failure shutdown.
         background.reset();
@@ -243,6 +248,7 @@ struct GpuExperts::Impl {
             (unsigned long long)((used+unused)*expert_bytes),int(bool(prefetch_history)));
     }
     void begin_prefetch(int layer, int n, const std::set<uint64_t> & current_keys) {
+        if (suppress_prefetch) return;
 #ifdef M31_REGISTERED_ARENA_CUDA
         if(layer_banks){
             if(bank_prefetch_enabled&&n>1&&layer+1<g.layers&&g.routed(layer+1))ensure_bank(layer+1,true);
@@ -1018,6 +1024,7 @@ void GpuExperts::forward_into(int layer, int n, const std::vector<float> & x,
 }
 
 #include "gpu_device_forward_impl.hpp"
+#include "gpu_shortprefill_impl.hpp"
 
 bool GpuExperts::forward_cached(int layer, int n, const std::vector<float> & x,
                                 const std::vector<int32_t> & ids, const std::vector<float> & weights,
@@ -1088,6 +1095,13 @@ void GpuExperts::print_profile(const char * label) const {
         label?label:"live",(unsigned long long)s.prefetch_batches,(unsigned long long)s.prefetched_experts,
         (unsigned long long)s.prefetch_bytes,1000*s.prefetch_wait_seconds,1000*s.prefetch_pack_seconds,
         1000*s.prefetch_staging_wait_seconds,1000*s.prefetch_submit_seconds);
+    if(s.short_hybrid_forwards)std::fprintf(stderr,
+        "M31 shortprefill profile label=%s forwards=%llu cpu_experts=%llu gpu_experts=%llu cached_experts=%llu cpu_routes=%llu gpu_routes=%llu cold_gpu_bytes=%llu cpu_ms=%.3f wall_ms=%.3f\n",
+        label?label:"live",(unsigned long long)s.short_hybrid_forwards,
+        (unsigned long long)s.short_cpu_experts,(unsigned long long)s.short_gpu_experts,
+        (unsigned long long)s.short_cached_experts,(unsigned long long)s.short_cpu_routes,
+        (unsigned long long)s.short_gpu_routes,(unsigned long long)s.short_cold_gpu_bytes,
+        1000*s.short_cpu_seconds,1000*s.short_wall_seconds);
     if (p_->uploads) {
         const auto & u = p_->uploads->stats();
         std::fprintf(stderr, "M31 GPU upload profile label=%s bytes=%llu pack_host_ms=%.3f staging_wait_host_ms=%.3f submit_host_ms=%.3f\n",

@@ -83,6 +83,40 @@ public:
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
     int64_t position() const;
+    // Serialized use only, between Engine calls. Cumulative counters for
+    // calibration; resets keep these counters. CPU
+    // weight demand counts each selected expert's payload once per layer, not
+    // measured DRAM traffic (which also depends on CPU tiling and caches).
+    struct PrefillStats {
+        uint64_t gpu_upload_bytes = 0, gpu_upload_experts = 0, gpu_cache_hits = 0;
+        size_t gpu_resident_slots = 0;
+        uint64_t cpu_weight_demand_bytes = 0, cpu_assignments = 0, cpu_layers = 0;
+        double cpu_lane_seconds = 0, cpu_setup_seconds = 0, cpu_compute_seconds = 0;
+        double cpu_reduce_seconds = 0; // included in cpu_compute_seconds
+        double cpu_correction_seconds = 0; // included in cpu_compute_seconds
+        uint64_t cpu_correction_groups = 0;
+        size_t cpu_correction_bytes = 0;
+        double gpu_execute_seconds = 0;
+        uint64_t short_hybrid_forwards = 0, short_cpu_experts = 0, short_gpu_experts = 0;
+        uint64_t short_cached_experts = 0, short_cpu_routes = 0, short_gpu_routes = 0;
+        uint64_t short_cold_gpu_bytes = 0;
+        double short_cpu_seconds = 0, short_wall_seconds = 0;
+        uint64_t cpu_executor_graph_builds = 0, cpu_executor_graph_hits = 0;
+        double cpu_executor_graph_build_seconds = 0, cpu_executor_pack_seconds = 0;
+        double cpu_executor_read_seconds = 0;
+        size_t cpu_executor_retained_graphs = 0, cpu_executor_retained_scratch_bytes = 0;
+        uint64_t cpu_cuda_fallback_layers = 0;
+        uint64_t cpu_gpu_quant_calls = 0, cpu_gpu_quant_h2d_bytes = 0, cpu_gpu_quant_d2h_bytes = 0;
+        double cpu_gpu_quant_seconds = 0; // included in cpu_compute_seconds
+        size_t cpu_gpu_quant_device_bytes = 0, cpu_gpu_quant_pinned_bytes = 0;
+        uint64_t cpu_gpu_quant_reserve_calls = 0, cpu_gpu_quant_allocations = 0, cpu_gpu_quant_runtime_allocations = 0;
+        double cpu_gpu_quant_reserve_seconds = 0; // Engine preparation, outside cpu_compute_seconds
+        double cpu_gpu_quant_host_copy_seconds = 0, cpu_gpu_quant_submit_seconds = 0;
+        double cpu_gpu_quant_wait_seconds = 0, cpu_gpu_quant_unpack_seconds = 0;
+        size_t cpu_gpu_quant_reserved_max_values = 0, cpu_gpu_quant_reserved_max_rows = 0;
+        int cpu_gpu_quant_stream_priority = 0;
+    };
+    PrefillStats prefill_stats() const;
     // requested is already capped by the caller's remaining prompt. With
     // M31_PREFILL_ADAPTIVE=1, choose a conservative CUDA scratch-safe chunk.
     // Returns0 with error on invalid state/insufficient budget; forward never changes n.

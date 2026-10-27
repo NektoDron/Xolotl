@@ -3,6 +3,7 @@
 #include "m31_arena.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -24,6 +25,10 @@ public:
         uint64_t prefetch_used_experts = 0, prefetch_unused_experts = 0;
         uint64_t prefetch_used_bytes = 0, prefetch_unused_bytes = 0;
         uint64_t prefetch_history_batches = 0, prefetch_history_skipped_experts = 0;
+        uint64_t short_hybrid_forwards = 0, short_cpu_experts = 0, short_gpu_experts = 0;
+        uint64_t short_cached_experts = 0, short_cpu_routes = 0, short_gpu_routes = 0;
+        uint64_t short_cold_gpu_bytes = 0;
+        double short_cpu_seconds = 0, short_wall_seconds = 0;
         uint64_t cached_forwards = 0;
         uint64_t fast_forwards = 0;
         // Wall time on the calling thread. Async upload_submit can overlap prior
@@ -71,6 +76,22 @@ public:
     void forward_device(int layer,int n,ggml_tensor * normalized,
                         const std::vector<int32_t> & ids,const std::vector<float> & weights,
                         ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination);
+    // Native GPU fallback within an adaptive chunk, without speculative copies
+    // for a next layer that may be assigned entirely to the CPU.
+    void forward_device_no_prefetch(int layer,int n,ggml_tensor * normalized,
+        const std::vector<int32_t> &ids,const std::vector<float> &weights,
+        ggml_tensor *shared,ggml_tensor *residual,ggml_tensor *destination);
+    // Adaptive mixed-device prefill. The CPU callback receives complete experts'
+    // route assignments and returns weighted down rows in route_indices order.
+    using CpuRoutes = std::function<void(int,int,const std::vector<float> &,
+        const std::vector<int32_t> &,const std::vector<float> &,
+        const std::vector<int32_t> &,std::vector<float> &)>;
+    void forward_device_hybrid(int layer,int n,ggml_tensor * normalized,
+        const std::vector<int32_t> & ids,const std::vector<float> & weights,
+        ggml_tensor * shared,ggml_tensor * residual,ggml_tensor * destination,
+        const CpuRoutes & cpu_routes);
+    // Complete old speculative copies before switching to a CPU/hybrid chunk.
+    void drain_prefetch();
     // A cache miss returns false without uploading, evicting, touching LRU or output.
     // A hit executes the complete original [used,n] graph, preserving accumulation.
     // Synchronizes the borrowed backend before exact-dot raw-stream execution.

@@ -5,6 +5,8 @@
 #include "m31_run.hpp"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
+#include "shortprefill_cuda_math_cpu.hpp"
+#include "shortprefill_cuda_nvfp4_cpu.hpp"
 #ifdef M31_CPU_QUANTS_CUDA
 #include "gpu_cpu_quants.hpp"
 #include "cpu_gpu_host_ops.hpp"
@@ -14,6 +16,7 @@
 #endif
 
 #include <array>
+#include <chrono>
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -45,9 +48,12 @@ struct Args {
     uint64_t seed = 20261026;
     float input_scale = 1;
     bool raw = false;
+    bool short_cpu_check = false;
+    std::string short_cpu_math = "both";
 };
 Args parse(int argc, char ** argv) {
     Args a;
+    bool tokens_given=false,source_given=false;
     for (int i = 1; i < argc; ++i) {
         const std::string key = argv[i];
         check(i + 1 < argc, "missing value for " + key);
@@ -62,7 +68,7 @@ Args parse(int argc, char ** argv) {
         else if (key == "--out") a.out = value;
         else if (key == "--backend") a.backend = value;
         else if (key == "--layer") a.layers = {integer(0)};
-        else if (key == "--tokens") a.tokens = {integer(1)};
+        else if (key == "--tokens") { a.tokens = {integer(1)};tokens_given=true; }
         else if (key == "--expert") a.expert = integer(0);
         else if (key == "--threads") a.threads = integer(1);
         else if (key == "--seed") {
@@ -72,8 +78,11 @@ Args parse(int argc, char ** argv) {
         } else if (key == "--raw") {
             check(value == "0" || value == "1", "--raw expects 0|1");
             a.raw = value == "1";
-        } else if (key == "--src-precision") a.source_precision = value;
+        } else if (key == "--src-precision") { a.source_precision = value;source_given=true; }
         else if (key == "--acc-precision") a.accumulator = value;
+        else if (key == "--short-cpu-check") {
+            check(value=="0"||value=="1","--short-cpu-check expects 0|1");a.short_cpu_check=value=="1";
+        } else if (key == "--short-cpu-math") a.short_cpu_math=value;
         else if (key == "--input-scale") {
             size_t end = 0;
             a.input_scale = std::stof(value, &end);
@@ -83,7 +92,14 @@ Args parse(int argc, char ** argv) {
     }
     check(!a.model.empty() && !a.out.empty(),
           "usage: -m MODEL --out NEW-DIR [--backend cuda|cpu --layer 3 --expert 0 --tokens 128 "
-          "--threads 64 --raw 0|1 --src-precision both|auto|q8 --acc-precision auto|f32 --input-scale 1]");
+          "--threads 64 --raw 0|1 --src-precision both|auto|q8 --acc-precision auto|f32 --input-scale 1 "
+          "--short-cpu-check 0|1 --short-cpu-math both|compat|ggml]");
+    check(a.short_cpu_math=="both"||a.short_cpu_math=="compat"||a.short_cpu_math=="ggml","invalid short CPU math mode");
+    if(a.short_cpu_check){
+        check(a.backend=="cuda","--short-cpu-check requires native CUDA reference");
+        if(!tokens_given)a.tokens={1,7,8,16,128};
+        if(!source_given)a.source_precision="auto";
+    }
     check(a.backend == "cpu" || a.backend == "cuda", "backend must be cpu|cuda");
     check(a.source_precision == "auto" || a.source_precision == "q8" || a.source_precision == "both",
           "source precision must be auto|q8|both");
@@ -174,8 +190,36 @@ struct Mode {
     ggml_backend_t backend;
     const WeightSet * weights;
     bool indirect = false, q8 = false, cpu_quants = false;
+    bool short_cpu_compat = false;
 };
 Outputs evaluate(const Mode & mode, int role, int n, const std::vector<float> & input, bool acc_f32) {
+    if(mode.short_cpu_compat){
+        check(!acc_f32,"compatible CPU MMQ diagnostic models native auto accumulation only");
+        Outputs output;const auto &w=*mode.weights;
+        auto mm=[&](int r,const std::vector<float>&activation,const std::string &name){
+            const auto *weight=w.tensors[size_t(r)];const size_t columns=size_t(weight->ne[0]),rows=size_t(weight->ne[1]);
+            check(activation.size()==columns*size_t(n),"compatible CPU input geometry differs");
+            std::vector<float> raw;
+            if(weight->type==GGML_TYPE_NVFP4){
+                raw.resize(rows*size_t(n));
+                for(int token=0;token<n;++token){
+                    cuda_nvfp4_cpu::Activation q;cuda_nvfp4_cpu::quantize(activation.data()+size_t(token)*columns,columns,q);
+                    for(size_t row=0;row<rows;++row)raw[size_t(token)*rows+row]=cuda_nvfp4_cpu::dot(static_cast<const uint8_t*>(weight->data)+row*weight->nb[1],q,columns);
+                }
+            }else{
+                check(cuda_math_cpu::supported(weight->type),"unsupported compatible CPU quant format");
+                cuda_math_cpu::mul_mat_rows(weight->type,weight->data,weight->nb[1],rows,columns,activation.data(),size_t(n),raw);
+            }
+            output[name+"_raw"]=raw;for(auto &value:raw)value*=w.scales[size_t(r)];output[name+"_scaled"]=raw;return raw;
+        };
+        if(role>=0)mm(role,input,"mm");
+        else{
+            const auto gate=mm(0,input,"gate"),up=mm(1,input,"up");std::vector<float> activation(gate.size());
+            for(size_t i=0;i<gate.size();++i){const float a=std::min(gate[i],7.f),b=std::clamp(up[i],-7.f,7.f);activation[i]=(a/(1.f+expf(1.702f*(-a))))*(b+1.f);}
+            output["oai"]=activation;mm(2,activation,"down");
+        }
+        return output;
+    }
 #ifdef M31_CPU_QUANTS_CUDA
     if (mode.cpu_quants) {
         GpuCpuQuants gpu;
@@ -344,7 +388,10 @@ int main(int argc, char ** argv) {
             << ",\"acc_precision\":" << run::quote(args.accumulator) << ",\"raw\":" << (args.raw ? "true" : "false")
             << ",\"fusion_disabled\":" << ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")
             << ",\"mmq_precision_env\":" << run::quote(std::getenv("GGML_CUDA_MMQ_PREC") ? std::getenv("GGML_CUDA_MMQ_PREC") : "")
-            << ",\"note\":\"Each result is compared with CPU mul_mat on identical bytes and inputs. auto uses BF16 accumulator for NVFP4. q8 forces source precision, unless overridden by GGML_CUDA_MMQ_PREC. No pass/fail tolerance is implied.\",\"cases\":[";
+            << ",\"short_cpu_check\":" << (args.short_cpu_check?"true":"false") << ",\"short_cpu_math\":" <<run::quote(args.short_cpu_math)
+            << ",\"note\":" << run::quote(args.short_cpu_check
+                ?"Native CUDA mul_mat_id reference on identical original single-expert bytes. CPU compatible MMQ uses CUDA activation quantizers; small-n native MMV may differ. Full FFN additionally includes CPU expf OAI. No accuracy or speed acceptance is implied."
+                :"Each result is compared with CPU mul_mat on identical bytes and inputs. auto uses BF16 accumulator for NVFP4. q8 forces source precision, unless overridden by GGML_CUDA_MMQ_PREC. No pass/fail tolerance is implied.") << ",\"cases\":[";
         bool first_case = true;
         for (int layer : args.layers) {
             check(g.routed(layer), "requested layer is not a routed layer");
@@ -352,6 +399,7 @@ int main(int argc, char ** argv) {
             std::unique_ptr<WeightSet> gpu_weights;
             if (gpu.value) gpu_weights = std::make_unique<WeightSet>(model, g, layer, args.expert, gpu.value);
             std::vector<Mode> modes{{"cpu_mm", cpu.value, &cpu_weights, false, false}, {"cpu_id", cpu.value, &cpu_weights, true, false}};
+            if(args.short_cpu_check&&args.short_cpu_math=="compat")modes.clear();
             if (gpu.value) {
                 if (args.source_precision != "q8") {
                     modes.push_back({"cuda_mm_auto", gpu.value, gpu_weights.get(), false, false});
@@ -365,13 +413,21 @@ int main(int argc, char ** argv) {
 #ifdef M31_CPU_QUANTS_CUDA
             if (gpu.value) modes.push_back({"cuda_cpu_quants", gpu.value, gpu_weights.get(), true, false, true});
 #endif
+            if(args.short_cpu_check&&args.short_cpu_math!="ggml")modes.push_back({"cpu_cuda_mmq",cpu.value,&cpu_weights,false,false,false,true});
+            if(args.short_cpu_check){
+                const std::string name=args.source_precision=="q8"?"cuda_id_q8":"cuda_id_auto";
+                const auto it=std::find_if(modes.begin(),modes.end(),[&](const Mode&m){return m.name==name;});
+                check(it!=modes.end(),"native reference mode unavailable");std::iter_swap(modes.begin(),it);
+            }
             for (int n : args.tokens) for (int role : {0, 1, 2, -1}) {
                 const std::string role_name = role < 0 ? "full" : role == 0 ? "gate" : role == 1 ? "up" : "down";
                 const std::string stem = "l" + std::to_string(layer) + "_n" + std::to_string(n) + "_" + role_name;
                 const int64_t input_size = role == 2 ? g.expert_ff : g.embd;
                 const auto input = random_input(size_t(input_size) * size_t(n), args.seed + uint64_t(layer) * 1024 + uint64_t(role + 1), args.input_scale);
                 if (args.raw) raw_file(fs::path(args.out) / (stem + "_input.f32"), input);
+                const auto reference_start=std::chrono::steady_clock::now();
                 const auto reference = evaluate(modes.front(), role, n, input, args.accumulator == "f32");
+                const double reference_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-reference_start).count();
                 if (!first_case) report << ',';
                 first_case = false;
                 report << "{\"layer\":" << layer << ",\"tokens\":" << n << ",\"operation\":" << run::quote(role_name)
@@ -379,15 +435,18 @@ int main(int argc, char ** argv) {
                     << "],\"type_names\":[" << run::quote(ggml_type_name(cpu_weights.tensors[0]->type)) << ','
                     << run::quote(ggml_type_name(cpu_weights.tensors[1]->type)) << ',' << run::quote(ggml_type_name(cpu_weights.tensors[2]->type))
                     << "],\"scales\":[" << cpu_weights.scales[0] << ',' << cpu_weights.scales[1] << ',' << cpu_weights.scales[2]
-                    << "],\"results\":[";
+                    << "],\"reference_mode\":" << run::quote(modes.front().name) << ",\"results\":[";
                 bool first_result = true;
                 for (const auto & mode : modes) {
-                    const auto candidate = mode.name == "cpu_mm" ? reference : evaluate(mode, role, n, input, args.accumulator == "f32");
+                    const auto evaluated_start=std::chrono::steady_clock::now();
+                    const auto candidate = mode.name == modes.front().name ? reference : evaluate(mode, role, n, input, args.accumulator == "f32");
+                    const double evaluation_ms=mode.name==modes.front().name?reference_ms:std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-evaluated_start).count();
                     for (const auto & stage : candidate) {
                         if (!first_result) report << ',';
                         first_result = false;
                         report << "{\"mode\":" << run::quote(mode.name) << ",\"stage\":" << run::quote(stage.first) << ",\"metrics\":";
                         metric_json(report, metrics(reference.at(stage.first), stage.second));
+                        if(args.short_cpu_check)report << ",\"mode_evaluate_ms\":" << evaluation_ms;
                         if (args.raw) {
                             const auto filename = stem + "_" + mode.name + "_" + stage.first + ".f32";
                             raw_file(fs::path(args.out) / filename, stage.second);
