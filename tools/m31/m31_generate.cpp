@@ -1,5 +1,6 @@
 #include "m31_engine.hpp"
 #include "m31_run.hpp"
+#include "m31_mixed.hpp"
 #ifdef M31_HAVE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -44,7 +45,9 @@ int main(int argc, char ** argv) {
             std::string error;
             if (!engine.init(args.model, cfg, error)) throw std::runtime_error(error);
             for (const auto & path : cases) {
-                auto ids = run::read_ids(path);
+                MixedInput mixed;
+                if (!args.mixed_manifest.empty()) mixed = load_mixed_manifest(path, int(engine.geometry().vocab), args.context);
+                auto ids = args.mixed_manifest.empty() ? run::read_ids(path) : mixed.tokens;
                 if (ids.size() > size_t(args.context)) throw std::runtime_error("case exceeds configured context");
                 engine.reset();
                 run::Dump dump(run::fs::path(args.out) / path.stem(), args, ids, int(engine.geometry().vocab));
@@ -55,7 +58,11 @@ int main(int argc, char ** argv) {
                     const int n = engine.prefill_chunk(requested, error);
                     if (n <= 0) throw std::runtime_error(error);
                     dump.record_chunk(pos, n);
-                    if (!engine.forward(ids.data() + pos, n, error)) throw std::runtime_error(error);
+                    const bool ok = args.mixed_manifest.empty()
+                        ? engine.forward(ids.data() + pos, n, error)
+                        : engine.forward_mixed(ids.data() + pos, mixed.visual_rows.data() + pos,
+                                               mixed.embeddings.data(), mixed.visual_count, n, error);
+                    if (!ok) throw std::runtime_error(error);
                     // Match the oracle's batched head (MMQ vs single-row MMV has
                     // different activation rounding). Chunk bounds vocab scratch.
                     const int head_count = args.head_tail ? std::min(n, args.head_tail) : n;

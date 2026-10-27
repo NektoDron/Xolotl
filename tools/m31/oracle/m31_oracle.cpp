@@ -146,6 +146,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc > 1 && std::string(argv[1]) == "tokenize") return tokenize(argc, argv);
         const auto args = run::parse(argc, argv);
+        if (!args.mixed_manifest.empty()) throw std::runtime_error("--mixed-manifest requires the vision oracle");
         if (args.arena_gib) throw std::runtime_error("--arena-gib is native-only; oracle retains original GGUF layout");
         if (args.gpu_experts_gib || args.reuse_allocations || args.persistent_cpu_pool || args.cpu_residual ||
             args.cpu_decode_cache || args.dense_decode_cache || args.profile)

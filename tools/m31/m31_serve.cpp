@@ -1,5 +1,6 @@
 // Engine subprocess for the opt-in M31 HTTP adapter. One request at a time.
 #include "m31_engine.hpp"
+#include "m31_mixed.hpp"
 #include "json.hpp"
 #ifdef M31_HAVE_CUDA
 #include "ggml-cuda.h"
@@ -73,6 +74,12 @@ int main(int argc, char ** argv) {
                 try {
                     const auto req = json::parse(line);
                     auto ids = req.at("tokens").get<std::vector<int32_t>>();
+                    const std::string mixed_manifest = req.value("mixed_manifest", "");
+                    MixedInput mixed;
+                    if (!mixed_manifest.empty()) {
+                        mixed = load_mixed_manifest(mixed_manifest, int(engine.geometry().vocab), cfg.context);
+                        ids = mixed.tokens;
+                    }
                     const int maximum = req.value("max_tokens", 256);
                     const double temperature = req.value("temperature", 1.0), top_p = req.value("top_p", 0.95), min_p = req.value("min_p", 0.05);
                     const int top_k = req.value("top_k", 40);
@@ -81,7 +88,8 @@ int main(int argc, char ** argv) {
                         throw std::runtime_error("invalid request/sampling parameters");
                     if (int64_t(ids.size()) > cfg.context || int64_t(ids.size()) + maximum > cfg.context)
                         throw std::runtime_error("prompt plus maximum generation exceeds context");
-                    for (int token : ids) if (token < 0 || token >= engine.geometry().vocab) throw std::runtime_error("token out of vocabulary");
+                    if (mixed_manifest.empty())
+                        for (int token : ids) if (token < 0 || token >= engine.geometry().vocab) throw std::runtime_error("token out of vocabulary");
                     const auto stops = req.value("stop_ids", std::vector<int>{});
                     const std::set<int> stop_ids(stops.begin(), stops.end());
                     const bool ignore_eos = req.value("ignore_eos", false);
@@ -127,7 +135,11 @@ int main(int argc, char ** argv) {
                         const int requested = int(std::min(size_t(cfg.max_chunk), ids.size() - p));
                         last_n = engine.prefill_chunk(requested, error);
                         if (last_n <= 0) throw std::runtime_error(error);
-                        if (!engine.forward(ids.data() + p, last_n, error)) throw std::runtime_error(error);
+                        const bool ok = mixed_manifest.empty()
+                            ? engine.forward(ids.data() + p, last_n, error)
+                            : engine.forward_mixed(ids.data() + p, mixed.visual_rows.data() + p,
+                                                   mixed.embeddings.data(), mixed.visual_count, last_n, error);
+                        if (!ok) throw std::runtime_error(error);
                         p += size_t(last_n);
                     }
                     if (maximum && !engine.logits(last_n - 1, 1, logits_for_sampling, error)) throw std::runtime_error(error);

@@ -15,6 +15,7 @@ if(TARGET ggml-cpu)
   set_source_files_properties(${_m31_dir}/cpu_gpu_host_executor.cpp
     PROPERTIES COMPILE_OPTIONS "-frounding-math;-fno-fast-math")
   add_executable(m31_generate ${_m31_dir}/m31_generate.cpp)
+  target_include_directories(m31_generate PRIVATE ${strata_llamacpp_SOURCE_DIR}/vendor/nlohmann)
   target_link_libraries(m31_generate PRIVATE m31_engine)
   add_executable(m31_expert_check ${_m31_dir}/m31_expert_check.cpp)
   target_link_libraries(m31_expert_check PRIVATE m31_engine)

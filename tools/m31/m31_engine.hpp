@@ -47,6 +47,14 @@ public:
     // Append one chunk. A preflight rejection preserves valid state. Once execution
     // starts, an error requires reset(): caches may be partially written.
     bool forward(const int32_t * tokens, int n, std::string & error);
+    // Append mixed rows with the same linear decoder positions as forward().
+    // visual_rows[i] == -1 selects tokens[i]; otherwise tokens[i] must be -1
+    // and visual_rows[i] selects an F32 row in [visual_count, geometry().embd].
+    // The whole chunk uses the ordinary layered prefill (including GPU v8).
+    // Inputs are borrowed only until this synchronous call returns.
+    bool forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
+                       const float * visual_embeddings, int visual_count,
+                       int n, std::string & error);
     // Logits for a consecutive set of rows in the last chunk. Small row slices avoid vocab*n scratch.
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
