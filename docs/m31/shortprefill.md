@@ -5,6 +5,55 @@
 на GPU и выбирает CPU либо смешанное выполнение routed experts. Арифметика
 декода одного токена не переключается этим режимом.
 
+## Текущая приёмка после merge: v14
+
+Merge `7a0f5e6a` включает port `dd4bc35b`; текущий код `06021f96`.
+CPU/CUDA v14 пересобраны;7 unit tests на обоих backend и prefix21 PASS.
+`/mnt/ai/logs/m31-vision/shortprefill/integration-build-v14.json`
+подтверждает соответствие frozen ELF/исходников/vendor и ancestry port.
+Все27 экспериментальных port7 controls в shortprefill-профиле явно0;
+`--prefix-cache` по умолчанию0 и профиль его не включает.
+
+Полные GPU oracle v14:10/10 gates,16042 строки побитно, top1=1 и
+KL/maxAbs0. Это code128, exact text515, code3000 и ref PNG/video в полном
+профиле и с одним MODEauto. HTTP vision6/6 и tools3/3 PASS.
+TTFT v14:15/15 случаев, server exit0; warm PNG с реальным encode1,7382с,
+text5151,8100с, raw sameIDs1,7070с, video с реальным encode3,7248с.
+Цель515/PNG<1с остаётся незакрытой. Источники в
+`/mnt/ai/logs/m31-vision/shortprefill/`: `quality-final-v14/summary.json`,
+`http-final-v14/receipt.json`, `ttft-final-v14/results.json`.
+
+Новый CPU regression `vision-cache-merge-v14.json`:92 проверки/18 запросов
+с обеими cache mechanisms. Port7 live text-ID cache применяется только к
+тексту; mixed input всегда обходит и очищает его. Отдельный SHA/F32 snapshot
+различает два media payload при одинаковых placeholder IDs. Явный
+`cache_prompt:false` отключает lookup/store обоих механизмов; поле строго
+boolean и передаётся также при SHA budget0, поскольку CLI-кеш независим.
+Отсутствующее поле остаётся отсутствующим. DSpark сохраняет обычный target
+fallback для mixed. Эта CPU-проверка не заменяет GPU vision gates.
+
+Длинный post-merge v14 завершён PASS/exit0,9 запросов: prewarm515,
+один warmup и два измеряемых повтора4K/16K/32K; native RPC безHTTP.
+Входы и метод соответствуют историческому сравнению ниже.
+
+| Токенов | Same-day old native t/s | v14 native t/s | Изменение | v14 forward t/s |
+|---:|---:|---:|---:|---:|
+| 4096 | 1325.84 | 1326.20 | +0.027% | 1326.63 |
+| 16384 | 1536.05 | 1534.61 | -0.093% | 1534.76 |
+| 32768 | 1234.64 | 1247.73 | +1.060% | 1248.02 |
+
+Разница4K/16K в этих двух повторах находится в пределах0,1%;32K быстрее
+same-day baseline примерно на1,06%. Статистическая доверительная граница
+не строилась; исторический4K1391t/s сегодня не воспроизвёл и старый ELF.
+Геометрия actual chunks (position/rows) и greedy token всех9 запросов
+совпали с pre-merge v13. Это speed-контроль; long all-row logits/качество
+по нему не принимаются. Отдельный matched4096 control ниже относится
+к old-v3/new-v13, а не объявляется повторённым v14 oracle.
+Источники: `long-rpc-new-v14/summary.json`,
+`shortprefill-long-final-v14.result.json` в том же каталоге логов.
+
+## Настройки
+
 По умолчанию `M31_SHORT_PREFILL_MODE=off`; это прежний путь v8. Режимы:
 
 | Переменная | Значение | Назначение |
@@ -112,8 +161,10 @@ dummy-хвост scratch и исключаются из исходного top-k
 в targeted resident-cache code128 gate оба варианта совпали с oracle побитно,
 а профиль подтвердил реальные полосы из7 и6 строк с padding2/3.
 
-## Измеренная точка перехода
+## Историческая калибровка до merge: frozen v12/v13
 
+Калибровка сделана до merge port: frozen v12, принята в v13. После merge
+широкий sweep не повторялся; v14 имеет отдельные gates/TTFT выше.
 На EPYC9654/RTX5090, CPU80, исходная RAM-арена170GiB, GPU experts7GiB,
 измерено19 случаев по off/CPU/hybrid: один прогрев и два образца каждого
 режима. Суммарно171 запуск, KV сбрасывается между ними. Корпус для sweep —
@@ -140,18 +191,17 @@ hybrid —1024; она выбрана default в v13, промежуток1024�
 скоростной скачок на любом содержимом.
 
 При существующем KV-префиксе515 новые100/300 токенов заняли hybrid1020/1450мс
-против off2193/2786мс. Это прямой append Engine. HTTP-сервер по этому тесту
-не получает поддержку частичного повторного использования KV между
-запросами. Для515 новых токенов цель<1с не достигнута уже на уровне самого
+против off2193/2786мс. Это прямой append Engine. HTTP reuse по нему не измерялся;
+добавленный при merge live text-ID cache проверяется отдельными API gates. Для515 новых токенов цель<1с не достигнута уже на уровне самого
 префилла. Полные raw results:
 `/mnt/ai/logs/m31-vision/shortprefill/wide-final-v12/summary.json` и
 `aggregate.json`.
 
-Финальный HTTP PNG с прогретым энкодером дал TTFT2,727→1,792с против прежнего
+Исторический v13 HTTP PNG с прогретым энкодером дал TTFT2,727→1,792с против прежнего
 профиля; цель<1с остаётся незакрытой. Трасса и готовые ответы сохранены в
 `/mnt/ai/logs/m31-vision/shortprefill/ttft-final-v13/results.json`.
 
-## Длинный префилл в тот же день
+## Исторический длинный префилл v13 до merge
 
 Старый frozen v3 и новый frozen v13 запускались по одному разу, каждый в одном
 постоянном native RPC-процессе: raw IDs, context40000/chunk32768,
@@ -174,9 +224,9 @@ prewarm515, затем один полный warmup и два измеряемы
 Actual chunks отличаются: old16K `[10240,6144]`, new `[10112,6272]`;
 old32K `[10240,7936,6528,5632,2432]`, new
 `[10112,7808,6400,5632,2816]`. На4K оба используют `[4096]`.
-Первый greedy token совпал на4K, но отличается на16K/32K. Причинность
-расхождения не проверялась сравнением с одинаковыми chunk recipes. Поэтому
-этот запуск подтверждает только скорость; long logits/качество по нему не
+Первый greedy token совпал на4K, но отличается на16K/32K. Первоначальный speed run
+не устанавливает причинность этого расхождения. Последующий matched4096
+контроль приведён ниже. Сам этот запуск подтверждает только скорость; long logits/качество по нему не
 принимаются. Численная приёмка относится к отдельным полным oracle gates
 128/515/3000 и ref PNG/video.
 
@@ -186,6 +236,22 @@ Engine; returncode-15 отмечен отдельно и не скрываетс
 завершение процесса. В новом клиенте stdin закрывается и даётся до300с на
 штатное освобождение до fallback RPC cleanup. Парная сводка со всеми SHA:
 `/mnt/ai/logs/m31-vision/shortprefill/long-comparison-v13.json`.
+
+## Matched4096: контроль последних строк old-v3/new-v13
+
+После наблюдения разных greedy tokens в adaptive speed run отдельно
+проверены одинаковые chunks4096. Каждый frozen `m31_generate` использовал
+один Engine для515prewarm, corpus16K и corpus32K, reset между случаями,
+context40000/head_tail1/rowslast/tapsnone и native profile/history0/cache0.
+Сборка или код ради этого контроля не менялись.
+
+Все200064 значения последней строки каждого случая побитно совпали:
+515/16K/32K, суммарно600192 значения; top1 соответственно200060/5603/43817,
+KL/maxAbs0. Actual chunks подтверждены: `[515]`,4×4096 и8×4096.
+Оба процесса/worker завершились0. Это native old-vs-new control при
+одинаковом recipe, не all-prompt-row PR oracle и не утверждение long качества
+по исходному скоростному run с разными recipes.
+Источник: `/mnt/ai/logs/m31-vision/shortprefill/matched-chunks4096-v13/comparison.json`.
 
 ## Воспроизведение измерений
 

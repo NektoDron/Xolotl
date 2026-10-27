@@ -1,4 +1,35 @@
-# MiniMax-M3.1: адаптивный префилл, скоростная цель частично выполнена
+# MiniMax-M3.1: текущая приёмка post-merge v14
+
+27.10.2026. Ветка `aiserver/m31-vision`; merge `7a0f5e6a` включает
+`aiserver/m31-port` `dd4bc35b`, текущий код `06021f96`.
+Отчёт `/mnt/ai/logs/m31-vision/REPORT-shortprefill.final.md`.
+Профиль `tools/m31/profiles/vision-shortprefill.json`: MODEauto,
+CPU2…31, hybrid32…1024, затем v8; глобальный MODEoff сохранён.
+Все27 экспериментальных port7 controls явно0; prefix-cache CLI default0.
+CPU/CUDA builds v14:7 unit tests на обоих backend и prefix21 PASS.
+`vision-cache-merge-v14.json`:92 проверки/18 CPU запросов PASS:
+live text-ID cache обходит/очищается на mixed; отдельный SHA snapshot
+учитывает F32 media, explicit cache_promptfalse отключает оба lookup/store.
+Финальные v14 oracle10/10:16042 строки побитно (PNG/video, code128,
+text515/code3000; полный профиль и только MODEauto), KL/maxAbs0.
+HTTP vision6/6, tools3/3, TTFT15/15 PASS, server exit0.
+Warm PNG real encode TTFT1,7382с, text5151,8100с, raw sameIDs1,7070с,
+video warm real encode3,7248с. Цель<1с остаётся незакрытой.
+Широкий crossover171sample — историческая калибровка доmerge
+(frozen v12, принята в v13), а не повторный замер v14.
+Engine append+100/+300 в ней1,02/1,45с; HTTP reuse этим benchmark не измерялся.
+Matched4096 old-v3/new-v13: последние full-vocab строки515/16K/32K
+побитны (600192 значения), actualchunks515/4×4096/8×4096; это контроль
+последних строк при одинаковом recipe, не all-row long oracle.
+Post-merge long v14 PASS/exit0:4K1326,20,16K1534,61,32K1247,73t/s
+(native prompt, один warmup и два measured повтора). Геометрия chunks
+и greedy tokens всех9 запросов совпали с pre-merge v13; это speed-контроль,
+а не all-row long oracle. По same-day old: +0,027% /-0,093% /+1,060%.
+Актуальные измерения и границы доказательства: `docs/m31/shortprefill.md`.
+
+---
+
+# MiniMax-M3.1: историческая приёмка адаптивного префилла v13 до merge
 
 27.10.2026. Функциональный локальный commit `8742b26c`.
 Отчёт `/mnt/ai/logs/m31-vision/REPORT-shortprefill.final.md`.
@@ -10,7 +41,7 @@ code128/text515/code3000, полный профиль и только MODEauto).
 tools3/3, TTFT15/15 PASS. CPU/CUDA build и post-merge ELF identity PASS.
 Warm PNG real encode TTFT2,727→1,792с, native forward1,661с;
 text515 warm2,846→1,898с, raw sameIDs1,777с. Цель<1с не достигнута.
-Engine live-KV append+100/+300:1,02/1,45с; HTTP partial-prefix reuse не добавлен.
+Engine live-KV append+100/+300:1,02/1,45с; эта калибровка не измеряла HTTP reuse.
 Same-day long old→new:4K1325,84→1325,90;16K1536,05→1548,10;
 32K1234,64→1256,82t/s (native prompt, два measured повтора).
 Подробные gates/порог/cost model: `docs/m31/shortprefill.md`.
