@@ -1,3 +1,286 @@
+# Port7 завершён: устойчивого +10% нет, новых экспериментов в очереди нет
+
+Итог 2026-10-27: `/mnt/ai/logs/m31-port/REPORT-port7.final.md`, копия
+`/mnt/ai/logs/codex-m31-port7.final.md`, `docs/m31/port7-results.md`.
+Машинный итог/финальный HEAD: `/mnt/ai/logs/m31-port/port7-final-summary.json`.
+Каноническая port7 CPU/CUDA v2 собрана, selected numeric/default greedy proofs
+точны; новой полной GSM/tools/full20 приёмки нет. Принятой runtime/quality
+конфигурацией остаётся protected `build-port6-canonical/v8` (97/100,19/23).
+Новый код opt-in; `tools/m31/profiles/native-gpu.json` не изменён.
+
+Свежая парная V8→canonical TG25.56→26.15 /25.27→24.40 /23.89→24.87,
+PP1381.53→1379.30 /1542.21→1532.31 /1255.80→1251.58. Все800native IDs,
+входы и PP recipes равны. Нет устойчивого winner, текущий32K TG<25 у обеих;
+раннюю принятую v8 приёмку не выдавать за новую. CacheIMMA/rank ABA плоская,
+THP full startup timeout180s, strict80 model ABA26.09→19.87→23.59 хуже.
+
+Runtime/fixtures60files:57229a20; selectedrepro99files:dd4bc35b; docs commit
+смотри machine summary. Пуша/PR нет. Stale/unapplied research и port6 файлы
+оставлены локально untracked, ничего не удалено. Новую модель Q2 не запускали:
+проверены все1188headers, sidecars aria2 на15:10 отсутствуют, payload/runtime
+не проверены. Минимальная совместимость/fast-kernel ограничения в UD-Q2 audit.
+
+Resource/config audits PASS: своих GPU model/jobs/listeners нет; свои preset
+keys восстановлены; protected m31/hxq3k конфиги не менялись. Miner-hold0
+сохранён, GPU1 miner и llm-chat active. На GPU0 legitimate m31-vision-test,
+её units/worktree не трогали. Ни global THP/clock/NUMA правок, ни deployment.
+
+Ниже — исторические записи работы, не продолжать автоматически их очереди.
+
+# Port7: прежнее контрольное окно 2026-10-27 13:50–15:50 UTC
+
+## Текущий срез 15:03 UTC (продолжать до последнего placement ABA)
+
+Локальные коммиты: 57229a20 runtime/fixtures60files, dd4bc35b selectedtooling99files.
+Пуша нет. Canonical `build-port7-canonical/v2` PASS: CPU/CUDA14ELF,49стадий,
+source/vendor stable, protectedV8 unchanged. V1 CPU fixture import failure
+сохранён; v2 добавляет только tools/gguf_reader.py/writer.py в support snapshot.
+После сборки убран один trailing space в standalone GU proof cpp (tokens same,
+не runtime); receipt `port7-postbuild-repro-whitespace-v1.json`.
+
+Default canonical code128 GPU-oracle PASS128rows/KL0/maxabs0. V11 RMS/LOOKUP
+по128tailrows каждый побайтно logits/tokens PASS, не full20/long/quality.
+Fresh fixedUUID V8→canonical warmup+4/16/32K:272auditchecks PASS, все800native
+outputs и actualpromptIDs/PP recipes равны. PP1381.53→1379.30 /1542.21→1532.31 /
+1255.80→1251.58. TG25.5578→26.1536 /25.2706→24.3964 /23.8875→24.8665.
+Одна пара, без sustainable/no-regression acceptance; оба текущих32K<25.
+РаннийV8 был27.9/27.0/26.0: снижение затрагивает unchangedV8, routedCPU;
+dense не замедлился, CPUquants object/pool functions identical, fusedcallback
+stack72B одинаков. Причина текущего CPU state drift не установлена.
+
+CacheIMMA/rank cleanABA26.1817→26.1542→25.0592, all128IDs exact, conservative
+0.99895; primer108.198ms включён, worker6.378→3.787ms/token, общего+10% нет.
+DSpark/RPC/HTTP отрицательны; все новые режимы defaultOFF, native-gpu не менялся.
+THP16GiB100% за.117s; full153GiB forced trial startup timeout180s, ownPID gone,
+нет postregistration/TG proof. После него freehuge84.95GiB<guard190.63, force
+не повторяем. Последний existingflag CPU strict-spread80 trial queued:
+`codex-m31-port7-canonical-v2-cpu-placement-aba-v1`, directory same basename.
+OFF→ON→OFF3324/128, mask отrouted_cpu, caps180s/child/590s total.
+Если нет устойчивых+10%, заканчивать волну с docs/report/resourceaudit.
+
+UD-Q2 headers теперь все1188: declaredpayload134.019GiB/experts124.664GiB,
+IQ2_XS gate/up3–58, IQ3gate/up59+down54layers, IQ4down52/58/59, NVFP4нет.
+Payloadshard4 ещёaria2; не запускали. StockCPU/GPU есть, customfastallowlists
+и exactMMV Q5/Q4 требуют отдельной совместимости/quality; см.docs audit.
+
+Финальные отчёты ещё НЕ записаны: рабочий REPORT-port7.draft.md существует.
+Нужно REPORT-port7.final.md и /mnt/ai/logs/codex-m31-port7.final.md, docs commit
+и итоговый resource/config audit. Полныеquality/full20 на новомELF НЕ запускали
+(по решению координатора только winner>=10%); не переносить97/19 старойV8.
+Шестьагентов у root держат audits/metadata; source runtime/CMake frozen.
+
+Новое решение координатора: приоритет ordinary dense GPU, отдельно измерить
+GEMV bandwidth и остальную GPU работу. DSpark только при устойчивом выигрыше;
+по умолчанию выключен. Если за это окно нет устойчивых +10% TG к принятой v8,
+завершить волну: локальные коммиты точных полезных opt-in изменений, честный
+REPORT-port7.final.md и codex-m31-port7.final.md, аудит типов UD-Q2_K_XL.
+Не подменять новые quality gates результатами принятой port6 v8.
+
+После capacity на 13:50 UTC GPU0 свободна, активных вычислительных port7 units нет,
+GPU1 miner работает. /run/aictl.miner-hold ожидаем, майнер0 не запускать вручную.
+Шесть прежних агентов возобновлены через followup; validation — единая очередь.
+Соседний /mnt/ai/Xolotl-m31-vision и его units не трогать.
+
+# Предыдущее состояние port7 — ещё не финальная приёмка
+
+2026-10-27, base HEAD faeb1332. Цель новой волны TG35–40+ при сохранении
+принятых PP/quality V8. Последнее сообщение пользователя после capacity
+повторило минимумы PP32K1000/TG25 и quality; это продолжение той же волны.
+V8 frozen ELF/receipts не менялись. Port7 source пока не закоммичен.
+Статус и измерения: /mnt/ai/logs/m31-port/STATUS.md (последние секции).
+
+Шесть агентов: dense_latency (pinned/FUSION perbackend), cached_decode
+(native hybrid отклонён, exact partial fallback), dspark (draft + exact n1
+verifier), routed_cpu (CPUbatch exact + pair dot kernels), prefix (exact
+singlechunk cache/proofs), validation (единая очередь/GPU и build окна).
+Root интегрирует, собирает combined и коммитит; push/PR запрещены.
+Все правила infra AGENTS/card_session/card+build locks остаются обязательны.
+
+Свежий unchanged V8 baseline PASS: PP1378.7/1528.2/1246.1,
+TG27.90/27.01/25.98. CUPTI: actual GPUkernelunion11.037ms/token,
+DMA.330ms. read_ms12 включает ожидание GPU исполнения, не только передачи.
+Native hot162 hybrid FAIL code128 (top1.8828, meanKL.382, max15.426);
+prefill96 rows0diff, decode17/32top1. Этот режим НЕ принимать.
+Naive DSpark batch8 vs serial FAIL13/128,meanKL.2385,max14.36.
+Exact layer-major verifier сохраняет n1 geometry, его модельный гейт впереди.
+CPU batched proof180batches/675rows PASS, но component gain~1.18× или меньше.
+
+Готовые combined frozen builds build-port7-candidate/v1 (naive), v2 (exact
+n1 verifier, .inc included), все5ELFs rc0 и build-receipt.json. Обе сборки
+используют unchanged V8 CUDA libraries. Config/GPUStats headers согласованы.
+Dense isolatedv1 отказ доforward из-за смешения новыхStats/oldarchive;
+исправленный build-port7-dense/v2 готов; не считать это регрессией модели.
+Fusion build-port7-dense/v3: отдельный CUDA main TU/library с optin API,
+live _deps пока не менялись. Root CMake получит patch при следующем configure;
+после него engine с API macro требует обновлённую backendlibrary.
+
+Очередь validation: CPUrealroute replay → exactDSpark parity / fusionV3
+numeric gates → pinnedV2 trace → prefixGPU. Не запускать дубли:
+проверять systemd/результаты. Nativecachedhot и naivebatch уже отклонены,
+полные quality на них не тратить. Prefix CPU15helper+21protocolPASS,
+GPUproofjob port7-prefix-gpu-v1 prepared, не был запущен на момент записи.
+Финальные full20/long/GSM100/tools23/om2round нужны только winner одной сборки.
+Финальный отчёт писать REPORT-port7.final.md и codex-m31-port7.final.md;
+пока цель35–40 НЕ достигнута, не объявлять M3 готовым.
+
+## Новейшие результаты: ускорение генерации ещё не принято
+
+P7-v10 consistent build rc0/7ELFs, source167files, Engine977922…; добавлен
+только opt-in COALESCE_INPUTS относительно V9. Parity128 и rawgreedy обоих
+плеч точны, но diagnosticdepth1 24,23→22,66; cleanNativeRPC0/1 ещё в очереди.
+
+Clean ordinary exactcache290 OFF/ON (V9):25,668→23,736t/s,−7,53%, raw128IDs
+равны. Seed108ms включён, hits12,22%, join1,286ms/token; routed23,85→26,97ms,
+dense≈13,2ms безизменений. Этот cache пока не продвигать, fullom не запускать.
+
+Representative actualHTTP V10, fixedinputs/nativeIDs observer, setupвTG:
+K1 PP1276,5/1534,0/1245,9 и TG24,54/25,76/23,16 (4/16/32K);
+K3 PP1268,0/1529,1/1241,5 и TG22,08/21,72/20,97. Это exploratoryonepass,
+неfinalom; независимый scorer/crossdepthnativeIDs/acceptance ещё дочитываются.
+ТекущийM3 slower, цель35–40+ не достигнута. Frozenport6V8 остаётся принятой.
+
+Главные следующие рычаги: cached_decode готовит isolated contiguousGUconcat
+(все57layers gate/upIQ3[6144,3072], без gap, existingmultiply rows2F), dense
+пишет новыйIQ3n1IMMA partialI32 +originalFMAfinish. IndependentCPU source/math
+review PASS, actualGPUproof/timing ещёpending. SIMDrank-outermerge — отдельный
+CPUjoin reserve; не применять доbitproof/gain. CPUskew instrumentation нашёл
+SMTпару48/144, но новаяstrict-spread80проверка ещёpending; dynamic scheduler
+не реализован. MWAITXtinyprobe compiled, execution ещёpending; private THP16GiB
+trial такжеpending. Никакихsysctl/globalclock/THPизменений не делалось.
+
+FAne3 batch rejected:45/60cases differ (maxabs0,027). Только batchF16gather
+60/60byteexact; DSpark делает gather-only+perqueryn1FA proposal, безEngine
+доrawproof. F32indexshadow пока designonly. PrefixVIEW accumulated GPUraw
+PASS, послеrelease/lifetime/epoch тоже, actualHTTPcancelnext ещёвочереди.
+
+## Актуально: P7-v9 собрана, проверки ещё выполняются
+
+P7-v9 `build-port7-candidate/v9` — source164files, Engine9baad562…,
+consistent build rc0/7ELFs: genacbb6a07…, serve3ebc28f1…, DSpark2970bf77…,
+verifydump4d7210ac…, captureprobee2c98535…. MSA/GROUP/LOOKUP/CAPTURE_VIEW
+по умолчанию выключены. Guard EXACT1/NATIVE0 исправлен; отсутствующий
+compiled exact helper по-прежнему отвергается, native fallback запрещён.
+Capture lease сохраняет прежнюю seed append geometry, CPU958+controller9720
+PASS; combined CPU/CUDA syntax PASS перед сборкой. Новые поля helperStats
+требуют согласованной пересборки engine/GpuExperts/helper, builder это делает.
+
+P7-v8 long16K И32K PASS против GPU-offload oracle: anchor1+tail32,
+top1=100%, KL/maxabs0, все features exact, partialcommit/rewind. Runtime
+capacity equivalence явно проверена: native40000, oracle requested16416/32800,
+actual padded16640/33024, contiguous KV + trained RoPE + PAD256. Первый
+oracle16Kctx40000 OOM сохранён; повтор с equivalence — новый immutablejob.
+
+Проверки V9: raw accumulated capture VIEW0/1 (split3840+256 иskip→17),
+MSA→LOOKUP→cache290→GROUP пять numeric профилей; затем clean ordinary
+EXACTcache290 OFF/ON (безDSpark, seedprimer внутриTG) и clean M3 mini.
+Все они координируются validation; не дублировать, смотреть active units.
+
+Flat CPU perf frozenV8 PASS:34228 samples/lost0, только ownedPID и временный
+CAP_PERFMON. Secondary poll39,29%, barrier16%, dotIQ3/IQ4/NVFP4 вместе42,70%.
+Disassembly подтверждает spin, НО это USERcycles, не потеря54%wall. expf≈0,05%,
+quant≈0,08%; не тратить время на переносlibm. CPU агент готовит приватный
+per-thread skew profiler, не меняя production. THP16GiB trial ещё не запускался.
+
+Следующие отдельные proposals: coalesce helper360GPUcases exact (runtime
+ещёнеподключён), fused contiguous gate+up cached helper feasibility, F32index
+shadow design, optional batched-gather/FA component. Не объявлять их принятыми.
+Цель35–40+ всё ещё НЕ достигнута; P7-v8 diagnosticbest25,21 нижеordinary.
+Final canonical/full20/GSM100/tools23/om2round пока pending.
+
+## Текущее продолжение: P7-v8 заморожена, ещё не собрана
+
+Не путать `build-port7-candidate/v8` с принятой `build-port6-canonical/v8`.
+Первая — новый эксперимент, вторая — сохранённая контрольная сборка.
+В P7-v8 заморожено 158 файлов: VIEW_INPUTS и PACKED_ROUTED теперь независимые
+opt-in режимы. Компоненты GPU: VIEW 316 случаев / 5,10 млн F32, PACKED 240
+случаев / 2,89 млн F32 и 2520 IDs, все биты совпали. Cached peer проверил
+норму как OUTPUT, lifetime shared graph, reusable host buffers и SUM budget.
+Root ждёт освобождения трёх CXX слотов (lookup/MSA/cached cold/syntax), затем
+запускает consistent builder --resume; не запускать четвёртый компилятор.
+
+V7 shared overlap: parity128 точна в обоих режимах, все 6 продолжений равны
+своим serial reference. Диагностический TG для depth1: 23,317→23,739; depth3:
+19,680→20,051; depth7: 14,578→14,651. Это меньше ordinary26,3; winner ещё нет.
+V6 code3000 fast-tail oracle: anchor1+tail128 PASS, top1=100%, KL=0,
+features exact, K1/2/3/4/7/8 и rollback. `port7-v6-fasttail-code3000-v1/compare.json`.
+Это один случай; новые 16K/32K diagnostic пары готовит validation под P7-v8.
+
+PP32 V2 с capture reuse дал 1233,6/1227,1 t/s, ordinary1250,0/1245,9. UUID
+входов различались, строгим A/B это не считается. Fixed-UUID reverse-order V3
+с наблюдением actual prompt IDs сейчас в очереди/работе. Full GSM100/tools23,
+final20 и canonical CMake для port7 по-прежнему НЕ выполнены.
+
+Cached grouping isolated warm component: 27 случаев / 712704 F32 exact;
+K8 local gain1,35–2,17×, но наборы помещаются в L2. Cold-L2 A/B ещё нужен,
+live runtime не менялся. Dynamic LRU uploads отвергнуты по offline трафику
+~4GB/token и слабому hit rate. Ngram draft пока только offline анализ;
+крошечные greedy trace cases зациклены, не считать их победой модели.
+
+## Port7 обновление после capacity, 2026-10-27 11:35 UTC
+
+V5/V6 новые пути пока НЕ быстрее V8. V5 sweep20arms все128greedy IDs
+совпали с serial при одинаковом ctx/chunk. Лучший depth1/pmin0:23.588t/s
+против same-config serial26.889. Наивный batch и unfenced fusion отклонены.
+V6 ops1/cache0 и ops1/cache1hot290 parity128/maxabs0; actual speed sweep
+ещё выполняется. Не выдавать profiler/численный pilot за om_bench.
+
+Combined frozen V7: build-port7-candidate/v7/source,151files, root build
+codex-m31-port7-candidate-build-v7, backend mmv-api-v3. Новое: defaultOFF
+M31_DSPARK_CAPTURE_REUSE (persistent pinned capture/window последних4096),
+M31_DSPARK_SHARED_OVERLAP (asyncshared против CPUmisses). CaptureCPU565PASS,
+batchedopsGPU444/444, exactmaskedcachewrapper16casesPASS. Модельная проверка
+именно новых V7 флагов ещё впереди; source proofs не заменяют её.
+
+Actual nsysV6 diagnostic port7-verify-trace-v6/trace.json:9steadyK8ranges,
+72querytokens; mean wall309.32ms/frame, GPUunion81.81ms, DMA9.81ms,
+mainGPUstream53.17ms/frame и exactcachedworker28.64ms/frame. Не считать
+API/GPU интервалы аддитивными. 24,967kernels+11,123copies/frame; concat и
+мелкие DTOD заметны. Цель35–40+ не достигнута. Следующие causal pilots:
+sharedoverlap, capturePPregression, packedreadback; MSAne2 component reserve.
+
+Prefix exactsinglechunk actualGPU raw cold/reuse/cold maxabs0 (4352IDs,
+256boundary/stalefuture), HTTP/CPU checks PASS. HTTP M3 native100checks и
+HTTP32checks PASS в V5; greedy толькоtemp0, temp1/grammar ordinaryfallback.
+До final canonical full20+16/32K+GSM100/tools23/om ещё НЕ выполнены дляport7.
+
+## Port7 обновление: точный DSpark и K4 MMV
+
+CombinedV3 rc0: build-port7-candidate/v3/build-receipt.json, CUDA override
+из build-port7-dense/v3 (новый fusionAPI, livevendorне тронут). В V3 есть
+verified weightedCPU (actual1.071/1.126/1.176×), persistent verifier,
+exactcached helper, policy/plannerSUMfixes. Последующие live изменения:
+CPU pairmode0/1/2, M3sweep/externalresidentbudget, projectedK4verifier/API.
+Новые CPU/CUDA translationunits нужно согласованно добавлять в manualbuilder
+и CMake. V3 source132files заморожен, будущийcombined не затирать его.
+
+Exactcached hot162 и290 code128: top1=1,KL/maxabs0; helper387072termsbitwise,
+full290→prefillunpin lifecycle9checksPASS. Реального omgain пока нет,
+queueготова, highpriorityтолькоеслиperformanceперспективен.
+Nativecached hot162 отклонён навсегда по данному профилю.
+
+ExactM3 V2 end-to-end spec128 greedy СОВПАЛ с matched serial128 при
+ctx40000/chunk32768/actual3324onechunk. SHA414644292d60…,
+strict-greedy-compare-v1.json в port7-dspark-matched-serial-numeric-v1.
+Первое сравнение давало117diff из-за referencectx4096/twochunks;
+теперь explicit invalid_reference ДОscore. Draftacceptance92/246=.374,
+36rounds, diagnostic7.3tps на slow transientверификаторе, НЕspeedприёмка.
+PersistentV3pilot только что завершён rc0, результаты дочитать.
+
+Главный новый положительный результат: actualGPU dense K4 FORCED MMV
+56/56role/type/familycases,2.79MF32 maxabs0; stockF32K4дрейфует (MMF),
+Q6/Q8stockK4точен. K8неexact, поэтомуK8verifierдвеK4пачки.
+Headcomponent3.58×,QKV2.65×,GU2.74×; это warmcomponent, НЕmodelTPS.
+Denseагент делает per-node markerAPI вunusedop_paramslot15 (unmarkedMSA
+не трогать), DSparkагент batchprojection hooks + perquery n1attention.
+Это основной следующий рычаг35–40. ПроверитьK3/finalparitylong16/32K.
+
+FusionV3fenced128tail exact, но~0.1msgain. V4unfenced128tailFAILtop1.78125,
+meanKL.366/max7.045; отклонён. Возвраткfusionвариантамнизкийприоритет.
+Root исправил routed_compute wall accounting hybrid и Dump metadata
+requesteddecodefusion/unfenced fields; эти правки только в live source.
+
+---
+
 # MiniMax-M3.1: port6, M2 принят
 
 Отчёт: /mnt/ai/logs/m31-port/REPORT-port6.final.md. Машинная приёмка:
