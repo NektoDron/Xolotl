@@ -53,6 +53,9 @@ void GpuExperts::forward_device_hybrid(int layer,int n,ggml_tensor *normalized,
         for(size_t j=i-i%size_t(g.used);j<i;++j)check(ids[j]!=ids[i],"duplicate hybrid expert");
         ++histogram[size_t(ids[i])];
     }
+    // Decode-only pins must not constrain the next prefill's cache assignment.
+    // With no decode seed configured this is the upstream no-op.
+    p_->leave_decode_seed();
     ggml_backend_synchronize(p_->backend);p_->finish_prefetch();
     std::vector<shortprefill::ExpertCost> costs(size_t(g.experts));
     const size_t expert_bytes=info.raw_bytes[0]+info.raw_bytes[1]+info.raw_bytes[2];
@@ -89,6 +92,13 @@ void GpuExperts::forward_device_hybrid(int layer,int n,ggml_tensor *normalized,
         p_->stat.short_cold_gpu_bytes+=assignment.gpu_cold_bytes;
         p_->stat.short_wall_seconds+=Impl::elapsed(whole_start);failure.complete=true;return;
     }
+    // The all-GPU delegation above records its own routes. Only the mixed/CPU
+    // branch records here, so demand counters and history are updated once.
+    // Residency was decided after draining prefetch; this path never starts a
+    // speculative next-layer transfer of its own.
+    std::vector<uint8_t> selected_mask(size_t(g.experts),0);
+    for(int e=0;e<g.experts;++e)selected_mask[size_t(e)]=histogram[size_t(e)]!=0;
+    p_->observe_routes(layer,n,selected_mask);
     std::vector<float> host_input(count);ggml_backend_tensor_get(normalized,host_input.data(),0,bytes);
     std::vector<float> cpu_output;
     if(!p_->short_cpu_lane)p_->short_cpu_lane=std::make_unique<ShortPrefillCpuLane>();

@@ -2,6 +2,9 @@
 #include "m31_engine.hpp"
 #include "m31_mixed.hpp"
 #include "m31_prompt_cache.hpp"
+#include "server_prefix_cache.hpp"
+#include "server_dspark_policy.hpp"
+#include "m31_dspark_session.hpp"
 #include "json.hpp"
 #ifdef M31_HAVE_CUDA
 #include "ggml-cuda.h"
@@ -31,6 +34,10 @@ int main(int argc, char ** argv) {
     try {
         std::string model, backend = "cpu";
         Config cfg;
+        bool prefix_cache_enabled = false;
+        std::string dspark_model;
+        int dspark_depth = 3;
+        float dspark_p_min = 0;
         cfg.context = 4096;
         for (int i = 1; i < argc; ++i) {
             const std::string key = argv[i];
@@ -49,11 +56,17 @@ int main(int argc, char ** argv) {
             else if (key == "--cpu-decode-cache") cfg.cpu_decode_cache = std::stoi(value) != 0;
             else if (key == "--dense-decode-cache") cfg.dense_decode_cache = std::stoi(value) != 0;
             else if (key == "--cpu-residual") cfg.cpu_residual = std::stoi(value) != 0;
+            else if (key == "--dspark-model") dspark_model = value;
+            else if (key == "--dspark-depth") dspark_depth = std::stoi(value);
+            else if (key == "--dspark-p-min") dspark_p_min = std::stof(value);
+            else if (key == "--prefix-cache") prefix_cache_enabled = std::stoi(value) != 0;
             else if (key == "--profile") cfg.profile = std::stoi(value) != 0;
             else throw std::runtime_error("unknown option " + key);
         }
         if (model.empty() || cfg.context < 1 || cfg.context > 1048576 || cfg.max_chunk < 1 || cfg.max_chunk > 32768 || cfg.threads < 1)
             throw std::runtime_error("invalid model/context/chunk/threads");
+        if (dspark_depth < 1 || dspark_depth > 7 || !std::isfinite(dspark_p_min) || dspark_p_min < 0 || dspark_p_min > 1)
+            throw std::runtime_error("invalid DSpark depth/p_min");
         if (backend == "cuda") {
             const char * session = std::getenv("M31_CARD_SESSION");
             if (!session || std::string(session) != "1") throw std::runtime_error("CUDA requires the aictl/flock runner");
@@ -77,7 +90,11 @@ int main(int argc, char ** argv) {
                                        {"context", cfg.context}, {"max_chunk", cfg.max_chunk}}).dump();
                 std::fprintf(stderr, "M31 exact whole-prompt cache: host_budget=%zu bytes; no partial-prefix reuse\n", prefix_cache.budget());
             }
-            send({{"event", "ready"}, {"vocab", engine.geometry().vocab}, {"context", cfg.context}});
+            json ready = {{"event", "ready"}, {"vocab", engine.geometry().vocab}, {"context", cfg.context}};
+            if (!dspark_model.empty()) ready["dspark"] = {{"configured", true}, {"mode", "greedy_only"},
+                {"sampling_fallback", true}, {"depth", dspark_depth}, {"p_min", dspark_p_min}};
+            send(ready);
+            ExactPromptCache text_prefix_cache;
             std::string line;
             while (std::getline(std::cin, line)) {
                 prompt_cache::Digest active_cache_key{};
@@ -116,6 +133,24 @@ int main(int argc, char ** argv) {
                     const auto suppressed = req.value("suppress_ids", std::vector<int>{});
                     std::set<int> excluded(suppressed.begin(), suppressed.end());
                     if (ignore_eos) excluded.insert(stop_ids.begin(), stop_ids.end());
+                    auto dspark_policy = dspark_request_policy(!dspark_model.empty(), backend == "cuda",
+                        cfg.persistent_cpu_pool, cfg.gpu_experts_min_tokens, int(engine.geometry().layers),
+                        temperature, req.value("grammar_check", false), maximum);
+                    // Mixed target capture/draft seeding has not been validated.
+                    if (!mixed_manifest.empty() && dspark_policy.enabled)
+                        dspark_policy = {false, "mixed_prompt"};
+                    std::unique_ptr<DSparkGreedySession> dspark_session;
+                    if (dspark_policy.enabled) {
+                        DSparkSessionConfig session_cfg;
+                        session_cfg.draft.backend = cfg.backend;
+                        session_cfg.draft.sidecar = dspark_model;
+                        session_cfg.draft.target = model;
+                        session_cfg.depth = dspark_depth;
+                        session_cfg.p_min = dspark_p_min;
+                        session_cfg.context = cfg.context;
+                        dspark_session = std::make_unique<DSparkGreedySession>(session_cfg);
+                        if (!dspark_session->begin_prefill(engine, error)) throw std::runtime_error(error);
+                    }
                     const uint64_t seed = req.value("seed", uint64_t(std::random_device{}()));
                     std::mt19937_64 rng(seed);
                     size_t grammar_checks = 0, grammar_rejections = 0, sampling_calls = 0, interactive_waits = 0;
@@ -150,20 +185,66 @@ int main(int argc, char ** argv) {
                     };
                     if (trace) trace_ms["request_setup_ms"] = ms(setup_start);
                     const auto prefill_pipeline_start = Clock::now();
-                    if (prefix_cache.budget() && req.contains("cache_prompt") && !req.at("cache_prompt").is_boolean())
+                    if ((prefix_cache.budget() || prefix_cache_enabled) && req.contains("cache_prompt") && !req.at("cache_prompt").is_boolean())
                         throw std::runtime_error("cache_prompt must be boolean");
                     const bool cache_requested = prefix_cache.budget() && maximum > 0 && req.value("cache_prompt", true);
-                    bool cache_usable = cache_requested, cache_hit = false;
+                    // The live-KV cache is text-only: visual placeholder IDs do not
+                    // identify embeddings. The snapshot cache below hashes all media.
+                    const bool use_cache = prefix_cache_enabled && mixed_manifest.empty() && maximum > 0 &&
+                        !dspark_policy.enabled && cfg.draft_feature_layers.empty() && req.value("cache_prompt", true);
+                    if (!use_cache) text_prefix_cache.clear();
+                    // Draft feature rings are not part of a PrefixCheckpoint.
+                    bool cache_usable = cache_requested && dspark_model.empty() && cfg.draft_feature_layers.empty();
+                    bool cache_hit = false;
+                    std::vector<PromptChunk> actual_chunks;
+                    const auto padded_keys = [&](int64_t position, int rows) {
+                        const int64_t block = std::max<int64_t>(256, engine.geometry().block);
+                        return ((position + rows + block - 1) / block) * block;
+                    };
                     json cache_info = {{"enabled", cache_requested}, {"hit", false}, {"budget_bytes", prefix_cache.budget()}};
                     if (prefix_cache.budget() && req.contains("cache_prompt") && !req.at("cache_prompt").get<bool>())
                         cache_info["skip"] = "cache_prompt:false";
+                    if (cache_requested && !cache_usable) cache_info["skip"] = "draft feature capture is not checkpointed";
                     json cached_recipe = json::array();
                     prompt_cache::Recipe fresh_recipe;
                     bool cache_reset = false;
                     double cache_reset_ms = 0;
-                    if (cache_requested) {
-                        const auto cache_reset_start = Clock::now();
+                    if (use_cache && !text_prefix_cache.empty()) {
+                        const int requested = int(std::min(size_t(cfg.max_chunk), ids.size()));
+                        const int planned = engine.prefill_chunk_at(0, requested, error);
+                        if (text_prefix_cache.matches(ids, planned, engine.position(), engine.geometry().vocab)) {
+                            if (!engine.rewind(int64_t(ids.size()), error)) throw std::runtime_error(error);
+                            const auto & chunk = text_prefix_cache.chunk();
+                            actual_chunks.push_back(chunk);
+                            cached_recipe.push_back({{"position", chunk.position}, {"rows", chunk.tokens}});
+                            logits_for_sampling = text_prefix_cache.raw_logits();
+                            cache_hit = true;
+                            cache_info["skip"] = "live text prefix cache hit";
+                        }
+                    }
+                    auto reset_engine = [&]() {
+                        // A reset or snapshot restore invalidates this live-KV descriptor.
+                        text_prefix_cache.clear();
                         engine.reset();
+                        if (!dspark_model.empty()) {
+                            if (!engine.set_external_resident_bytes(0, error) ||
+                                !engine.set_draft_feature_layers(dspark_policy.enabled
+                                    ? std::vector<int>{4,18,32,46,60} : std::vector<int>{}, 4096, error))
+                                throw std::runtime_error(error);
+                            const char * capture_reuse = std::getenv("M31_DSPARK_CAPTURE_REUSE");
+                            if (dspark_policy.enabled && capture_reuse && std::string(capture_reuse) == "1") {
+                                const auto begin = std::max<int64_t>(0, int64_t(ids.size()) - 4096);
+                                const char * capture_view = std::getenv("M31_DSPARK_CAPTURE_VIEW");
+                                const bool window_ok = capture_view && std::string(capture_view) == "1"
+                                    ? engine.set_draft_feature_view_window(begin, int64_t(ids.size()), error)
+                                    : engine.set_draft_feature_window(begin, error);
+                                if (!window_ok) throw std::runtime_error(error);
+                            }
+                        }
+                    };
+                    if (cache_usable && !cache_hit) {
+                        const auto cache_reset_start = Clock::now();
+                        reset_engine();
                         cache_reset_ms = ms(cache_reset_start);
                         cache_reset = true;
                         const auto geometry_start = Clock::now();
@@ -178,9 +259,9 @@ int main(int argc, char ** argv) {
                         const auto cache_key_start = Clock::now();
                         try {
                             if (cache_usable) {
-                            active_cache_key = prompt_cache::input_key(cache_identity, ids, mixed.visual_rows, mixed.embeddings, mixed.positions);
-                            active_cache_key_known = true;
-                            cache_info["input_sha256"] = prompt_cache::hex(active_cache_key);
+                                active_cache_key = prompt_cache::input_key(cache_identity, ids, mixed.visual_rows, mixed.embeddings, mixed.positions);
+                                active_cache_key_known = true;
+                                cache_info["input_sha256"] = prompt_cache::hex(active_cache_key);
                             }
                         } catch (const std::exception & e) {
                             cache_usable = false;
@@ -194,7 +275,10 @@ int main(int argc, char ** argv) {
                             const auto restore_start = Clock::now();
                             if (engine.restore_prefix(entry->checkpoint, error)) {
                                 logits_for_sampling = entry->logits;
-                                for (auto [position, rows] : entry->recipe) cached_recipe.push_back({{"position", position}, {"rows", rows}});
+                                for (auto [position, rows] : entry->recipe) {
+                                    cached_recipe.push_back({{"position", position}, {"rows", rows}});
+                                    actual_chunks.push_back({position, rows, padded_keys(position, rows)});
+                                }
                                 cache_info["entry_sha256"] = prompt_cache::hex(entry->key);
                                 cache_hit = true;
                             } else {
@@ -206,10 +290,10 @@ int main(int argc, char ** argv) {
                         cache_info["hit"] = cache_hit;
                     }
                     const auto reset_start = Clock::now();
-                    if (!cache_hit && !cache_reset) engine.reset();
+                    if (!cache_hit && !cache_reset) reset_engine();
                     if (trace) trace_ms["reset_ms"] = cache_reset ? cache_reset_ms : ms(reset_start);
                     double plan_ms = 0, forward_ms = 0, first_decode_ms = 0, first_decode_head_ms = 0;
-                    const auto start = cache_requested ? prefill_pipeline_start : Clock::now();
+                    const auto start = (cache_requested || cache_hit) ? prefill_pipeline_start : Clock::now();
                     int last_n = 0;
                     for (size_t p = 0; !cache_hit && p < ids.size();) {
                         const int requested = int(std::min(size_t(cfg.max_chunk), ids.size() - p));
@@ -223,10 +307,12 @@ int main(int argc, char ** argv) {
                             : engine.forward_mixed(ids.data() + p, mixed.visual_rows.data() + p,
                                                    mixed.embeddings.data(), mixed.visual_count, last_n, error);
                         if (!ok) throw std::runtime_error(error);
+                        if (dspark_session && !dspark_session->observe_prefill(engine, error)) throw std::runtime_error(error);
+                        if (prefix_cache_enabled) actual_chunks.push_back({int64_t(p), last_n, padded_keys(int64_t(p), last_n)});
                         if (trace) {
                             const double elapsed = ms(forward_start);
                             forward_ms += elapsed;
-                            trace_chunks.push_back({{"position", p}, {"rows", last_n}, {"forward_ms", elapsed}});
+                            trace_chunks.push_back({{"position", p}, {"rows", last_n}, {"tokens", last_n}, {"padded_keys", padded_keys(int64_t(p), last_n)}, {"forward_ms", elapsed}});
                         }
                         if (cache_usable) fresh_recipe.emplace_back(int64_t(p), last_n);
                         p += size_t(last_n);
@@ -235,6 +321,8 @@ int main(int argc, char ** argv) {
                     const auto head_start = Clock::now();
                     if (maximum && !cache_hit && !engine.logits(last_n - 1, 1, logits_for_sampling, error)) throw std::runtime_error(error);
                     if (trace) trace_ms["prefill_head_ms"] = cache_hit ? 0.0 : ms(head_start);
+                    if (use_cache && text_prefix_cache.empty())
+                        text_prefix_cache.store(ids, actual_chunks, logits_for_sampling, int(engine.geometry().vocab));
                     if (cache_usable && !cache_hit && fresh_recipe.size() == 1 && fresh_recipe[0].first == 0 && fresh_recipe[0].second == int(ids.size())) {
                         const auto snapshot_start = Clock::now();
                         try {
@@ -269,6 +357,15 @@ int main(int argc, char ** argv) {
                     auto decode_end = decode_start;
                     const double prompt_ms = std::chrono::duration<double, std::milli>(decode_start - start).count();
                     json prefill = {{"event", "prefill"}, {"prompt_n", ids.size()}, {"prompt_ms", prompt_ms}};
+                    if (prefix_cache_enabled) {
+                        prefill["cached_n"] = cache_hit ? ids.size() : 0;
+                        prefill["prompt_eval_n"] = cache_hit ? 0 : ids.size();
+                        prefill["cache_hit"] = cache_hit;
+                        prefill["actual_chunks"] = json::array();
+                        for (const auto & chunk : actual_chunks) prefill["actual_chunks"].push_back({
+                            {"position", chunk.position}, {"tokens", chunk.tokens}, {"padded_keys", chunk.padded_keys}});
+                        if (cache_hit) prefill["cached_prefill_recipe"] = cached_recipe;
+                    }
                     if (trace) {
                         trace_ms["prefill_ready_from_request_ms"] = ms(request_start);
                         prefill["ttft_stages_ms"] = trace_ms;
@@ -295,19 +392,34 @@ int main(int argc, char ** argv) {
                             if (!std::getline(std::cin, control)) throw std::runtime_error("request controller disconnected");
                             interactive_wait_ms += ms(interactive_started);
                             ++interactive_waits;
-                            if (!json::parse(control).value("continue", false)) { finish = "stop"; break; }
+                            if (!json::parse(control).value("continue", false)) { text_prefix_cache.clear(); finish = "stop"; break; }
                         }
                         if (i + 1 < maximum) {
                             const int32_t next = token;
                             const auto decode_forward_start = Clock::now();
-                            if (!engine.forward(&next, 1, error)) throw std::runtime_error(error);
-                            if (trace && i == 0) first_decode_ms = ms(decode_forward_start);
-                            const auto decode_head_start = Clock::now();
-                            if (!engine.logits(0, 1, logits_for_sampling, error)) throw std::runtime_error(error);
-                            if (trace && i == 0) first_decode_head_ms = ms(decode_head_start);
+                            if (dspark_session) {
+                                // Draft preparation remains after token0 and its ACK.
+                                if (!dspark_session->advance(engine, next, maximum - i - 1, logits_for_sampling, error))
+                                    throw std::runtime_error(error);
+                                if (trace && i == 0) first_decode_ms = ms(decode_forward_start);
+                            } else {
+                                if (!engine.forward(&next, 1, error)) throw std::runtime_error(error);
+                                if (trace && i == 0) first_decode_ms = ms(decode_forward_start);
+                                const auto decode_head_start = Clock::now();
+                                if (!engine.logits(0, 1, logits_for_sampling, error)) throw std::runtime_error(error);
+                                if (trace && i == 0) first_decode_head_ms = ms(decode_head_start);
+                            }
                         }
                     }
                     const double predicted_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();
+                    double dspark_finish_ms = 0;
+                    if (dspark_session) {
+                        const auto finish_started = Clock::now();
+                        if (!dspark_session->finish(engine, error)) throw std::runtime_error(error);
+                        dspark_finish_ms = ms(finish_started);
+                        const int64_t expected_fed = int64_t(ids.size()) + std::max(0, predicted - 1);
+                        if (engine.position() != expected_fed) throw std::runtime_error("DSpark final KV position differs from emitted samples");
+                    }
                     json done = {{"event", "done"}, {"finish_reason", finish}, {"timings", {
                         {"grammar_checks", grammar_checks}, {"grammar_rejections", grammar_rejections},
                         {"sampling_ms", sampling_ms}, {"sampling_calls", sampling_calls},
@@ -325,8 +437,31 @@ int main(int argc, char ** argv) {
                         done["timings"]["prompt_cache"] = cache_info;
                         if (cache_hit) done["timings"]["cached_prefill_recipe"] = cached_recipe;
                     }
+                    if (!dspark_model.empty()) {
+                        auto & timings = done["timings"];
+                        timings["dspark_mode"] = dspark_policy.enabled ? "greedy" : "target_fallback";
+                        timings["dspark_fallback_reason"] = dspark_policy.reason;
+                        timings["dspark_finish_ms"] = dspark_finish_ms;
+                        if (dspark_session) {
+                            const auto & stats = dspark_session->stats();
+                            timings["dspark_rounds"] = stats.rounds;
+                            timings["dspark_proposed"] = stats.proposed;
+                            timings["dspark_accepted"] = stats.accepted;
+                            timings["dspark_verified_rows"] = stats.verified_rows;
+                            timings["dspark_cached_rows"] = stats.cached_rows;
+                            timings["dspark_prepare_ms"] = stats.prepare_ms;
+                            timings["dspark_draft_ms"] = stats.draft_ms;
+                            timings["dspark_verify_ms"] = stats.verify_ms;
+                            timings["dspark_append_ms"] = stats.append_ms;
+                        }
+                    }
+                    if (prefix_cache_enabled || !dspark_model.empty()) {
+                        done["kv_position"] = engine.position();
+                        done["fed_generated_n"] = engine.position() - int64_t(ids.size());
+                    }
                     send(done);
                 } catch (const std::exception & e) {
+                    text_prefix_cache.clear();
                     if (active_cache_key_known) prefix_cache.erase(active_cache_key);
                     engine.reset(); send({{"event", "error"}, {"error", e.what()}});
                 }

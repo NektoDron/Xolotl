@@ -31,6 +31,7 @@ void GpuExperts::forward_device(int layer,int n,ggml_tensor *normalized,
     }
     for(int e=0;e<g.experts;++e)if(mask[size_t(e)]){selected.push_back(e);protected_keys.insert(p_->key(layer,e));}
     check(selected.size()<=p_->stat.slot_count,"device FFN selected experts exceed cache capacity");
+    if(n>1)p_->leave_decode_seed();
 #ifdef M31_REGISTERED_ARENA_CUDA
     if(p_->layer_banks){
         try{

@@ -281,6 +281,11 @@ struct Dump {
           << ",\"oracle_op_offload\":" << (args.oracle_op_offload ? "true" : "false")
           << ",\"cuda_fusion_disabled\":" <<
              ((std::getenv("GGML_CUDA_DISABLE_FUSION") && std::string(std::getenv("GGML_CUDA_DISABLE_FUSION")) == "1") ? "true" : "false")
+          // The process default and M31's per-backend decode override are separate.
+          << ",\"m31_decode_fusion_override_requested\":" <<
+             ((std::getenv("M31_GPU_DECODE_FUSION") && std::string(std::getenv("M31_GPU_DECODE_FUSION")) == "1") ? "true" : "false")
+          << ",\"m31_decode_fusion_unfenced_requested\":" <<
+             ((std::getenv("M31_DECODE_FUSION_UNFENCED") && std::string(std::getenv("M31_DECODE_FUSION_UNFENCED")) == "1") ? "true" : "false")
           << ",\"backend\":" << quote(args.backend) << ",\"kv\":\"f16\",\"actual_chunks\":[";
         for (size_t i = 0; i < chunks.size(); ++i)
             f << (i ? "," : "") << "{\"position\":" << chunks[i].first << ",\"tokens\":" << chunks[i].second << "}";

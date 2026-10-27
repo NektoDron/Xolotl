@@ -1,6 +1,7 @@
 #pragma once
 
 #include "m31_geometry.hpp"
+#include "draft_feature_view.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 
@@ -25,6 +26,10 @@ struct Config {
     bool cpu_decode_cache = false; // keep per-layer CPU MoE graphs for single-token steps
     bool dense_decode_cache = false; // stable dense/head graphs, indexed KV writes; requires reuse/cpu_residual
     bool profile = false;
+    // Optional DSpark capture of residuals ENTERING these zero-based layer inputs.
+    // [4,18,32,46,60] are outputs of blocks [3,17,31,45,59]. Empty keeps v8.
+    std::vector<int> draft_feature_layers;
+    int draft_feature_max_rows = 4096;
     // Optional calibration observer; IDs/weights are token-major [n,used].
     std::function<void(int layer, int n, const std::vector<int32_t> &,
                        const std::vector<float> &)> route_observer;
@@ -79,9 +84,33 @@ public:
     // no last chunk. The caller retains the exact last-prefix logits separately.
     // Rejected foreign/invalid checkpoints leave the current valid state alone.
     bool restore_prefix(const PrefixCheckpointPtr & checkpoint, std::string & error);
+    // Experimental layer-major verifier: n1 dense geometry, shared CPU expert rows.
+    bool verify(const int32_t * tokens, int n, std::vector<float> & logits, std::string & error);
     // Logits for a consecutive set of rows in the last chunk. Small row slices avoid vocab*n scratch.
     bool logits(int row, int count, std::vector<float> & out, std::string & error);
     void reset();
+    // Borrow the immutable loaded output projection; valid until Engine destruction.
+    ggml_tensor * output_weight() const;
+    // Opt-in decode transition: discard retained prefill scratch after the caller
+    // saved the last logits/features. KV and expert weights remain valid.
+    bool release_prefill_workspace(std::string & error);
+    // Caller-owned GPU allocations (e.g. retained DSpark) are subtracted from
+    // the post-resident prefill budget. Caller updates this after their changes.
+    bool set_external_resident_bytes(uint64_t bytes, std::string & error);
+    // Captured rows of the last forward, token-major [rows, feature_layers*embd].
+    bool draft_features(int64_t & first_position, int & rows,
+                        std::vector<float> & values, std::string & error) const;
+    // Request-boundary capture policy, after reset() and before any forward.
+    // Empty layers keeps the ordinary target path free of feature readbacks.
+    bool set_draft_feature_layers(const std::vector<int> & layers, int max_rows,
+                                  std::string & error);
+    // Opt-in reuse capture: skip prompt rows before this position. Empty windows
+    // return zero valid rows; policy can change only immediately after reset.
+    bool set_draft_feature_window(int64_t min_position, std::string & error);
+    // Separate opt-in bounded [begin,end) host window. The older min setter
+    // retains its per-chunk semantics. Requires VIEW=1 and REUSE=1.
+    bool set_draft_feature_view_window(int64_t begin, int64_t end, std::string & error);
+    bool draft_feature_window_view(DraftFeatureView & view, std::string & error) const;
     int64_t position() const;
     // Serialized use only, between Engine calls. Cumulative counters for
     // calibration; resets keep these counters. CPU
@@ -121,6 +150,13 @@ public:
     // M31_PREFILL_ADAPTIVE=1, choose a conservative CUDA scratch-safe chunk.
     // Returns0 with error on invalid state/insufficient budget; forward never changes n.
     int prefill_chunk(int requested, std::string & error) const;
+    // Cache/speculation primitive. Preserves KV/index rows [0,position), but
+    // invalidates every graph-backed hidden/head result. Caller owns raw logits.
+    // Only positions produced by completed passes are eligible for reuse.
+    bool rewind(int64_t position, std::string & error);
+    // Pure planning at a logical position, using current retained-owner budget.
+    // This does not claim that future allocation high-water marks stay constant.
+    int prefill_chunk_at(int64_t position, int requested, std::string & error) const;
 private:
     struct Impl;
     std::unique_ptr<Impl> p_;

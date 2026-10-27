@@ -1,0 +1,9 @@
+#!/usr/bin/env python3
+"""One CXX isolated coalesce component, no Engine/common CMake edits."""
+import argparse,hashlib,json,shlex,shutil,subprocess
+from pathlib import Path
+p=argparse.ArgumentParser();p.add_argument('--out',type=Path,required=True);a=p.parse_args();r=Path('/mnt/ai/Xolotl-m31');base=r/'build-m31-cuda';v=r/'build-m31-cpu/_deps/strata_llamacpp-src';o=a.out.resolve();o.mkdir(parents=True,exist_ok=False);s=o/'source';s.mkdir()
+for n in ['m31_dspark_coalesced_rows.hpp','port7_coalesced_rows_check.cpp']:shutil.copy2(r/'tools/m31'/n,s/n)
+cmd=['/usr/bin/g++-14','-std=c++20','-O3','-DNDEBUG','-fno-fast-math','-frounding-math','-DM31_ENGINE_CUDA=1','-I'+str(s),'-I'+str(v/'ggml/include'),'-c',str(s/'port7_coalesced_rows_check.cpp'),'-o',str(o/'check.o')];subprocess.run(cmd,check=True)
+link=shlex.split((base/'CMakeFiles/m31_generate.dir/link.txt').read_text());link=[x for x in link if not x.startswith('-Wl,--dependency-file=')];i=link.index('-o');link[i-1]=str(o/'check.o');link[i+1]=str(o/'coalesced-rows-check');subprocess.run(link,cwd=base,check=True)
+run=subprocess.run([str(o/'coalesced-rows-check'),'cpu',str(o/'cpu-result.json')],capture_output=True,text=True);(o/'cpu.log').write_text(run.stdout+run.stderr);run.check_returncode();sha=lambda p:hashlib.sha256(p.read_bytes()).hexdigest();receipt=dict(format='m31-port7-coalesced-rows-build-v1',source={p.name:sha(p) for p in s.iterdir()},compile=cmd,link=link,cpu_result=json.loads((o/'cpu-result.json').read_text()),elf_sha256=sha(o/'coalesced-rows-check'),cuda_library_sha256=sha(base/'ggml/src/ggml-cuda/libggml-cuda.a'),scope='Independent pure metadata helper; Engine/common CMake unchanged; CUDA raw proof pending');(o/'build-receipt.json').write_text(json.dumps(receipt,indent=2)+'\n');print(json.dumps(receipt['cpu_result']))

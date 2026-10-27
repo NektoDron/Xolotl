@@ -30,6 +30,15 @@ public:
         uint64_t short_cold_gpu_bytes = 0;
         double short_cpu_seconds = 0, short_wall_seconds = 0;
         uint64_t cached_forwards = 0;
+        uint64_t hybrid_forwards = 0, decode_route_lookups = 0, decode_resident_routes = 0;
+        double hybrid_submit_seconds = 0, hybrid_cpu_seconds = 0, hybrid_join_seconds = 0;
+        size_t decode_scratch_bytes = 0;
+        uint64_t decode_seed_primes = 0, decode_seed_upload_bytes = 0;
+        double decode_seed_seconds = 0;
+        uint64_t cached_batch_calls=0,cached_batch_forwards=0,cached_batch_tokens=0;
+        uint64_t cached_batch_routes=0,cached_batch_hits=0,cached_batch_allmiss=0;
+        double cached_batch_seed_seconds=0,cached_batch_submit_seconds=0;
+        double cached_batch_cpu_seconds=0,cached_batch_join_seconds=0,cached_batch_wall_seconds=0;
         uint64_t fast_forwards = 0;
         // Wall time on the calling thread. Async upload_submit can overlap prior
         // DMA; execute includes device completion and must not be called pure kernel time.
@@ -98,12 +107,41 @@ public:
     bool forward_cached(int layer, int n, const std::vector<float> & x,
                         const std::vector<int32_t> & ids, const std::vector<float> & weights,
                         std::vector<float> & output);
+    // Native n1 partial-cache execution. After optional one-time decode seeding,
+    // false means zero resident routes: no callback/output mutation or per-route
+    // uploads/evictions. Otherwise GPU work is
+    // enqueued before the callback computes CPU misses. Callback returns already
+    // weighted [embd,missing] contributions, in submitted miss-ID order. The final
+    // sum preserves original top-k order; all borrowed work drains on failure.
+    using MissingDecode = std::function<void(const std::vector<int32_t> &,
+        const std::vector<float> &, std::vector<float> &)>;
+    bool forward_cached_hybrid(int layer, const std::vector<float> & x,
+        const std::vector<int32_t> & ids, const std::vector<float> & weights,
+        const MissingDecode & cpu_misses, std::vector<float> & output);
+    // Opt-in exact cached-only verifier, n1..8. After optional decode seed,
+    // all-miss returns false without callback/output mutation or per-route DMA.
+    // CPU mask is original [n,used]:1=miss,0=GPU hit. Callback supplies full-rank
+    // already weighted [n,used,embd] terms with zero GPU holes; all-hit skips it.
+    // Complete Moe output [n,embd] preserves original rank order. Actual private
+    // GPU readers and all slot leases drain before return/exception.
+    using MaskedDecode = std::function<void(const std::vector<uint8_t>&,
+        std::vector<float>&)>;
+    bool forward_cached_batched(int layer,int n,const std::vector<float>& x,
+        const std::vector<int32_t>& ids,const std::vector<float>& weights,
+        const MaskedDecode& cpu_misses,std::vector<float>& output);
     // Readable during a live HTTP worker; no destructor or signal shutdown needed.
     void print_profile(const char * label = "live") const;
+    // Compact grouped-worker counters after a completed verifier round; silent
+    // while grouping is unused. No public Stats/Config layout changes.
+    void print_cached_batch_profile(const char * label = "verify") const;
     bool exact_cpu_math() const;
     bool fast_gpu_math() const;
     bool native_gpu_math() const;
     size_t workspace_bytes() const;
+    // Native-only, between completed passes: drains prefetch/backend readers and
+    // releases transient prefill scratch. Fixed weight pool and decode graphs stay.
+    // A later prefill reallocates scratch normally; call before loading a drafter.
+    void release_prefill_workspace();
     // Actual configured per-expert local GEMM bound, or zero outside fast mode.
     int fast_expert_batch_rows() const;
     bool fast_fused_reduction() const;

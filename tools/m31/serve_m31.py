@@ -205,10 +205,6 @@ def request_parameters(body, context, prompt_tokens):
     params = {"max_tokens": maximum, "ignore_eos": bool(body.get("ignore_eos", False)),
               "temperature": body.get("temperature", 1.0), "top_p": body.get("top_p", 0.95),
               "top_k": body.get("top_k", 40), "min_p": body.get("min_p", 0.05), "interactive": True}
-    if "cache_prompt" in body and int(os.environ.get("M31_PROMPT_CACHE_MIB", "0") or "0") > 0:
-        if not isinstance(body["cache_prompt"], bool):
-            raise ValueError("cache_prompt must be boolean")
-        params["cache_prompt"] = body["cache_prompt"]
     for key in ("temperature", "top_p", "min_p"):
         value = params[key]
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not float("-inf") < value < float("inf"):
@@ -221,6 +217,10 @@ def request_parameters(body, context, prompt_tokens):
         if isinstance(body["seed"], bool) or not isinstance(body["seed"], int) or not 0 <= body["seed"] < 2**64:
             raise ValueError("seed must be uint64 or -1")
         params["seed"] = body["seed"]
+    if "cache_prompt" in body:
+        if not isinstance(body["cache_prompt"], bool):
+            raise ValueError("cache_prompt must be boolean")
+        params["cache_prompt"] = body["cache_prompt"]
     stop = body.get("stop", [])
     if isinstance(stop, str):
         stop = [stop]
@@ -229,6 +229,14 @@ def request_parameters(body, context, prompt_tokens):
     if not isinstance(stop, list) or any(not isinstance(s, str) or not s for s in stop):
         raise ValueError("stop must contain nonempty strings")
     return params, stop
+
+
+def usage_counts(timings):
+    value = {"prompt_tokens": timings["prompt_n"], "completion_tokens": timings["predicted_n"],
+             "total_tokens": timings["prompt_n"] + timings["predicted_n"]}
+    if "cached_n" in timings:
+        value["prompt_tokens_details"] = {"cached_tokens": timings["cached_n"]}
+    return value
 
 
 def clipped_text(text, stops):
@@ -392,6 +400,7 @@ class Application:
         started = False
         completed = False
         tool_ids = {}
+        prefill_cache = {}
         try:
             if cancelled():
                 raise ClientDisconnected("client disconnected")
@@ -411,6 +420,7 @@ class Application:
                     self.engine.write(self.tokenizer.call({"op": "grammar_check", "token": event["token"]}))
                     waiting_grammar = False
                 elif event["event"] == "prefill":
+                    prefill_cache = {key: event[key] for key in ("cached_n", "prompt_eval_n", "cache_hit") if key in event}
                     if trace:
                         trace.point("native_prefill_received")
                         trace.details["native_prefill"] = dict(event)
@@ -447,6 +457,12 @@ class Application:
                     if delta:
                         yield {"event": "delta", "delta": delta}
                 elif event["event"] == "done":
+                    if prefill_cache:
+                        event = {**event, "timings": {**event["timings"], **prefill_cache}}
+                        # Report measured computation separately from reused logical tokens.
+                        if "prompt_eval_n" in prefill_cache:
+                            elapsed_ms = event["timings"].get("prompt_ms", 0)
+                            event["timings"]["prompt_per_second"] = 1000.0 * prefill_cache["prompt_eval_n"] / elapsed_ms if elapsed_ms > 0 else 0
                     if trace:
                         trace.point("native_done")
                         trace.details["native_timings"] = dict(event.get("timings", {}))
@@ -628,8 +644,7 @@ class Handler(BaseHTTPRequestHandler):
                                 emit(chunk(event["delta"]))
                             elif event["event"] == "done":
                                 timings = event["timings"]
-                                usage = {"prompt_tokens": timings["prompt_n"], "completion_tokens": timings["predicted_n"],
-                                         "total_tokens": timings["prompt_n"] + timings["predicted_n"]}
+                                usage = usage_counts(timings)
                                 emit(chunk({}, event["finish_reason"], timings, usage))
                     emit("[DONE]")
                 else:
@@ -639,12 +654,11 @@ class Handler(BaseHTTPRequestHandler):
                             if event["event"] == "done":
                                 done = event
                     timings = done["timings"]
-                    usage = {"prompt_tokens": timings["prompt_n"], "completion_tokens": timings["predicted_n"],
-                             "total_tokens": timings["prompt_n"] + timings["predicted_n"]}
+                    usage = usage_counts(timings)
                     if native:
                         value = {"content": done["message"].get("content", ""), "stop": True,
                                  "stopped_eos": done["finish_reason"] == "stop", "tokens_predicted": timings["predicted_n"],
-                                 "tokens_evaluated": timings["prompt_n"], "timings": timings}
+                                 "tokens_evaluated": timings.get("prompt_eval_n", timings["prompt_n"]), "timings": timings}
                     else:
                         choice = {"index": 0, "finish_reason": done["finish_reason"]}
                         choice["message" if chat else "text"] = done["message"] if chat else done["message"].get("content", "")
@@ -692,7 +706,13 @@ def main():
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         parser.add_argument("--" + flag, action="store_true")
     parser.add_argument("--vision-config", help="JSON: adapter/model/mmproj/cache_dir/backend/threads and optional limits")
+    parser.add_argument("--prefix-cache", action="store_true", help="opt-in exact full-prompt reuse in the native worker")
+    parser.add_argument("--dspark-model", default="", help="opt-in DSpark sidecar; greedy only, ordinary sampling fallback")
+    parser.add_argument("--dspark-depth", type=int, default=3)
+    parser.add_argument("--dspark-p-min", type=float, default=0.0)
     args = parser.parse_args()
+    if not 1 <= args.dspark_depth <= 7 or not 0 <= args.dspark_p_min <= 1:
+        parser.error("DSpark depth must be1..7 and p_min in0..1")
     if args.backend == "cuda" and os.environ.get("M31_CARD_SESSION") != "1":
         parser.error("CUDA requires an aictl-owned card session")
     argv = [args.engine, "--model", args.model, "--backend", args.backend, "--ctx", str(args.ctx),
@@ -700,6 +720,11 @@ def main():
             "--gpu-experts-gib", str(args.gpu_experts_gib), "--gpu-experts-min-tokens", str(args.gpu_experts_min_tokens)]
     for flag in ("reuse-allocations", "persistent-cpu-pool", "cpu-residual", "cpu-decode-cache", "dense-decode-cache", "profile"):
         argv += ["--" + flag, "1" if getattr(args, flag.replace("-", "_")) else "0"]
+    if args.prefix_cache:
+        argv += ["--prefix-cache", "1"]
+    if args.dspark_model:
+        argv += ["--dspark-model", args.dspark_model, "--dspark-depth", str(args.dspark_depth),
+                 "--dspark-p-min", str(args.dspark_p_min)]
     vision = media_input = None
     prewarm_vision = False
     if args.vision_config:

@@ -6,13 +6,19 @@
 #include "m31_gpu_experts.hpp"
 #include "cpu_direct_decode.hpp"
 #include "cpu_fused_decode.hpp"
+#include "cpu_batched_verify.hpp"
 #include "cpu_threadpool_config.hpp"
 #include "prefill_plan.hpp"
 #include "msa_chunk_limit.hpp"
+#include "msa_sorted_lookup.hpp"
 #include "gpu_prefill_hidden.hpp"
 #include "shortprefill_policy.hpp"
 #include "shortprefill_cpu_executor.hpp"
 #include "shortprefill_cuda_executor.hpp"
+#include "dense_pinned_io.hpp"
+#include "capture_host.hpp"
+#include "m31_dspark_packed_routes.hpp"
+#include "m31_dspark_coalesced_rows.hpp"
 #ifdef M31_ENGINE_CUDA
 #include "gpu_attention_fill.hpp"
 #endif
@@ -227,6 +233,10 @@ struct Graph {
     int64_t pos0 = 0;
     std::vector<std::pair<std::string, ggml_tensor *>> taps;
     bool borrowed = false;
+    bool single_token = false;
+    // Opt-in M3 helper policy; ordinary graph operations never inspect it.
+    bool dspark_view_inputs = false;
+    bool dspark_coalesce_inputs = false;
     Graph(ggml_backend_t b, const Config & cfg, int64_t pos, Workspace * workspace = nullptr,
           size_t metadata_bytes = 32 * 1024 * 1024, size_t graph_nodes = 8192)
         : backend(b), config(cfg), pos0(pos), borrowed(workspace != nullptr) {
@@ -273,7 +283,13 @@ struct Graph {
         // MUL output fencing prevents the CUDA fusion regressions observed in the
         // model gates. The exact vendor cause is still unresolved.
         const char * safe_fusion = std::getenv("M31_SAFE_FUSION");
-        if (safe_fusion && std::string(safe_fusion) == "1")
+        bool decode_unfenced = false;
+#if defined(M31_ENGINE_CUDA) && defined(GGML_CUDA_HAS_FUSION_OVERRIDE)
+        const char * unfenced = std::getenv("M31_DECODE_FUSION_UNFENCED");
+        decode_unfenced = single_token && unfenced && std::strcmp(unfenced,"1") == 0 &&
+            ggml_backend_is_cuda(backend) && ggml_backend_cuda_get_fusion_override(backend) == 1;
+#endif
+        if (safe_fusion && std::string(safe_fusion) == "1" && !decode_unfenced)
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
                 auto node = ggml_graph_node(graph, i);
                 if (node->op == GGML_OP_MUL) ggml_set_output(node);
@@ -315,6 +331,8 @@ struct Graph {
     }
 };
 
+#include "m31_dspark_verify_state.hpp"
+
 ggml_tensor * rms(Graph & b, ggml_tensor * x, ggml_tensor * w, float eps) {
     return ggml_mul(b.c, ggml_rms_norm(b.c, x, eps), w);
 }
@@ -340,6 +358,10 @@ ggml_tensor * ffn(Graph & b, const Weights & w, ggml_tensor * x, const std::stri
     auto h = ggml_swiglu_oai(b.c, gate, up, 1.702f, 7.0f);
     return ggml_mul_mat(b.c, w.get(prefix + "ffn_down" + suffix + ".weight"), h);
 }
+
+#include "m31_dspark_batched_dense.hpp"
+#include "m31_dspark_batched_ops.hpp"
+#include "m31_dspark_batched_msa.hpp"
 
 // minimax-m3.cpp::build_attn_msa_fa, single sequence, channel=GQA group.
 ggml_tensor * grouped_fa(Graph & b, ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
@@ -411,10 +433,32 @@ struct Engine::Impl {
     std::vector<std::unique_ptr<HeadGraph>> shared_decode_graphs;
     bool cpu_shared_overlap = false, shared_inflight = false, shared_trace = false;
     bool gpu_decode_chain = false, dense_async_reads = false, gpu_cached_decode = false;
+    std::unique_ptr<DensePinnedIo> dense_pinned_io;
+    bool dense_io_trace = false;
+    bool dense_decode_fusion = false;
+    bool dense_rms_only_fusion = false;
+    int dense_fusion_mode = -2, dense_fusion_previous = -1;
+    void set_dense_fusion(bool decode) {
+#if defined(M31_ENGINE_CUDA) && defined(GGML_CUDA_HAS_FUSION_OVERRIDE)
+        if (!dense_decode_fusion) return;
+        const int mode = decode ? (dense_rms_only_fusion ? 2 : 1) : 0;
+        if (mode == dense_fusion_mode) return;
+        require(ggml_backend_cuda_set_fusion_override(backend, mode), "cannot set decode-only CUDA fusion mode");
+        dense_fusion_mode = mode;
+        if (cfg.profile) std::fprintf(stderr, "M31 dense fusion mode: decode=%d (changed; captured graphs invalidated)\n", int(decode));
+#else
+        (void)decode;
+#endif
+    }
     bool decode_chain_active = false, native_gather = false, adaptive_prefill = false;
     uint64_t prefill_free_after_resident = 0;
+    uint64_t external_resident_bytes = 0;
     int msa_query_tile = 0, msa_index_tile = 0;
     bool msa_topk_mask = false, causal_f16 = false, msa_index_nvis = false;
+    // One immutable owner for every layer/ordinary/verification n1 graph.
+    // Fixed allocation precedes the adaptive free-VRAM snapshot; do not credit
+    // these bytes as reusable workspace or subtract them a second time.
+    std::unique_ptr<MsaSortedLookupMaps> msa_sorted_lookup;
     std::unique_ptr<CpuDirectDecode> cpu_direct;
     std::unique_ptr<CpuFusedDecode> cpu_fused;
 #ifdef M31_SHARED_OVERLAP_TESTING
@@ -424,6 +468,7 @@ struct Engine::Impl {
         double dense = 0, routed_setup = 0, routed_compute = 0, routed_read = 0, residual = 0;
         double dense_build = 0, dense_allocate = 0, dense_upload = 0, dense_compute = 0, dense_read = 0, dense_destroy = 0;
         double shared_enqueue = 0, shared_wait = 0, shared_read = 0;
+        double io_norm_enqueue = 0, io_ids_enqueue = 0, io_weights_enqueue = 0, io_wait = 0, io_collect = 0;
         uint64_t shared_batches = 0;
     } timings;
     using Clock = std::chrono::steady_clock;
@@ -442,6 +487,86 @@ struct Engine::Impl {
     int last_n = 0;
     bool poisoned = false, ready = false;
     std::vector<float> hidden;
+    std::vector<float> captured_features;
+    std::vector<float> verified_logits;
+    std::unique_ptr<DSparkVerifyState> verify_state;
+    std::vector<std::unique_ptr<HeadGraph>> draft_capture_graphs;
+    int captured_rows = 0;
+    int64_t captured_first = 0;
+    bool capture_reuse = false, capture_reused = false;
+    bool capture_view_enabled=false,capture_view_window_set=false,capture_view_active=false;
+    int64_t capture_view_begin=0,capture_view_end=0;
+    std::shared_ptr<uint64_t> capture_epoch;
+    int64_t capture_min_position = 0;
+    std::unique_ptr<CaptureHost> capture_host;
+    void invalidate_capture() {
+        capture_reused=false;capture_view_active=false;
+        if (capture_epoch) ++*capture_epoch;
+        if (capture_host) capture_host->invalidate();
+    }
+    void invalidate_capture_batch() {
+        capture_reused=false;capture_view_active=false;
+        if (capture_epoch) ++*capture_epoch;
+        if (capture_host) capture_host->invalidate_batch();
+    }
+    void release_capture_metadata() {
+        // Lazy draft append owns a plain-host lease. This transition releases
+        // GPU graphs only; it must not invalidate that lease's epoch or bytes.
+        capture_reused=false;capture_view_active=false;
+        if (capture_host) capture_host->invalidate_batch();
+    }
+    void prepare_capture_host() {
+        if (!capture_reuse || cfg.draft_feature_layers.empty()) return;
+        bool pinned = false;
+#ifdef M31_ENGINE_CUDA
+        pinned = ggml_backend_is_cuda(backend);
+#endif
+        if (!capture_host) capture_host = std::make_unique<CaptureHost>();
+        const bool allocated = capture_host->prepare(backend,size_t(g.embd),
+            cfg.draft_feature_layers.size(),size_t(cfg.draft_feature_max_rows),pinned);
+        if (allocated && cfg.profile) std::fprintf(stderr,
+            "M31 feature capture: reuse=1 pinned=%d scratch=%zu backing=%zu capacity=%zu\n",
+            int(capture_host->pinned()),capture_host->scratch_bytes(),
+            capture_host->backing_bytes(),capture_host->capacity_rows());
+    }
+    void capture_draft_features(int layer, int n) {
+        const auto found = std::find(cfg.draft_feature_layers.begin(),cfg.draft_feature_layers.end(),layer+1);
+        if (found == cfg.draft_feature_layers.end()) return;
+        const size_t slot = size_t(found-cfg.draft_feature_layers.begin());
+        const int rows = captured_rows, skip = n-rows;
+        // The opt-in path changes host ownership only. Tensor operations and
+        // F32 residual order below are identical to the legacy capture path.
+        std::vector<float> legacy_values;
+        if (!capture_reused) legacy_values.resize(size_t(rows)*size_t(g.embd));
+        float * values = capture_reused ? capture_host->scratch() : legacy_values.data();
+        const size_t values_bytes = size_t(rows)*size_t(g.embd)*sizeof(float);
+        if (prefill_chain_active) {
+            auto source = prefill_hidden->current();
+            ggml_backend_tensor_get(source,values,size_t(skip)*size_t(g.embd)*sizeof(float),values_bytes);
+        } else if (decode_chain_active) {
+            // A persistent residual-only graph retains the same F32 add order
+            // without touching the attention/router graph or CUDA graph cache.
+            auto & storage=draft_capture_graphs[size_t(layer)];
+            if (!storage) storage=std::make_unique<HeadGraph>();
+            if (!storage->graph) {
+                storage->graph=std::make_unique<Graph>(backend,cfg,pos,nullptr,1024*1024,512);
+                auto & b=*storage->graph;
+                storage->input=b.input(GGML_TYPE_F32,g.embd,1);
+                storage->output=ggml_cont(b.c,previous_hidden(b,layer,storage->input));
+                b.allocate({storage->output});
+            }
+            if (g.routed(layer)) ggml_backend_tensor_set(storage->input,hidden.data(),0,ggml_nbytes(storage->input));
+            storage->graph->compute();
+            ggml_backend_tensor_get(storage->output,values,0,values_bytes);
+        } else {
+            std::copy(hidden.begin()+size_t(skip)*size_t(g.embd),hidden.end(),values);
+        }
+        if (capture_reused) { capture_host->scatter(slot,values); return; }
+        const size_t width=cfg.draft_feature_layers.size()*size_t(g.embd);
+        for (int row=0;row<rows;++row)
+            std::copy_n(values+size_t(row)*size_t(g.embd),size_t(g.embd),
+                captured_features.data()+size_t(row)*width+slot*size_t(g.embd));
+    }
     // Opt-in host ownership only: every graph/backend operation stays unchanged.
     // Buffers are private to this serialized Engine and survive layer/reset boundaries.
     bool reuse_host_reads = false;
@@ -477,6 +602,9 @@ struct Engine::Impl {
 
     ~Impl() {
         drain_shared();
+        capture_epoch.reset(); // any externally held host view is now invalid
+        dense_pinned_io.reset();
+        capture_host.reset(); // pinned host owner must die before the borrowed backend
         if (gpu_experts && cfg.profile) {
             const auto & s = gpu_experts->stats();
             std::fprintf(stderr, "M31 expert cache: hits=%llu misses=%llu evictions=%llu upload_bytes=%llu resident=%zu peak=%zu scratch=%zu pinned=%d\n",
@@ -489,6 +617,8 @@ struct Engine::Impl {
         cpu_fused.reset();
         cpu_direct.reset();
         cpu_decode_graphs.clear();
+        verify_state.reset();
+        draft_capture_graphs.clear();
         shared_decode_graphs.clear();
         dense_decode_graphs.clear();
         head_decode_graph.graph.reset();
@@ -496,8 +626,15 @@ struct Engine::Impl {
         cpu_workspace.reset();
         attention_inputs.reset();
         prefill_hidden.reset();
+        msa_sorted_lookup.reset(); // all graph/capture borrowers above are gone; backend remains alive
 #ifdef M31_ENGINE_CUDA
         gpu_attention_fill.reset();
+#ifdef GGML_CUDA_HAS_FUSION_OVERRIDE
+        // This Engine borrows its CUDA backend. Return its prior policy only
+        // after every graph/stream owned here has been joined and released.
+        if (dense_decode_fusion && backend)
+            ggml_backend_cuda_set_fusion_override(backend, dense_fusion_previous);
+#endif
 #endif
         close_weights();
         if (state_buffer) ggml_backend_buffer_free(state_buffer);
@@ -532,15 +669,21 @@ struct Engine::Impl {
         return result;
     }
 
+    struct ProjectedAttention {
+        ggml_tensor * norm=nullptr,*q=nullptr,*k=nullptr,*v=nullptr,*iq=nullptr,*ik=nullptr;
+        ggml_tensor * selected_idx=nullptr;
+        bool defer_output=false,encoded=false,kv_written=false;
+    };
     ggml_tensor * attention(Graph & b, int l, int64_t start, int n, ggml_tensor * x,
                              ggml_tensor * positions, ggml_tensor * pos_mask, ggml_tensor * bias,
-                             bool indexed_kv_write = false) {
+                             bool indexed_kv_write = false, const ProjectedAttention * projected = nullptr) {
         auto c = b.c;
         const std::string prefix = "blk." + std::to_string(l) + ".";
         auto wt = [&](const char * name) { return dense->get(prefix + name); };
-        auto norm = b.tap(rms(b, x, wt("attn_norm.weight"), g.rms_eps), "attn_norm", l);
+        auto norm = projected ? projected->norm : b.tap(rms(b, x, wt("attn_norm.weight"), g.rms_eps), "attn_norm", l);
         ggml_tensor * q = nullptr, * k = nullptr, * v = nullptr;
-        if (auto bundle = n == 1 ? dense->maybe(prefix + "m31_qkv.weight") : nullptr) {
+        if (projected) { q=projected->q;k=projected->k;v=projected->v; }
+        else if (auto bundle = n == 1 ? dense->maybe(prefix + "m31_qkv.weight") : nullptr) {
             auto joined = ggml_mul_mat(c, bundle, norm);
             auto slice = [&](int64_t rows, int64_t offset) { return ggml_view_2d(c, joined, rows, 1, joined->nb[1], size_t(offset) * sizeof(float)); };
             q = ggml_reshape_3d(c, slice(g.head_dim * g.heads, 0), g.head_dim, g.heads, 1);
@@ -551,17 +694,22 @@ struct Engine::Impl {
             k = ggml_reshape_3d(c, ggml_mul_mat(c, wt("attn_k.weight"), norm), g.head_dim, g.kv_heads, n);
             v = ggml_reshape_3d(c, ggml_mul_mat(c, wt("attn_v.weight"), norm), g.head_dim, g.kv_heads, n);
         }
-        q = b.tap(rms(b, q, wt("attn_q_norm.weight"), g.rms_eps), "Qcur_normed", l);
-        k = b.tap(rms(b, k, wt("attn_k_norm.weight"), g.rms_eps), "Kcur_normed", l);
+        if(!projected||!projected->encoded){
+            q = b.tap(rms(b, q, wt("attn_q_norm.weight"), g.rms_eps), "Qcur_normed", l);
+            k = b.tap(rms(b, k, wt("attn_k_norm.weight"), g.rms_eps), "Kcur_normed", l);
+        }
         auto rope = [&](ggml_tensor * t) {
             return ggml_rope_ext(c, t, positions, nullptr, int(g.rope_dim), GGML_ROPE_TYPE_NEOX,
                                  int(g.context), g.rope_base, 1, 0, 1, 32, 1);
         };
-        q = b.tap(rope(q), "Qcur", l);
-        k = b.tap(rope(k), "Kcur", l);
+        if(!projected||!projected->encoded){
+            q = b.tap(rope(q), "Qcur", l);
+            k = b.tap(rope(k), "Kcur", l);
+        }
         b.tap(v, "Vcur", l);
         ggml_tensor * iq = nullptr, * ik = nullptr;
-        if (auto bundle = n == 1 ? dense->maybe(prefix + "m31_index_qk.weight") : nullptr) {
+        if (projected) { iq=projected->iq;ik=projected->ik; }
+        else if (auto bundle = n == 1 ? dense->maybe(prefix + "m31_index_qk.weight") : nullptr) {
             auto joined = ggml_mul_mat(c, bundle, norm);
             iq = ggml_reshape_3d(c, ggml_view_2d(c, joined, g.index_dim * g.index_heads, 1, joined->nb[1], 0), g.index_dim, g.index_heads, 1);
             ik = ggml_reshape_3d(c, ggml_view_2d(c, joined, g.index_dim, 1, joined->nb[1], size_t(g.index_dim * g.index_heads) * sizeof(float)), g.index_dim, 1, 1);
@@ -569,11 +717,15 @@ struct Engine::Impl {
             iq = ggml_reshape_3d(c, ggml_mul_mat(c, wt("indexer.q_proj.weight"), norm), g.index_dim, g.index_heads, n);
             ik = ggml_reshape_3d(c, ggml_mul_mat(c, wt("indexer.k_proj.weight"), norm), g.index_dim, 1, n);
         }
-        iq = rope(rms(b, iq, wt("indexer.q_norm.weight"), g.rms_eps));
-        ik = rope(rms(b, ik, wt("indexer.k_norm.weight"), g.rms_eps));
+        if(!projected||!projected->encoded){
+            iq = rope(rms(b, iq, wt("indexer.q_norm.weight"), g.rms_eps));
+            ik = rope(rms(b, ik, wt("indexer.k_norm.weight"), g.rms_eps));
+        }
 
         auto & kv = cache[size_t(l)];
-        if (indexed_kv_write) {
+        if(projected&&projected->kv_written){
+            require(indexed_kv_write&&n==1&&projected->encoded,"invalid prewritten n1 attention inputs");
+        } else if (indexed_kv_write) {
             // Keep pointers and graph topology stable across decode positions. Only
             // the positions tensor contents change. F32 -> F16 conversion is the
             // same storage operation as CPY; cache row order/precision are unchanged.
@@ -626,7 +778,11 @@ struct Engine::Impl {
         auto attend_queries = [&](ggml_tensor * q, ggml_tensor * iq, ggml_tensor * pos_mask,
                                   ggml_tensor * bias, int query_n) {
             ggml_tensor * idx = nullptr;
-            if (msa_index_tile <= 0 || query_n <= msa_index_tile) idx = select_blocks(iq, pos_mask, bias, query_n, nk);
+            if(projected&&projected->selected_idx){
+                idx=projected->selected_idx;
+                require(n==1&&query_n==1&&idx->type==GGML_TYPE_I32&&idx->ne[0]==top&&idx->ne[1]==g.index_heads&&idx->ne[2]==1&&idx->ne[3]==1,"invalid preselected n1 MSA blocks");
+            }
+            else if (msa_index_tile <= 0 || query_n <= msa_index_tile) idx = select_blocks(iq, pos_mask, bias, query_n, nk);
             else for (int first = 0; first < query_n; first += msa_index_tile) {
                 const int count = std::min(msa_index_tile, query_n - first);
                 auto query = ggml_view_3d(c, iq, g.index_dim, g.index_heads, count,
@@ -649,13 +805,20 @@ struct Engine::Impl {
             ggml_tensor * result = nullptr;
             if (n == 1) {
                 // Match the oracle's score-sorted gather order, including future/padded rows masked at -inf.
-                auto a = ggml_reshape_3d(c, ggml_scale(c, ggml_cast(c, idx, GGML_TYPE_F32), float(g.block)), 1, top, g.index_heads);
-                auto tj = ggml_add(c, ggml_repeat_4d(c, a, g.block, top, g.index_heads, 1),
-                                  ggml_reshape_3d(c, ggml_arange(c, 0, float(g.block), 1), g.block, 1, 1));
-                auto tr = ggml_add(c, ggml_scale(c, tj, float(g.kv_heads)),
-                                  ggml_reshape_3d(c, ggml_arange(c, 0, float(g.kv_heads), 1), 1, 1, g.kv_heads));
-                auto tok = ggml_cast(c, ggml_reshape_1d(c, tj, g.block * top * g.index_heads), GGML_TYPE_I32);
-                auto row = ggml_cast(c, ggml_reshape_1d(c, tr, g.block * top * g.index_heads), GGML_TYPE_I32);
+                ggml_tensor * tok=nullptr,*row=nullptr;
+                if(msa_sorted_lookup){
+                    const auto indices=msa_sorted_lookup->build(c,idx,
+                        b.borrow(msa_sorted_lookup->token_source()),b.borrow(msa_sorted_lookup->row_source()));
+                    tok=indices.token;row=indices.row;
+                }else{
+                    auto a = ggml_reshape_3d(c, ggml_scale(c, ggml_cast(c, idx, GGML_TYPE_F32), float(g.block)), 1, top, g.index_heads);
+                    auto tj = ggml_add(c, ggml_repeat_4d(c, a, g.block, top, g.index_heads, 1),
+                                      ggml_reshape_3d(c, ggml_arange(c, 0, float(g.block), 1), g.block, 1, 1));
+                    auto tr = ggml_add(c, ggml_scale(c, tj, float(g.kv_heads)),
+                                      ggml_reshape_3d(c, ggml_arange(c, 0, float(g.kv_heads), 1), 1, 1, g.kv_heads));
+                    tok = ggml_cast(c, ggml_reshape_1d(c, tj, g.block * top * g.index_heads), GGML_TYPE_I32);
+                    row = ggml_cast(c, ggml_reshape_1d(c, tr, g.block * top * g.index_heads), GGML_TYPE_I32);
+                }
                 auto k3 = ggml_view_2d(c, kv.k, g.head_dim, nk * g.kv_heads, kv.k->nb[1], 0);
                 auto v3 = ggml_view_2d(c, kv.v, g.head_dim, nk * g.kv_heads, kv.v->nb[1], 0);
                 auto kg = gather_half(b, k3, row);
@@ -739,6 +902,7 @@ struct Engine::Impl {
                 (unsigned long long)indexer_cells,
                 (unsigned long long)(uint64_t(nk) * uint64_t(g.index_heads) * uint64_t(n)));
         result = b.tap(result, "kqv_out", l);
+        if(projected&&projected->defer_output)return result;
         return ggml_mul_mat(c, wt("attn_output.weight"), result);
     }
     ggml_tensor * cell_blocks_input = nullptr; // per transient graph; never retained across a compute
@@ -1098,6 +1262,7 @@ struct Engine::Impl {
             // tensor addresses remain owned until reset/destruction, after drain.
             storage->graph = std::make_unique<Graph>(backend, cfg, pos, nullptr, 1024 * 1024, 512);
             auto & b = *storage->graph;
+            b.single_token = true;
             storage->input = b.input(GGML_TYPE_F32, g.embd, 1);
             storage->output = ffn(b, *dense, storage->input, "blk." + std::to_string(layer) + ".", "_shexp");
             b.allocate({storage->output});
@@ -1115,6 +1280,7 @@ struct Engine::Impl {
         // CUDA's captures reference tensor metadata and shared attention inputs.
         // Destroy them before either ownership group can be replaced/freed.
         drain_shared();
+        for (auto & graph : draft_capture_graphs) graph.reset();
         if (release_shared) for (auto & graph : shared_decode_graphs) graph.reset();
         for (auto & graph : dense_decode_graphs) graph.reset();
         head_decode_graph.graph.reset();
@@ -1132,6 +1298,7 @@ struct Engine::Impl {
     void build_dense(int l, int n, DenseGraph & storage, bool stable_decode, bool split_shared) {
         const auto build_start = cfg.profile ? Clock::now() : Clock::time_point{};
         auto & b = *storage.graph;
+        b.single_token = n == 1;
         auto c = b.c;
         storage.input = !prefill_chain_active && (!decode_chain_active || l == 0 || g.routed(l - 1))
             ? b.input(GGML_TYPE_F32, g.embd, n) : nullptr;
@@ -1231,6 +1398,13 @@ struct Engine::Impl {
         else b.compute();
         if (cfg.profile) timings.dense_compute += elapsed(compute_start);
         const auto read_start = cfg.profile ? Clock::now() : Clock::time_point{};
+        const bool pinned_read = dense_pinned_io && decode_chain_active && g.routed(l);
+        const bool trace_io = dense_io_trace && n == 1 && g.routed(l);
+        auto io_time = [&](double & total, auto && operation) {
+            const auto started = trace_io ? Clock::now() : Clock::time_point{};
+            operation();
+            if (trace_io) total += elapsed(started);
+        };
         if (!g.routed(l)) {
             if (prefill_chain_active) { /* copied to persistent GPU hidden before graph release */ }
             else if (decode_chain_active) { /* the next graph consumes this device output */ }
@@ -1239,10 +1413,17 @@ struct Engine::Impl {
             else hidden = Graph::read(storage->output);
         }
         else {
-            if (prefill_chain_active) { /* norm/residual/shared stay in this live GPU graph */ }
+            if (pinned_read) {
+                ffn_input.resize(size_t(g.embd));
+                route_weights.resize(size_t(g.used));
+                io_time(timings.io_norm_enqueue, [&] { dense_pinned_io->read_norm(storage->norm); });
+                io_time(timings.io_ids_enqueue, [&] { dense_pinned_io->read_ids(storage->ids); });
+                io_time(timings.io_weights_enqueue, [&] { dense_pinned_io->read_weights(storage->weights); });
+            }
+            else if (prefill_chain_active) { /* norm/residual/shared stay in this live GPU graph */ }
             else if (dense_async_reads) {
                 if (!decode_chain_active) read_async(storage->residual, residual);
-                read_async(storage->norm, ffn_input);
+                io_time(timings.io_norm_enqueue, [&] { read_async(storage->norm, ffn_input); });
                 if (!decode_chain_active && !shared_overlap) read_async(storage->shared, shared);
             } else if (reuse_host_reads) {
                 read_host(storage->residual, residual);
@@ -1253,27 +1434,34 @@ struct Engine::Impl {
                 ffn_input = Graph::read(storage->norm);
                 if (!shared_overlap) shared = Graph::read(storage->shared);
             }
-            if (ggml_is_contiguous(storage->ids)) {
-                if (dense_async_reads) ggml_backend_tensor_get_async(backend, storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
-                else ggml_backend_tensor_get(storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
-            } else {
-                for (int t = 0; t < n; ++t)
-                    ggml_backend_tensor_get(storage->ids, ids.data() + t * g.used,
-                        size_t(t) * storage->ids->nb[1], size_t(g.used) * sizeof(int32_t));
+            if (!pinned_read) {
+                if (ggml_is_contiguous(storage->ids)) {
+                    if (dense_async_reads) io_time(timings.io_ids_enqueue, [&] { ggml_backend_tensor_get_async(backend, storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t)); });
+                    else ggml_backend_tensor_get(storage->ids, ids.data(), 0, ids.size() * sizeof(int32_t));
+                } else {
+                    for (int t = 0; t < n; ++t)
+                        ggml_backend_tensor_get(storage->ids, ids.data() + t * g.used,
+                            size_t(t) * storage->ids->nb[1], size_t(g.used) * sizeof(int32_t));
+                }
+                if (reuse_host_reads) {
+                    ++host_reads.reads;
+                    host_reads.bytes += ids.size() * sizeof(int32_t);
+                    if (dense_async_reads) io_time(timings.io_weights_enqueue, [&] { read_async(storage->weights, route_weights); });
+                    else read_host(storage->weights, route_weights);
+                } else if (dense_async_reads) read_async(storage->weights, route_weights);
+                else route_weights = Graph::read(storage->weights);
             }
-            if (reuse_host_reads) {
-                ++host_reads.reads;
-                host_reads.bytes += ids.size() * sizeof(int32_t);
-                if (dense_async_reads) read_async(storage->weights, route_weights);
-                else read_host(storage->weights, route_weights);
-            } else if (dense_async_reads) read_async(storage->weights, route_weights);
-            else route_weights = Graph::read(storage->weights);
         }
         if (dense_async_reads) {
             // Dense leading layers have no host consumers; the same backend stream
             // carries their persistent outputs directly into the next layer.
-            if (!decode_chain_active || g.routed(l)) ggml_backend_synchronize(backend);
+            if (!decode_chain_active || g.routed(l))
+                io_time(timings.io_wait, [&] { ggml_backend_synchronize(backend); });
             dense_drain.pending = false;
+        }
+        if (pinned_read) {
+            io_time(timings.io_collect, [&] { dense_pinned_io->collect(ffn_input.data(), ids.data(), route_weights.data()); });
+            if (reuse_host_reads) { host_reads.reads += 3; host_reads.bytes += size_t(g.embd) * sizeof(float) + size_t(g.used) * 8; }
         }
         if (cfg.profile) timings.dense_read += elapsed(read_start);
         if (prefill_chain_active) {
@@ -1355,8 +1543,26 @@ struct Engine::Impl {
         std::vector<float> local_moe;
         const std::vector<float> * moe_result = nullptr;
         auto & cached_output = reuse_host_reads ? host_reads.moe : local_moe;
-        const bool cached_gpu_hit = gpu_cached_decode && gpu_experts && n == 1 &&
-            gpu_experts->forward_cached(l, n, ffn_input, ids, route_weights, cached_output);
+        bool cached_gpu_hit = false;
+        if (gpu_cached_decode && gpu_experts && n == 1) {
+            if (gpu_experts->native_gpu_math()) {
+                const auto hybrid_start = cfg.profile ? Clock::now() : Clock::time_point{};
+                const double previous_routed_compute = timings.routed_compute;
+                cached_gpu_hit = gpu_experts->forward_cached_hybrid(l, ffn_input, ids, route_weights,
+                    [&](const std::vector<int32_t> & missing_ids, const std::vector<float> & missing_weights,
+                        std::vector<float> & contributions) {
+                        std::vector<float> unused_sum;
+                        routed_cpu_into(l, 1, ffn_input, missing_ids, missing_weights, unused_sum);
+                        const auto & terms = cpu_fused->contributions();
+                        contributions.assign(terms.begin(), terms.end());
+                    }, cached_output);
+                // Replace the nested CPU-miss duration with the complete critical
+                // path, including submit/join and any decode-only seed upload.
+                // Detailed CPU/GPU overlap remains in GpuExperts' own counters.
+                if (cfg.profile)
+                    timings.routed_compute = previous_routed_compute + elapsed(hybrid_start);
+            } else cached_gpu_hit = gpu_experts->forward_cached(l, n, ffn_input, ids, route_weights, cached_output);
+        }
         if (cached_gpu_hit) {
             moe_result = &cached_output;
         } else if (reuse_host_reads) {
@@ -1425,7 +1631,8 @@ struct Engine::Impl {
     void upload_attention(Graph &, ggml_tensor * x, ggml_tensor * positions, ggml_tensor * mask,
                           ggml_tensor * bias, int n, int64_t nk, int64_t nb) {
         if (x) {
-            if (dense_async_reads) ggml_backend_tensor_set_async(backend, x, hidden.data(), 0, ggml_nbytes(x));
+            if (dense_pinned_io && decode_chain_active) dense_pinned_io->upload(x, hidden.data());
+            else if (dense_async_reads) ggml_backend_tensor_set_async(backend, x, hidden.data(), 0, ggml_nbytes(x));
             else ggml_backend_tensor_set(x, hidden.data(), 0, ggml_nbytes(x));
         }
         if (attention_inputs) return; // uploaded once before the first layer
@@ -1433,7 +1640,7 @@ struct Engine::Impl {
     }
 
     void fill_attention(ggml_tensor * positions, ggml_tensor * mask, ggml_tensor * bias,
-                        ggml_tensor * cell_blocks, int n, int64_t nk, int64_t nb) {
+                        ggml_tensor * cell_blocks, int n, int64_t nk, int64_t nb, bool copy_positions = true) {
 #ifdef M31_ENGINE_CUDA
         if (gpu_attention_fill) {
             const auto started = cfg.profile ? Clock::now() : Clock::time_point{};
@@ -1457,7 +1664,7 @@ struct Engine::Impl {
             for (int64_t b = (pos + t) / g.block, local = 0; local < g.local_blocks && b >= 0; ++local, --b)
                 bias_h[size_t(t) * nb + b] = 1e30f;
         }
-        ggml_backend_tensor_set(positions, positions_h.data(), 0, ggml_nbytes(positions));
+        if(copy_positions)ggml_backend_tensor_set(positions, positions_h.data(), 0, ggml_nbytes(positions));
         ggml_backend_tensor_set(mask, mask->type == GGML_TYPE_F16 ? static_cast<const void *>(half_mask_h.data()) : static_cast<const void *>(mask_h.data()), 0, ggml_nbytes(mask));
         ggml_backend_tensor_set(bias, bias_h.data(), 0, ggml_nbytes(bias));
         if (cell_blocks) {
@@ -1490,7 +1697,14 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->model = std::make_unique<GgufModel>(gguf_split_paths(path));
         p_->g = read_geometry(*p_->model);
         p_->cpu_decode_graphs.resize(size_t(p_->g.layers));
+        for (auto layer : cfg.draft_feature_layers)
+            require(layer > 0 && layer <= p_->g.layers,"draft feature layer outside target");
+        auto draft_layers=cfg.draft_feature_layers;
+        std::sort(draft_layers.begin(),draft_layers.end());
+        require(std::adjacent_find(draft_layers.begin(),draft_layers.end())==draft_layers.end(),"duplicate draft feature layer");
+        require(cfg.draft_feature_max_rows > 0 && cfg.draft_feature_max_rows <= 4096,"draft capture row limit outside1..4096");
         p_->dense_decode_graphs.resize(size_t(p_->g.layers));
+        p_->draft_capture_graphs.resize(size_t(p_->g.layers));
         p_->shared_decode_graphs.resize(size_t(p_->g.layers));
         require(cfg.context <= p_->g.context && cfg.context <= INT32_MAX, "context exceeds model maximum");
         p_->capacity = kv_length(cfg.context, p_->g);
@@ -1516,6 +1730,20 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
             int(p_->cpu_shared_overlap));
         if (ggml_backend_is_cpu(p_->backend)) ggml_backend_cpu_set_n_threads(p_->backend, cfg.threads);
         auto enabled = [](const char * name) { const char * value = std::getenv(name); return value && std::string(value) == "1"; };
+#ifndef M31_ENGINE_CUDA
+        require(!enabled("M31_GPU_RMS_FUSION"), "RMS-only fusion requires a CUDA engine");
+#endif
+        p_->capture_reuse = enabled("M31_DSPARK_CAPTURE_REUSE");
+        p_->capture_view_enabled=enabled("M31_DSPARK_CAPTURE_VIEW");
+        require(!p_->capture_view_enabled||p_->capture_reuse,"feature view requires capture reuse");
+        if (p_->capture_view_enabled) p_->capture_epoch=std::make_shared<uint64_t>(0);
+        p_->prepare_capture_host(); // allocation and first touch precede any PP timer
+        if(enabled("M31_MSA_SORTED_LOOKUP")){
+            p_->msa_sorted_lookup=std::make_unique<MsaSortedLookupMaps>(p_->backend,p_->capacity,
+                p_->g.block,p_->g.index_heads,p_->g.kv_heads);
+            std::fprintf(stderr,"M31 MSA sorted lookup: enabled=1 maps=1 capacity=%lld resident_bytes=%zu (fixed before prefill snapshot)\n",
+                (long long)p_->capacity,p_->msa_sorted_lookup->resident_bytes());
+        }
         bool direct_supported = true;
         for (int l = int(p_->g.dense_lead); l < p_->g.layers; ++l)
             for (int type : {p_->g.gate_types[size_t(l)], p_->g.up_types[size_t(l)], p_->g.down_types[size_t(l)]})
@@ -1528,6 +1756,41 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         p_->gpu_decode_chain = enabled("M31_GPU_DECODE_CHAIN") && cuda && cfg.dense_decode_cache && !cfg.tap;
         p_->dense_async_reads = (enabled("M31_DENSE_ASYNC_READS") || p_->gpu_decode_chain) && cuda && cfg.reuse_allocations && !cfg.tap;
         p_->gpu_cached_decode = enabled("M31_GPU_CACHED_DECODE") && cuda && !cfg.tap;
+        p_->dense_io_trace = enabled("M31_DENSE_IO_TRACE") && cuda;
+        if (enabled("M31_GPU_DECODE_FUSION") || enabled("M31_GPU_RMS_FUSION")) {
+            require(!(enabled("M31_GPU_DECODE_FUSION") && enabled("M31_GPU_RMS_FUSION")),
+                    "select either broad decode fusion or RMS-only fusion");
+            require(cuda && cfg.dense_decode_cache && !cfg.tap,
+                    "decode-only fusion requires CUDA/dense-decode-cache/no-taps");
+#ifdef GGML_CUDA_HAS_FUSION_OVERRIDE
+            if (enabled("M31_GPU_RMS_FUSION")) {
+#ifdef GGML_CUDA_HAS_RMS_ONLY_FUSION
+                p_->dense_rms_only_fusion = true;
+#else
+                require(false, "RMS-only fusion requires the M31 RMS-only backend patch");
+#endif
+            }
+            p_->dense_fusion_previous = ggml_backend_cuda_get_fusion_override(p_->backend);
+            require(p_->dense_fusion_previous >= -1, "cannot read CUDA backend fusion mode");
+            p_->dense_decode_fusion = true;
+            // All multi-token forward calls remain unfused. A one-token prompt
+            // or chunk tail follows the same exact n1 policy as generation.
+            p_->set_dense_fusion(false);
+#else
+            require(false, "decode-only fusion requires the M31 ggml API patch and rebuilt CUDA backend");
+#endif
+        }
+        if (enabled("M31_DENSE_PINNED_IO")) {
+            require(p_->gpu_decode_chain && p_->dense_async_reads && cfg.reuse_allocations && !cfg.tap,
+                    "dense pinned I/O requires CUDA decode chain/reuse/no-taps");
+            p_->dense_pinned_io = std::make_unique<DensePinnedIo>(p_->backend,
+                size_t(p_->g.embd) * sizeof(float), size_t(p_->g.used) * sizeof(int32_t));
+            std::fprintf(stderr,"M31 dense pinned I/O: enabled=1 bytes=%zu decode_only=1\n", p_->dense_pinned_io->bytes());
+        }
+        if (enabled("M31_DECODE_FUSION_UNFENCED")) {
+            require(p_->dense_decode_fusion && !p_->dense_rms_only_fusion, "unfenced decode requires broad M31_GPU_DECODE_FUSION=1 and its CUDA API");
+            std::fprintf(stderr,"M31 unfenced decode fusion: enabled=1 (n1 graphs in backend mode1 only)\n");
+        }
         p_->gpu_prefill_chain = enabled("M31_GPU_PREFILL_CHAIN") && cuda;
         if (enabled("M31_GPU_CAUSAL_FILL")) {
             require(cuda && cfg.reuse_allocations,"GPU causal fill requires CUDA and reusable attention inputs");
@@ -1603,7 +1866,10 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
             require(p_->host.arena != nullptr, "GPU expert cache requires an arena");
             p_->gpu_experts = std::make_unique<GpuExperts>();
             p_->gpu_experts->init(*p_->model, p_->g, *p_->host.arena, p_->backend, cfg.gpu_experts_gib, cfg.max_chunk);
-            require(!p_->gpu_cached_decode || p_->gpu_experts->exact_cpu_math(), "cached decode requires CPU-exact GPU math");
+            require(!p_->gpu_cached_decode || p_->gpu_experts->exact_cpu_math() ||
+                (p_->gpu_experts->native_gpu_math() && p_->cpu_fused &&
+                    (enabled("M31_GPU_CACHED_DECODE_NATIVE") || enabled("M31_GPU_CACHED_DECODE_EXACT"))),
+                "cached decode requires exact GPU math, or native GPU math with CPU_FUSED and CACHED_DECODE_NATIVE=1/CACHED_DECODE_EXACT=1");
         }
         if (p_->gpu_prefill_chain) {
             require(cfg.reuse_allocations && cfg.cpu_residual && !cfg.tap && p_->gpu_experts && !p_->gpu_experts->exact_cpu_math(),
@@ -1613,6 +1879,7 @@ bool Engine::init(const std::string & path, const Config & cfg, std::string & er
         if (p_->adaptive_prefill) {
             size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(p_->backend), &free_bytes, &total_bytes);
+            // Includes the optional shared sorted-lookup maps exactly once.
             p_->prefill_free_after_resident = free_bytes;
             require(free_bytes > 0, "device did not report free VRAM for adaptive prefill");
         }
@@ -1700,7 +1967,8 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
         // Snapshot after resident weights/full KV/cache allocation credits scratch
         // retained by earlier chunks instead of subtracting that same memory twice.
         // The extra GiB covers lazy exact-GPU routed buffers (up to ~925 MiB at8192).
-        budget.free_after_resident = p_->prefill_free_after_resident;
+        require(p_->external_resident_bytes < p_->prefill_free_after_resident,"external GPU residents exhaust prefill budget");
+        budget.free_after_resident = p_->prefill_free_after_resident-p_->external_resident_bytes;
         budget.reserve_bytes = 1ULL << 30;
         budget.extra_scratch_bytes = 1ULL << 30;
         budget.max_chunk = limit;
@@ -1715,6 +1983,7 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
         if (budget.native_gpu_ffn) budget.retained_routed_bytes = p_->gpu_experts->workspace_bytes();
         if (p_->dense_workspace)
             budget.retained_dense_bytes = ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0);
+        if (p_->verify_state) budget.retained_dense_bytes += p_->verify_state->workspace_bytes();
 #ifdef M31_FAST_FFN_CUDA
         budget.fast_gpu_ffn = p_->gpu_experts && p_->gpu_experts->fast_gpu_math();
         if (budget.fast_gpu_ffn) {
@@ -1749,10 +2018,231 @@ int Engine::prefill_chunk(int requested, std::string & error) const {
         return plan.chunk;
     } catch (const std::exception & exception) { error = exception.what(); return 0; }
 }
+int Engine::prefill_chunk_at(int64_t position, int requested, std::string & error) const {
+    try {
+        require(p_->ready && !p_->poisoned && requested > 0 && position >= 0 && position < p_->cfg.context, "invalid prefill planning state");
+        const int requested_limit = int(std::min<int64_t>({requested, p_->cfg.max_chunk, p_->cfg.context - position}));
+        const int limit = msa_chunk_limit(position,requested_limit,p_->g.index_heads,p_->g.block,
+                                          p_->msa_index_tile,p_->msa_query_tile);
+        require(limit > 0,"MSA int32 indexing does not admit even one query at this position");
+        if (!p_->adaptive_prefill || limit == 1) return limit;
+        PrefillBudget budget;
+        // Snapshot after resident weights/full KV/cache allocation credits scratch
+        // retained by earlier chunks instead of subtracting that same memory twice.
+        // The extra GiB covers lazy exact-GPU routed buffers (up to ~925 MiB at8192).
+        require(p_->external_resident_bytes < p_->prefill_free_after_resident,"external GPU residents exhaust prefill budget");
+        budget.free_after_resident = p_->prefill_free_after_resident-p_->external_resident_bytes;
+        budget.reserve_bytes = 1ULL << 30;
+        budget.extra_scratch_bytes = 1ULL << 30;
+        budget.max_chunk = limit;
+        budget.attention_query_tile = p_->msa_query_tile;
+        budget.indexer_query_tile = p_->msa_index_tile;
+        budget.causal_f16 = p_->causal_f16;
+        budget.gpu_prefill_chain = p_->gpu_prefill_chain &&
+            (limit >= p_->cfg.gpu_experts_min_tokens ||
+             (limit > 1 && ShortPrefillPolicy::environment().select(limit) != ShortPrefillPolicy::Mode::off));
+        budget.retained_hidden_bytes = p_->prefill_hidden ? p_->prefill_hidden->bytes() : 0;
+        budget.native_gpu_ffn = p_->gpu_experts && p_->gpu_experts->native_gpu_math();
+        if (budget.native_gpu_ffn) budget.retained_routed_bytes = p_->gpu_experts->workspace_bytes();
+        if (p_->dense_workspace)
+            budget.retained_dense_bytes = ggml_gallocr_get_buffer_size(p_->dense_workspace->allocator, 0);
+        if (p_->verify_state) budget.retained_dense_bytes += p_->verify_state->workspace_bytes();
+#ifdef M31_FAST_FFN_CUDA
+        budget.fast_gpu_ffn = p_->gpu_experts && p_->gpu_experts->fast_gpu_math();
+        if (budget.fast_gpu_ffn) {
+            budget.extra_scratch_bytes = 0; // explicit retained FFN budget below
+            budget.fast_expert_rows = p_->gpu_experts->fast_expert_batch_rows();
+            budget.fast_fused_reduction = p_->gpu_experts->fast_fused_reduction();
+            budget.fast_rank_phases = p_->gpu_experts->fast_rank_phases();
+            budget.retained_routed_bytes = p_->gpu_experts->stats().scratch_bytes;
+        }
+#endif
+        // Logical-position planning must include the same retained activation
+        // buffers as ordinary planning, including after a prefix rewind.
+        if (p_->short_cuda_executor)
+            budget.extra_scratch_bytes = prefill_sum(budget.extra_scratch_bytes,p_->short_cuda_executor->gpu_auxiliary_bytes());
+        budget.f16_mask = p_->native_gather;
+        budget.top_k_mask = p_->msa_topk_mask;
+        budget.inplace_score = p_->msa_topk_mask;
+        budget.position = position; budget.remaining = limit; budget.context = p_->cfg.context;
+        budget.streaming_slots = uint64_t(p_->g.experts);
+        if (p_->gpu_experts) {
+            const auto & stats = p_->gpu_experts->stats();
+            budget.streaming_slots = stats.slot_count - std::min(stats.slot_count, stats.seeded_slots);
+        }
+        const auto plan = plan_prefill(p_->g, budget);
+        require(plan.chunk > 0, "adaptive prefill refused: " + plan.reason);
+        if (p_->cfg.profile) std::fprintf(stderr,
+            "M31 prefill-plan pos=%lld requested=%d planned=%d keys=%lld initial_free=%llu scratch=%llu headroom=%llu\n",
+            (long long)position, requested, plan.chunk, (long long)plan.padded_keys,
+            (unsigned long long)budget.free_after_resident, (unsigned long long)plan.scratch_estimate,
+            (unsigned long long)plan.headroom_bytes);
+        return plan.chunk;
+    } catch (const std::exception & exception) { error = exception.what(); return 0; }
+}
+
+bool Engine::rewind(int64_t position, std::string & error) {
+    try {
+        require(p_->ready && !p_->poisoned, "rewind requires a valid initialized engine");
+        require(position >= 0 && position <= p_->pos, "rewind position exceeds valid KV prefix");
+        // Every completed forward has joined its graph/expert streams. Once graph
+        // ownership changes, an unexpected failure requires reset.
+        p_->poisoned = true;
+        p_->clear_dense_decode_cache(true);
+        p_->pos = position;
+        p_->last_n = 0;
+        p_->verified_logits.clear();
+        p_->hidden.clear();
+        p_->captured_rows = 0;
+        p_->captured_features.clear();
+        p_->invalidate_capture();
+        p_->decode_chain_active = false;
+        p_->prefill_chain_active = false;
+        p_->poisoned = false;
+        // Future rows may stay allocated: indexer block-max and attention apply
+        // the causal mask before they can influence any accepted output.
+        return true;
+    } catch (const std::exception & exception) { error = exception.what(); return false; }
+}
+
+ggml_tensor * Engine::output_weight() const {
+    return p_->ready ? p_->dense->get("output.weight") : nullptr;
+}
+bool Engine::set_external_resident_bytes(uint64_t bytes,std::string & error) {
+    try {
+        require(p_->ready&&!p_->poisoned,"external resident budget requires a valid initialized engine");
+        require(!p_->adaptive_prefill||bytes<p_->prefill_free_after_resident,"external GPU residents exceed free budget");
+        p_->external_resident_bytes=bytes;return true;
+    } catch(const std::exception & e){error=e.what();return false;}
+}
+bool Engine::release_prefill_workspace(std::string & error) {
+    try {
+        require(p_->ready && !p_->poisoned,"workspace release requires valid initialized engine");
+        p_->poisoned=true;
+        p_->clear_dense_decode_cache(true);
+        p_->verify_state.reset();
+        if (p_->gpu_experts) p_->gpu_experts->release_prefill_workspace();
+        p_->attention_inputs.reset();
+        p_->dense_workspace.reset();
+        if (p_->cfg.reuse_allocations) p_->dense_workspace=std::make_unique<Workspace>(p_->backend);
+        p_->prefill_hidden.reset();
+        if (p_->gpu_prefill_chain) p_->prefill_hidden=std::make_unique<GpuPrefillHidden>();
+        p_->verified_logits.clear();p_->hidden.clear();p_->last_n=0;p_->captured_rows=0;p_->captured_features.clear();p_->release_capture_metadata();
+        p_->decode_chain_active=false;p_->prefill_chain_active=false;
+        if (p_->cfg.profile) {
+            size_t free_bytes=0,total_bytes=0;
+            ggml_backend_dev_memory(ggml_backend_get_device(p_->backend),&free_bytes,&total_bytes);
+            std::fprintf(stderr,"M31 decode-transition pos=%lld free_bytes=%zu total_bytes=%zu expert_pool_kept=%d\n",(long long)p_->pos,free_bytes,total_bytes,int(bool(p_->gpu_experts)));
+        }
+        p_->poisoned=false;return true;
+    } catch(const std::exception & e) { error=e.what();return false; }
+}
+bool Engine::draft_features(int64_t & first_position,int & rows,std::vector<float> & values,std::string & error) const {
+    try {
+        require(p_->ready && !p_->poisoned && p_->last_n > 0,"no valid captured draft features");
+        if (p_->capture_reused) {
+            require(p_->capture_host && p_->capture_host->complete(size_t(p_->captured_rows)),
+                    "incomplete captured draft feature slots");
+            first_position=p_->captured_first;rows=p_->captured_rows;
+            const auto * data=p_->capture_host->values(size_t(rows));
+            if (!rows) values.clear();
+            else values.assign(data,data+size_t(rows)*p_->cfg.draft_feature_layers.size()*size_t(p_->g.embd));
+            return true; // an enabled window may legitimately return zero rows
+        }
+        require(p_->captured_rows > 0,"no valid captured draft features");
+        first_position=p_->captured_first;rows=p_->captured_rows;values=p_->captured_features;return true;
+    } catch(const std::exception & e) { error=e.what();return false; }
+}
+
+bool Engine::set_draft_feature_layers(const std::vector<int> & layers, int max_rows,
+                                      std::string & error) {
+    try {
+        require(p_->ready && !p_->poisoned && p_->pos == 0 && p_->last_n == 0,
+                "draft capture policy requires a valid engine immediately after reset");
+        require(max_rows > 0 && max_rows <= 4096, "draft capture row limit outside1..4096");
+        require(!p_->capture_host||!p_->capture_host->has_live_view(),"release draft feature view before capture policy change");
+        auto next_layers = layers;
+        for (int layer : next_layers)
+            require(layer > 0 && layer <= p_->g.layers, "draft feature layer outside target");
+        auto sorted_layers = next_layers;
+        std::sort(sorted_layers.begin(), sorted_layers.end());
+        require(std::adjacent_find(sorted_layers.begin(), sorted_layers.end()) == sorted_layers.end(),
+                "duplicate draft feature layer");
+        // All preflight checks leave the old policy/state intact. Graph owners
+        // can only be released after this request-boundary validation succeeds.
+        p_->poisoned = true;
+        for (auto & graph : p_->draft_capture_graphs) graph.reset();
+        p_->captured_rows = 0;
+        p_->captured_first = 0;
+        p_->captured_features.clear();
+        p_->cfg.draft_feature_layers.swap(next_layers);
+        p_->cfg.draft_feature_max_rows = max_rows;
+        p_->capture_min_position = 0;
+        p_->capture_view_window_set=false;
+        p_->invalidate_capture();
+        p_->prepare_capture_host();
+        p_->poisoned = false;
+        return true;
+    } catch (const std::exception & exception) { error = exception.what(); return false; }
+}
+
+bool Engine::set_draft_feature_window(int64_t min_position, std::string & error) {
+    try {
+        require(p_->ready && !p_->poisoned && p_->pos == 0 && p_->last_n == 0,
+                "draft capture window requires a valid engine immediately after reset");
+        require(p_->capture_reuse && !p_->cfg.draft_feature_layers.empty(),
+                "draft capture window requires enabled feature reuse/layers");
+        require(min_position >= 0 && min_position <= p_->cfg.context,
+                "draft capture window outside target context");
+        require(!p_->capture_host||!p_->capture_host->has_live_view(),"release draft feature view before capture policy change");
+        p_->capture_view_window_set=false;
+        p_->capture_min_position=min_position;
+        p_->captured_rows=0;p_->captured_features.clear();p_->invalidate_capture();
+        return true;
+    } catch (const std::exception & exception) { error=exception.what();return false; }
+}
+
+bool Engine::set_draft_feature_view_window(int64_t begin,int64_t end,std::string & error) {
+    try {
+        require(p_->ready&&!p_->poisoned&&p_->pos==0&&p_->last_n==0,
+                "feature view window requires a valid engine immediately after reset");
+        require(p_->capture_view_enabled&&p_->capture_reuse&&!p_->cfg.draft_feature_layers.empty(),
+                "feature view window requires VIEW/REUSE and selected layers");
+        require(begin>=0&&end>begin&&end<=p_->cfg.context&&end-begin<=p_->cfg.draft_feature_max_rows,
+                "feature view window exceeds bounded row/context limit");
+        require(p_->capture_host&&!p_->capture_host->has_live_view(),
+                "release draft feature view before capture policy change");
+        p_->invalidate_capture();p_->capture_view_begin=begin;p_->capture_view_end=end;
+        p_->capture_view_window_set=true;p_->capture_min_position=begin;
+        p_->captured_rows=0;p_->captured_features.clear();return true;
+    }catch(const std::exception & exception){error=exception.what();return false;}
+}
+bool Engine::draft_feature_window_view(DraftFeatureView & view,std::string & error) const {
+    view.clear();
+    try {
+        require(p_->ready&&!p_->poisoned&&p_->last_n>0&&p_->capture_view_active&&p_->capture_host,
+                "no valid bounded draft feature window");
+        const auto rows=p_->capture_host->window_rows();
+        require(rows<=size_t(p_->cfg.draft_feature_max_rows)&&p_->capture_host->complete(size_t(p_->captured_rows)),
+                "incomplete bounded draft feature window");
+        const int64_t first=rows?p_->capture_view_begin:p_->pos;
+        require(first+int64_t(rows)==p_->pos,"bounded draft feature window is not current");
+        view=DraftFeatureView(p_->capture_host->share_window(),p_->capture_epoch,first,int(rows),
+            p_->cfg.draft_feature_layers.size()*size_t(p_->g.embd));
+        if (p_->cfg.profile) std::fprintf(stderr,"M31 feature view pos=%lld first=%lld rows=%zu epoch=%llu host_only=1\n",
+            (long long)p_->pos,(long long)first,rows,(unsigned long long)*p_->capture_epoch);
+        return true;
+    }catch(const std::exception & exception){error=exception.what();return false;}
+}
+
 void Engine::reset() {
+    p_->verify_state.reset();
     p_->clear_dense_decode_cache(true);
+    p_->set_dense_fusion(false);
     p_->pos = 0; p_->last_n = 0; p_->hidden.clear(); p_->poisoned = false; p_->decode_chain_active = false;
     p_->prefill_chain_active = false;
+    p_->captured_rows=0;p_->captured_features.clear();p_->verified_logits.clear();
+    p_->capture_min_position=0;p_->capture_view_window_set=false;p_->invalidate_capture();
 }
 
 size_t Engine::prefix_checkpoint_bytes() const {
@@ -1858,6 +2348,8 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
                     if (!std::isfinite(row[j])) require(false, "non-finite visual embedding");
             }
         }
+        require(!p_->capture_view_enabled||!p_->capture_host||!p_->capture_host->has_live_view(),
+                "release draft feature view before another forward");
         // Validation above has not touched KV, hidden, graph state or streams.
         // A caller can re-plan a rejected pass without resetting valid state.
         // PR mtmd.cpp selects MTMD_POS_TYPE_NORMAL for MiniMax's NEOX RoPE;
@@ -1890,6 +2382,9 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
             p_->short_cuda_executor->prepare_gpu_quant(size_t(n),size_t(g.embd),size_t(g.used),size_t(g.expert_ff));
         }
         p_->poisoned = true;
+        p_->set_dense_fusion(n == 1);
+        p_->verified_logits.clear();
+        p_->verify_state.reset(); // ordinary forward releases private verifier scratch before planning/allocation
         p_->decode_chain_active = p_->gpu_decode_chain && n == 1;
         p_->short_prefill_mode = short_mode;
         p_->short_cuda_math = short_cuda_math;
@@ -1938,7 +2433,32 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
         const auto previous_host_bytes = p_->host_reads.bytes;
         const double prepare_seconds = p_->cfg.profile ? Impl::elapsed(prepare_started) : 0;
         p_->timings = {};
-        for (int l = 0; l < g.layers; ++l) p_->layer(l, n);
+        p_->captured_rows = p_->cfg.draft_feature_layers.empty() ? 0 : std::min(n,p_->cfg.draft_feature_max_rows);
+        const bool bounded_view=p_->capture_view_enabled&&p_->capture_view_window_set&&p_->pos<p_->capture_view_end;
+        if (bounded_view) {
+            require(p_->pos+n<=p_->capture_view_end,"forward crosses bounded draft feature window end");
+            p_->invalidate_capture_batch();
+        } else p_->invalidate_capture();
+        if (p_->capture_reuse && !p_->cfg.draft_feature_layers.empty()) {
+            const int64_t valid_rows=std::max<int64_t>(0,p_->pos+n-std::max(p_->pos,p_->capture_min_position));
+            p_->captured_rows=int(std::min<int64_t>(p_->captured_rows,valid_rows));
+            require(p_->capture_host != nullptr,"feature capture host was not prepared before prefill");
+            if (bounded_view) {
+                const auto first=p_->pos+n-p_->captured_rows;
+                const auto offset=p_->captured_rows?size_t(first-p_->capture_view_begin):0;
+                p_->capture_host->begin_window(size_t(p_->captured_rows),offset);
+                p_->capture_view_active=true;
+            } else p_->capture_host->begin(size_t(p_->captured_rows));
+            p_->capture_reused=true;
+            p_->captured_features.clear();
+        } else {
+            p_->captured_features.resize(size_t(p_->captured_rows)*p_->cfg.draft_feature_layers.size()*size_t(g.embd));
+        }
+        p_->captured_first = p_->pos+n-p_->captured_rows;
+        for (int l = 0; l < g.layers; ++l) {
+            p_->layer(l,n);
+            if (p_->captured_rows) p_->capture_draft_features(l,n);
+        }
         // The head consumes prefill_hidden directly. CPU hidden still contains
         // only the initial embeddings and must not be used for this forward.
 
@@ -1953,6 +2473,10 @@ bool Engine::forward_mixed(const int32_t * tokens, const int32_t * visual_rows,
             std::fprintf(stderr, "M31 dense-stages pos=%lld n=%d build_ms=%.3f allocate_ms=%.3f upload_ms=%.3f compute_ms=%.3f read_ms=%.3f destroy_ms=%.3f dense_cache=%d\n",
                          (long long)p_->pos, n, 1000*t.dense_build, 1000*t.dense_allocate, 1000*t.dense_upload,
                          1000*t.dense_compute, 1000*t.dense_read, 1000*t.dense_destroy, int(p_->cfg.dense_decode_cache));
+            if (p_->dense_io_trace && n == 1) std::fprintf(stderr,
+                "M31 dense-io pos=%lld pinned=%d norm_enqueue_ms=%.3f ids_enqueue_ms=%.3f weights_enqueue_ms=%.3f join_ms=%.3f collect_ms=%.3f\n",
+                (long long)p_->pos, int(bool(p_->dense_pinned_io)), 1000*t.io_norm_enqueue, 1000*t.io_ids_enqueue,
+                1000*t.io_weights_enqueue, 1000*t.io_wait, 1000*t.io_collect);
             if (p_->reuse_host_reads) std::fprintf(stderr,
                 "M31 host-reads pos=%lld n=%d reads=%llu reuses=%llu growths=%llu bytes=%llu retained_bytes=%zu\n",
                 (long long)p_->pos, n,
@@ -1993,6 +2517,11 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
     try {
         const auto head_started = p_->cfg.profile ? Impl::Clock::now() : Impl::Clock::time_point{};
         require(p_->ready && !p_->poisoned && row >= 0 && count > 0 && row + count <= p_->last_n, "invalid logits rows/state");
+        if (!p_->verified_logits.empty()) {
+            const size_t first=size_t(row)*size_t(p_->g.vocab), size=size_t(count)*size_t(p_->g.vocab);
+            out.assign(p_->verified_logits.begin()+first,p_->verified_logits.begin()+first+size);
+            return true;
+        }
         Impl::HeadGraph temporary;
         const bool stable_decode = p_->cfg.dense_decode_cache && count == 1 && p_->last_n == 1 && !p_->cfg.tap;
         auto & storage = stable_decode ? p_->head_decode_graph : temporary;
@@ -2002,6 +2531,7 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
                 stable_decode ? 1024 * 1024 : 32 * 1024 * 1024,
                 stable_decode ? 512 : 8192);
             auto & b = *storage.graph;
+            b.single_token = p_->last_n == 1 && count == 1;
             storage.input = p_->prefill_chain_active ? nullptr : b.input(GGML_TYPE_F32, p_->g.embd, count);
             auto head_input = storage.input;
             if (p_->prefill_chain_active) {
@@ -2028,5 +2558,7 @@ bool Engine::logits(int row, int count, std::vector<float> & out, std::string & 
         return true;
     } catch (const std::exception & e) { error = e.what(); return false; }
 }
+
+#include "m31_dspark_verify.inc"
 
 } // namespace strata::m31

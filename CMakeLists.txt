@@ -1332,6 +1332,7 @@ if(STRATA_NATIVE_EXPERTS)
   # the bit-exact fp4 KV packers, deterministic MMQ, the two upstream CUDA fixes, GLM's no-graph batches: 19 files).
   # Pinned commit + the patch == the tree every published number was measured on (checked with diff -r).
   set(_xolotl_ggml_patch ${CMAKE_CURRENT_SOURCE_DIR}/tools/xolotl/ggml/xolotl-ggml.patch)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/tools/m31/cmake/ggml_decode_fusion.cmake)
   if(STRATA_GGML_DIR)
     # GIT_CEILING_DIRECTORIES: a STRATA_GGML_DIR without its own .git (a copied tree under this repo) must not be
     # resolved against the enclosing repository - git apply then works as a plain patch tool there
@@ -1343,6 +1344,7 @@ if(STRATA_NATIVE_EXPERTS)
       message(WARNING "STRATA_GGML_DIR=${STRATA_GGML_DIR} does not carry tools/xolotl/ggml/xolotl-ggml.patch - "
                       "the build may fail or differ (tools/xolotl/fetch-llama.sh makes a patched checkout)")
     endif()
+    m31_patch_decode_fusion("${STRATA_GGML_DIR}" FALSE)
     add_subdirectory(${STRATA_GGML_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
   else()
     include(FetchContent)
@@ -1364,6 +1366,7 @@ if(STRATA_NATIVE_EXPERTS)
       endif()
       message(STATUS "xolotl: applied tools/xolotl/ggml/xolotl-ggml.patch to the fetched llama.cpp")
     endif()
+    m31_patch_decode_fusion("${strata_llamacpp_SOURCE_DIR}" TRUE)
     add_subdirectory(${strata_llamacpp_SOURCE_DIR}/ggml ${CMAKE_BINARY_DIR}/ggml EXCLUDE_FROM_ALL)
     # the engines' cmake (v41_engine / ds4_dense / glm) take ggml's private headers from STRATA_GGML_DIR, else from
     # third_party/llama.cpp - a fresh clone has neither, so point them at the fetched tree (a normal variable: the

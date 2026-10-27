@@ -183,7 +183,7 @@ class ProtocolTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 server.request_parameters(body, 128, 1)
 
-    def test_prompt_cache_explicit_optout_is_forwarded_only_when_enabled(self):
+    def test_prompt_cache_explicit_optout_is_forwarded_when_provided(self):
         with patch.dict(os.environ, {"M31_PROMPT_CACHE_MIB": "1024"}):
             for value in (False, True):
                 params, _ = server.request_parameters({"cache_prompt": value}, 128, 1)
@@ -193,7 +193,8 @@ class ProtocolTests(unittest.TestCase):
                     server.request_parameters({"cache_prompt": value}, 128, 1)
         with patch.dict(os.environ, {"M31_PROMPT_CACHE_MIB": "0"}):
             params, _ = server.request_parameters({"cache_prompt": False}, 128, 1)
-            self.assertNotIn("cache_prompt", params)
+            self.assertIs(params["cache_prompt"], False)
+            self.assertNotIn("cache_prompt", server.request_parameters({}, 128, 1)[0])
 
     def test_multimodal_is_explicit_error(self):
         with self.assertRaisesRegex(ValueError, "vision"):
