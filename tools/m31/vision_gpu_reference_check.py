@@ -46,7 +46,7 @@ def main():
                '--mmproj', str(root/'mmproj-BF16.gguf'), '--mmproj-device', 'CUDA0',
                '--image', str(args.image), '-p', '<__media__>', '-n', '0',
                '-ngl', '0', '-c', '4096', '-b', '2048', '-ub', '2048',
-               '-t', '80', '-tb', '80', '--flash-attn', 'auto', '--no-warmup']
+               '-t', '80', '-tb', '80', '--flash-attn', 'auto', '--no-warmup', '--jinja']
     env = os.environ.copy()
     env['MTMD_DEBUG_EMBEDDINGS'] = str(dump)
     # Receipt makes caller/backend matching explicit; do not change arithmetic
