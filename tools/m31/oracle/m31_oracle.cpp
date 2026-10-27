@@ -60,6 +60,44 @@ struct Backend {
     ~Backend() { llama_backend_free(); }
 };
 
+struct ChunkReplay {
+    std::vector<std::pair<int, int>> chunks;
+    std::string source;
+    int maximum = 0;
+    explicit operator bool() const { return !source.empty(); }
+};
+
+ChunkReplay read_chunk_replay(const run::Args & args, const std::vector<run::fs::path> & cases) {
+    ChunkReplay replay;
+    const char * path = std::getenv("M31_ORACLE_CHUNK_PLAN");
+    if (!path) return replay;
+    if (!*path || cases.size() != 1)
+        throw std::runtime_error("chunk replay requires one case and a nonempty plan path");
+    replay.source = path;
+    if (run::fs::file_size(path) > 64 * 1024 * 1024)
+        throw std::runtime_error("oracle chunk plan exceeds 64 MiB");
+    const auto ids = run::read_ids(cases.front());
+    if (ids.size() > size_t(args.context)) throw std::runtime_error("replay case exceeds context");
+    const int64_t prefix = std::max<int64_t>(0, int64_t(ids.size()) - args.decode_tail);
+    std::ifstream stream(path);
+    if (!stream) throw std::runtime_error("cannot open oracle chunk plan");
+    int64_t expected = 0, position = 0, count = 0;
+    while (stream >> position) {
+        if (!(stream >> count) || position != expected || count <= 0 || count > args.chunk ||
+            position < 0 || position > int64_t(ids.size()) || count > int64_t(ids.size()) - position)
+            throw std::runtime_error("invalid/noncontiguous oracle chunk plan");
+        if (args.decode_tail && ((position < prefix && position + count > prefix) ||
+                                  (position >= prefix && count != 1)))
+            throw std::runtime_error("oracle chunk plan contradicts decode-tail policy");
+        replay.chunks.emplace_back(int(position), int(count));
+        replay.maximum = std::max(replay.maximum, int(count));
+        expected += count;
+    }
+    if (!stream.eof() || replay.chunks.empty() || expected != int64_t(ids.size()))
+        throw std::runtime_error("oracle chunk plan is malformed or does not cover all input tokens");
+    return replay;
+}
+
 int tokenize(int argc, char ** argv) {
     if (argc != 5) throw std::runtime_error("usage: m31_oracle tokenize MODEL.gguf TEXT-DIR NEW-ID-DIR");
     // Vocab-only operation must not probe a visible GPU.
@@ -113,8 +151,19 @@ int main(int argc, char ** argv) {
             args.cpu_decode_cache || args.dense_decode_cache || args.profile)
             throw std::runtime_error("M2 optimization flags are native-only");
         const auto cases = run::cases(args);
+        // The native adaptive planner can use a different size at every step.
+        // Replay its actual TSV (position, count), rather than quietly comparing
+        // a nominal fixed-chunk oracle with different GEMM/attention geometry.
+        const auto replay = read_chunk_replay(args, cases);
         if (args.backend == "cpu") setenv("CUDA_VISIBLE_DEVICES", "", 1);
         if (!run::fs::create_directory(args.out)) throw std::runtime_error("output directory exists; use a new path");
+        if (replay) {
+            std::ofstream plan(run::fs::path(args.out) / "chunk-replay.tsv");
+            for (const auto & item : replay.chunks) plan << item.first << '\t' << item.second << '\n';
+            if (!plan) throw std::runtime_error("cannot save oracle replay plan");
+            std::fprintf(stderr, "M31 oracle replay: entries=%zu max_chunk=%d nominal_chunk=%d source=%s\n",
+                         replay.chunks.size(), replay.maximum, args.chunk, replay.source.c_str());
+        }
         ggml_backend_load_all();
         Backend backend;
         auto mp = llama_model_default_params();
@@ -131,14 +180,28 @@ int main(int argc, char ** argv) {
         Capture capture;
         auto cp = llama_context_default_params();
         cp.n_ctx = args.context;
-        cp.n_batch = args.chunk;
-        cp.n_ubatch = args.chunk;
+        cp.n_batch = replay ? replay.maximum : args.chunk;
+        cp.n_ubatch = replay ? replay.maximum : args.chunk;
+        // The bounded head requests at most this many logits per ubatch.
+        // Otherwise context initialization reserves vocab*n_batch outputs before
+        // seeing the batch's logits mask (8 GiB at10240 tokens for this model).
+        // Layer59 still executes for every token via the layer-input tap below.
+        if (args.head_tail) cp.n_outputs_max = uint32_t(args.head_tail);
         cp.n_seq_max = 1;
         cp.n_threads = args.threads;
         cp.n_threads_batch = args.threads;
         cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
         cp.type_k = GGML_TYPE_F16;
         cp.type_v = GGML_TYPE_F16;
+        const bool capacity_equivalence = std::getenv("M31_ORACLE_CAPACITY_EQUIVALENCE") &&
+            std::string(std::getenv("M31_ORACLE_CAPACITY_EQUIVALENCE")) == "1";
+        if (capacity_equivalence) {
+            // Explicitly retain this model's trained linear RoPE parameters
+            // while changing only physical KV allocation for reserve sizing.
+            cp.yarn_ext_factor = 0;
+            cp.yarn_orig_ctx = uint32_t(llama_model_n_ctx_train(model.get()));
+            cp.rope_freq_scale = llama_model_rope_freq_scale_train(model.get());
+        }
         cp.offload_kqv = args.backend == "cuda";
         // M1's native routed path is CPU ggml, including activation quantization.
         // Keep that backend identical in the oracle; otherwise CPU-placed expert
@@ -163,9 +226,16 @@ int main(int argc, char ** argv) {
             if (ids.size() > size_t(args.context)) throw std::runtime_error("case exceeds context");
             llama_memory_clear(llama_get_memory(ctx.get()), true);
             run::Dump dump(run::fs::path(args.out) / path.stem(), args, ids, vocab);
+            std::ofstream capacity_trace;
+            if (capacity_equivalence) {
+                capacity_trace.open(run::fs::path(args.out) / path.stem() / "capacity-equivalence.jsonl");
+                if (!capacity_trace) throw std::runtime_error("cannot create capacity equivalence trace");
+            }
             capture.dump = &dump;
+            size_t replay_index = 0;
             for (int pos = 0; pos < int(ids.size()); ) {
-                const int n = run::chunk_size(args, int(ids.size()), pos);
+                const int n = replay ? replay.chunks.at(replay_index++).second :
+                                       run::chunk_size(args, int(ids.size()), pos);
                 dump.record_chunk(pos, n);
                 batch.b.n_tokens = n;
                 for (int r = 0; r < n; ++r) {
@@ -181,6 +251,25 @@ int main(int argc, char ** argv) {
                 capture.pos0 = pos;
                 if (llama_decode(ctx.get(), batch.b) != 0) throw std::runtime_error("PR llama_decode failed");
                 if (!capture.error.empty()) throw std::runtime_error(capture.error);
+                if (capacity_equivalence) {
+                    const auto memory = llama_get_memory(ctx.get());
+                    const auto first = llama_memory_seq_pos_min(memory, 0);
+                    const auto last = llama_memory_seq_pos_max(memory, 0);
+                    if (first != 0 || last != pos + n - 1)
+                        throw std::runtime_error("capacity-equivalence requires contiguous KV without wrap/shift");
+                    // PR llama_kv_cache::get_n_kv uses PAD(used_max_p1,256),
+                    // clamped by physical capacity. The verified contiguous
+                    // KV range makes the padding below identical to native.
+                    const int keys = ((pos + n + 255) / 256) * 256;
+                    capacity_trace << "{\"position\":" << pos << ",\"tokens\":" << n
+                        << ",\"seq_min\":" << first << ",\"seq_max\":" << last
+                        << ",\"active_keys_padded_from_verified_positions\":" << keys
+                        << ",\"physical_context_requested\":" << args.context
+                        << ",\"physical_context_actual\":" << llama_n_ctx(ctx.get())
+                        << ",\"rope_ext_factor\":0,\"rope_orig_context\":" << cp.yarn_orig_ctx
+                        << ",\"rope_frequency_scale\":" << cp.rope_freq_scale << "}\n";
+                    if (!capacity_trace) throw std::runtime_error("cannot write capacity equivalence trace");
+                }
                 for (int r = 0; r < n; ++r) if (dump.wants(pos + r)) {
                     const float * logits = llama_get_logits_ith(ctx.get(), r);
                     if (!logits) throw std::runtime_error("missing oracle logits");
