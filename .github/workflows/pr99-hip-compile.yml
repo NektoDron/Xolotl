@@ -1,0 +1,43 @@
+name: PR99 pinned HIP compile only
+
+on:
+  push:
+    branches: ['ci/pr99-hip-compile-1103']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  hip-compile:
+    if: github.repository == 'NektoDron/Xolotl'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      PR99_SOURCE_SHA: 5ffbd05448cdff041dbb1d43ff2fdbd2b76e3c34
+      PR99_LLAMA_SHA: 6050b467c07a95c7b87debd4ddac2f8ba8d9b807
+    steps:
+      - name: Checkout qualification harness (separate from feature source)
+        uses: actions/checkout@v4
+        with:
+          path: qualification
+          persist-credentials: false
+      - name: Checkout exact PR99 source
+        uses: actions/checkout@v4
+        with:
+          repository: NektoDron/Xolotl
+          ref: 5ffbd05448cdff041dbb1d43ff2fdbd2b76e3c34
+          path: source
+          persist-credentials: false
+      - name: Preflight, install minimal pinned userspace SDK, compile supported targets
+        shell: bash
+        run: |
+          bash qualification/tools/ci/pr99_hip_compile.sh "$GITHUB_WORKSPACE/source" "$GITHUB_WORKSPACE/evidence"
+      - name: Preserve receipts and failed-build diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr99-5ffbd054-hip-compile-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
