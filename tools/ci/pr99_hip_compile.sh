@@ -5,7 +5,7 @@ export LC_ALL=C
 export GIT_LFS_SKIP_SMUDGE=1
 export PYTHONDONTWRITEBYTECODE=1
 [[ ${GITHUB_ACTIONS:-} == true && ${GITHUB_REPOSITORY:-} == NektoDron/Xolotl && ${RUNNER_OS:-} == Linux ]]
-[[ ${PR99_SOURCE_SHA:-} == 073e068162a69ab994903fa6425f83d49d4748f4 ]]
+[[ ${PR99_SOURCE_SHA:-} == 64af476ab8a8849f68e20583db14491f3a5ae0e1 ]]
 [[ ${PR99_LLAMA_SHA:-} == 6050b467c07a95c7b87debd4ddac2f8ba8d9b807 ]]
 pr99_source=$(realpath "$1")
 pr99_evidence=$(realpath -m "$2")
@@ -154,7 +154,7 @@ probe=(src/'tests/hip/shared_int4_alignment.cu').read_text()
 probe=probe.replace('tile[64]',f'tile[{gu}]').replace('threadIdx.x & 63',f'(threadIdx.x + blockIdx.x) % {gu}')
 probe=probe.replace('tile[128]',f'tile[{down}]').replace('threadIdx.x & 127',f'(threadIdx.x + blockIdx.x) % {down}')
 (out/'shared-int4-production.cu').write_text(probe)
-(out/'shared-int4-source.json').write_text(json.dumps(dict(source_head='073e068162a69ab994903fa6425f83d49d4748f4',fixed_iq_sha256=hashlib.sha256(fixed.encode()).hexdigest(),derived_probe_sha256=hashlib.sha256(probe.encode()).hexdigest(),gu_count=gu,down_count=down,int4_bytes=16,scope='Compile-only probe; no GPU launch or model'),indent=2)+'\n')
+(out/'shared-int4-source.json').write_text(json.dumps(dict(source_head='64af476ab8a8849f68e20583db14491f3a5ae0e1',fixed_iq_sha256=hashlib.sha256(fixed.encode()).hexdigest(),derived_probe_sha256=hashlib.sha256(probe.encode()).hexdigest(),gu_count=gu,down_count=down,int4_bytes=16,scope='Compile-only probe; no GPU launch or model'),indent=2)+'\n')
 PYMICRO
 pr99_hip_micro=("$ROCM_PATH/llvm/bin/clang++" -x hip --rocm-path="$ROCM_PATH" --offload-arch=gfx1100 -std=c++17 -O2 --cuda-device-only -S -emit-llvm)
 printf '%q ' "${pr99_hip_micro[@]}" "$pr99_evidence/shared-int4-production.cu" -o "$pr99_evidence/shared-int4-fixed.ll" > "$pr99_evidence/shared-int4-fixed-command.txt"

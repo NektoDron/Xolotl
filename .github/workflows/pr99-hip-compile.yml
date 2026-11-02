@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
-      PR99_SOURCE_SHA: 073e068162a69ab994903fa6425f83d49d4748f4
+      PR99_SOURCE_SHA: 64af476ab8a8849f68e20583db14491f3a5ae0e1
       PR99_LLAMA_SHA: 6050b467c07a95c7b87debd4ddac2f8ba8d9b807
     steps:
       - name: Checkout qualification harness (separate from feature source)
@@ -26,7 +26,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: NektoDron/Xolotl
-          ref: 073e068162a69ab994903fa6425f83d49d4748f4
+          ref: 64af476ab8a8849f68e20583db14491f3a5ae0e1
           path: source
           persist-credentials: false
       - name: Preflight, install minimal pinned userspace SDK, compile supported targets
@@ -37,7 +37,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr99-073e0681-hip-compile-${{ github.run_attempt }}
+          name: pr99-64af476a-hip-compile-${{ github.run_attempt }}
           path: evidence/
           if-no-files-found: error
           retention-days: 30
