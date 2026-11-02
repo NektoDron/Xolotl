@@ -5,7 +5,7 @@ export LC_ALL=C
 export GIT_LFS_SKIP_SMUDGE=1
 export PYTHONDONTWRITEBYTECODE=1
 [[ ${GITHUB_ACTIONS:-} == true && ${GITHUB_REPOSITORY:-} == NektoDron/Xolotl && ${RUNNER_OS:-} == Linux ]]
-[[ ${PR99_SOURCE_SHA:-} == 5ffbd05448cdff041dbb1d43ff2fdbd2b76e3c34 ]]
+[[ ${PR99_SOURCE_SHA:-} == 073e068162a69ab994903fa6425f83d49d4748f4 ]]
 [[ ${PR99_LLAMA_SHA:-} == 6050b467c07a95c7b87debd4ddac2f8ba8d9b807 ]]
 pr99_source=$(realpath "$1")
 pr99_evidence=$(realpath -m "$2")
@@ -140,6 +140,43 @@ sha256sum "$pr99_source/tools/xolotl/ggml/xolotl-ggml.patch" > "$pr99_evidence/g
 git -C "$pr99_llama" apply --check "$pr99_source/tools/xolotl/ggml/xolotl-ggml.patch"
 git -C "$pr99_llama" apply "$pr99_source/tools/xolotl/ggml/xolotl-ggml.patch"
 git -C "$pr99_llama" diff --binary > "$pr99_evidence/ggml-applied.patch"
+# Micro-regression before the full build: actual production array extents,
+# original HIP diagnostic, fixed shared address-space/alignment metadata.
+python3 - "$pr99_source" "$pr99_evidence" <<'PYMICRO'
+import hashlib,json,pathlib,re,sys
+src,out=map(pathlib.Path,sys.argv[1:]);fixed=(src/'src/kernels/cuda/iq_kernels.cu').read_text()
+assert fixed.count('__shared__ __align__(16) int4 s_u[')==2
+assert '__shared__ alignas(16) int4 s_u[' not in fixed
+nc=int(re.search(r'constexpr int GRP_NC = (\d+);',fixed)[1]);assert re.search(r'constexpr int ED_NC = GRP_NC;',fixed)
+xb=int(re.search(r'constexpr int ED_XB = (\d+);',fixed)[1]);hb=int(re.search(r'constexpr int ED_HB = (\d+);',fixed)[1]);gu,down=nc*2*xb,nc*2*hb
+assert (gu,down)==(640,160)
+probe=(src/'tests/hip/shared_int4_alignment.cu').read_text()
+probe=probe.replace('tile[64]',f'tile[{gu}]').replace('threadIdx.x & 63',f'(threadIdx.x + blockIdx.x) % {gu}')
+probe=probe.replace('tile[128]',f'tile[{down}]').replace('threadIdx.x & 127',f'(threadIdx.x + blockIdx.x) % {down}')
+(out/'shared-int4-production.cu').write_text(probe)
+(out/'shared-int4-source.json').write_text(json.dumps(dict(source_head='073e068162a69ab994903fa6425f83d49d4748f4',fixed_iq_sha256=hashlib.sha256(fixed.encode()).hexdigest(),derived_probe_sha256=hashlib.sha256(probe.encode()).hexdigest(),gu_count=gu,down_count=down,int4_bytes=16,scope='Compile-only probe; no GPU launch or model'),indent=2)+'\n')
+PYMICRO
+pr99_hip_micro=("$ROCM_PATH/llvm/bin/clang++" -x hip --rocm-path="$ROCM_PATH" --offload-arch=gfx1100 -std=c++17 -O2 --cuda-device-only -S -emit-llvm)
+printf '%q ' "${pr99_hip_micro[@]}" "$pr99_evidence/shared-int4-production.cu" -o "$pr99_evidence/shared-int4-fixed.ll" > "$pr99_evidence/shared-int4-fixed-command.txt"
+"${pr99_hip_micro[@]}" "$pr99_evidence/shared-int4-production.cu" -o "$pr99_evidence/shared-int4-fixed.ll" > "$pr99_evidence/shared-int4-fixed.log" 2>&1
+set +e
+"${pr99_hip_micro[@]}" -DTEST_LEGACY_SHARED_ALIGN=1 "$pr99_evidence/shared-int4-production.cu" -o "$pr99_evidence/shared-int4-legacy.ll" > "$pr99_evidence/shared-int4-legacy.log" 2>&1
+pr99_legacy_rc=$?
+set -e
+printf '%s\n' "$pr99_legacy_rc" > "$pr99_evidence/shared-int4-legacy-exit.txt"
+[[ $pr99_legacy_rc != 0 ]]
+grep -q "alignas.*attribute cannot be applied to types" "$pr99_evidence/shared-int4-legacy.log"
+python3 - "$pr99_evidence" <<'PYIR'
+import hashlib,json,pathlib,re,sys
+out=pathlib.Path(sys.argv[1]);data=(out/'shared-int4-fixed.ll').read_bytes();text=data.decode();records=[]
+for name,count in [('gu_probe',640),('down_probe',160)]:
+ lines=[line for line in text.splitlines() if line.startswith('@') and name in line and 'tile' in line and 'addrspace(3)' in line and 'global' in line]
+ assert len(lines)==1,(name,lines)
+ line=lines[0];array=re.search(r'\[(\d+) x ([^\]]+)\]',line);alignment=re.search(r', align (\d+)',line)
+ assert array and alignment and int(array[1])==count and int(alignment[1])==16,line
+ records.append(dict(kernel=name,count=count,alignment=16,element_type=array[2],int4_bytes=16,allocation_bytes=count*16,LLVM_global=line))
+(out/'shared-int4-report.json').write_text(json.dumps(dict(status='HIP_MICRO_FIXED_PASS_LEGACY_EXPECTED_FAIL_ALIGN16',fixed_IR_sha256=hashlib.sha256(data).hexdigest(),shared_arrays=records,GPU_execution=False,scope='Legacy compile must fail for original attribute diagnostic; fixed two production-sized shared int4 arrays compile in address space3/align16. Not a numerical/model proof.'),indent=2)+'\n')
+PYIR
 pr99_build="$GITHUB_WORKSPACE/pr99-build-hip"
 # STRATA_DENSE stays at its existing ON default: CMakeLists.txt:957 requires
 # STRATA_ENABLE_CUDA before adding strata-dense/dense_model/dense_kernels. The
@@ -149,7 +186,7 @@ cmake -S "$pr99_source" -B "$pr99_build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_HIP_COMPILER="$ROCM_PATH/llvm/bin/clang++" -DCMAKE_HIP_COMPILER_ROCM_ROOT="$ROCM_PATH" -DCMAKE_PREFIX_PATH="$ROCM_PATH" \
   -DSTRATA_GGML_DIR="$pr99_llama" -DSTRATA_NATIVE_EXPERTS=ON -DSTRATA_BUILD_TESTS=ON \
   -DSTRATA_BUILD_CONVERSATION_TESTS=ON -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-  -DSTRATA_M31=OFF | tee "$pr99_evidence/configure.log"
+  -DSTRATA_M31=OFF -DCMAKE_HIP_FLAGS=-ftemplate-backtrace-limit=1 -DCMAKE_CXX_FLAGS=-ftemplate-backtrace-limit=1 | tee "$pr99_evidence/configure.log"
 cp "$pr99_build/CMakeCache.txt" "$pr99_evidence/CMakeCache.txt"
 cmake --build "$pr99_build" --target strata strata-q36 ds41_generate persistent_prefix_test \
   q36_persistent_payload_test m31_prefix_codec_check test_ds41_persistent_identity \
