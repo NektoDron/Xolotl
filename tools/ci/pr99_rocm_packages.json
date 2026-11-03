@@ -1,0 +1,102 @@
+{
+  "comgr": {
+    "Version": "3.0.0.70002-56~24.04",
+    "Size": "59923644",
+    "SHA256": "d24fe9eefbb7c7d85c6e18a76ee812c97e82822aeb1d3b8f41002a73d43a8d5f"
+  },
+  "hip-dev": {
+    "Version": "7.0.51831.70002-56~24.04",
+    "Size": "359562",
+    "SHA256": "0f96a380dce611852cb8cffebe3ceebb3268e903391e1ef53a9e8ecca6b57b33"
+  },
+  "hip-runtime-amd": {
+    "Version": "7.0.51831.70002-56~24.04",
+    "Size": "13045756",
+    "SHA256": "358e6050486237d6388a4eaad66bba2577bf8435c25aa47128af0074a82b74c6"
+  },
+  "hipblas": {
+    "Version": "3.0.2.70002-56~24.04",
+    "Size": "116874",
+    "SHA256": "144cf5af52c49de5b146f929e2d136c346a45a82a4d20ee7680e8f9ab717f9cd"
+  },
+  "hipblas-common-dev": {
+    "Version": "1.2.0.70002-56~24.04",
+    "Size": "5830",
+    "SHA256": "9b0bb447096c7d74702e632218f9a644b4189a23efd7021f6d3660ef59ec168e"
+  },
+  "hipblas-dev": {
+    "Version": "3.0.2.70002-56~24.04",
+    "Size": "75608",
+    "SHA256": "11b2a9ac011dc30b1d4e81721bddcad6a6e85836637b4fd8c63a387f8bc95029"
+  },
+  "hipblaslt": {
+    "Version": "1.0.0.70002-56~24.04",
+    "Size": "1005654848",
+    "SHA256": "82367f5b7ee8615c673faa117e2975991d7e075e5202146541bd210349124144"
+  },
+  "hipblaslt-dev": {
+    "Version": "1.0.0.70002-56~24.04",
+    "Size": "221570",
+    "SHA256": "d03f4dcb2a486f7c4a6353086bfeeeb3b0d4c98ec9d185d0f094e9b2029b9a09"
+  },
+  "hipcc": {
+    "Version": "1.1.1.70002-56~24.04",
+    "Size": "213162",
+    "SHA256": "2b1aa1b5b5dd135a26201da8aaf0dbf21a2fba1fc456944a2cf9bca267e8ff8e"
+  },
+  "hsa-rocr": {
+    "Version": "1.18.0.70002-56~24.04",
+    "Size": "1465762",
+    "SHA256": "5bc03c8f9f823ea1a7546fc7935714ab4d437d707ba54816ad6aa73e10f430e1"
+  },
+  "hsa-rocr-dev": {
+    "Version": "1.18.0.70002-56~24.04",
+    "Size": "137622",
+    "SHA256": "d053885bd168a5751df8e2e98f841ddf0f665c52cb7b0480006a42bd8f20d559"
+  },
+  "rocblas": {
+    "Version": "5.0.2.70002-56~24.04",
+    "Size": "163243210",
+    "SHA256": "a48edfafe8ee0910006ec1db0995fc99a58fdebf47d004e7bba942fbe744513b"
+  },
+  "rocblas-dev": {
+    "Version": "5.0.2.70002-56~24.04",
+    "Size": "92382",
+    "SHA256": "8ba75eaf6095d3313c38b393a88b5946e44cb47a1f1adf3a027514c666f98789"
+  },
+  "rocm-core": {
+    "Version": "7.0.2.70002-56~24.04",
+    "Size": "14254",
+    "SHA256": "32574bb04134a1163408d411e37de693394df937ed4f747faa00b786030fd750"
+  },
+  "rocm-device-libs": {
+    "Version": "1.0.0.70002-56~24.04",
+    "Size": "727228",
+    "SHA256": "12fc3b0545cc128ae3c9b2451b017b3d82a9b69c526ac52701cd55c172db3500"
+  },
+  "rocm-llvm": {
+    "Version": "20.0.0.25385.70002-56~24.04",
+    "Size": "505068006",
+    "SHA256": "66434e0d914ebed70e054e4606bdacfc8d3f06de62c1c6935c6bafbc15e7254a"
+  },
+  "rocminfo": {
+    "Version": "1.0.0.70002-56~24.04",
+    "Size": "28272",
+    "SHA256": "7024a953111535b09e167fa48b7bca458c3b154ebd58576055521527f3859611"
+  },
+  "rocprofiler-register": {
+    "Version": "0.6.0.70002-56~24.04",
+    "Size": "242864",
+    "SHA256": "cb2dbe89886241ffb007ff184d2a921c80eadedddcd26ba32d23c227bd2f9e71"
+  },
+  "rocsolver": {
+    "Version": "3.30.1.70002-56~24.04",
+    "Size": "676851010",
+    "SHA256": "54a4d80b56f03a5734d1de856d3dd7bd76451548b0d4c2f8e19a94cdc1c6f266"
+  },
+  "roctracer": {
+    "Version": "4.1.70002.70002-56~24.04",
+    "Size": "525008",
+    "SHA256": "cefa1cb3ec9cb06ecb6d13dd0e9e8d9e15f62f9057db60b8f677adab6b201974"
+  }
+}
