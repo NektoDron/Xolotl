@@ -1,0 +1,39 @@
+name: DS41 GBNF pinned CPU and HIP-config compile
+on:
+  push:
+    branches: ['ci/ds41-gbnf-compile-1103']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hip-compile:
+    if: github.repository == 'NektoDron/Xolotl'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      DS41_SOURCE_SHA: f79c2e248c4e96b2924445df1b6f4b34cceb4eb4
+      DS41_LLAMA_SHA: 6050b467c07a95c7b87debd4ddac2f8ba8d9b807
+    steps:
+      - name: Checkout qualification harness
+        uses: actions/checkout@v4
+        with:
+          path: qualification
+          persist-credentials: false
+      - name: Checkout exact DS41 source
+        uses: actions/checkout@v4
+        with:
+          repository: NektoDron/Xolotl
+          ref: f79c2e248c4e96b2924445df1b6f4b34cceb4eb4
+          path: source
+          persist-credentials: false
+      - name: Pinned SDK preflight and CPU/HIP OFF/ON compile
+        shell: bash
+        run: bash qualification/tools/ci/ds41_compile.sh "$GITHUB_WORKSPACE/source" "$GITHUB_WORKSPACE/evidence"
+      - name: Preserve receipts and failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ds41-f79c2e2-compile-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 30
